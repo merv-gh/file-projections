@@ -110,7 +110,7 @@ func TestControlFlowJoernModeErrorsWithoutEngine(t *testing.T) {
 		Params: map[string]string{"file": "com/example/shop/OrderController.java", "line": "35", "mode": "joern"},
 	}}}
 	_, err := Run(cfg, DefaultRegistry())
-	if err == nil || !strings.Contains(err.Error(), "joern not available") {
+	if err == nil || !strings.Contains(err.Error(), "Docker was not found") {
 		t.Fatalf("expected joern-not-available error, got %v", err)
 	}
 }
@@ -130,7 +130,7 @@ func TestEntryToExitRequiresParamsAndEngine(t *testing.T) {
 		t.Skip("joern available; skipping no-engine assertion")
 	}
 	cfg.Lenses[0].Params = map[string]string{"entry": "@KafkaListener", "exit": `\.save\s*\(`, "entry_name": "onIncoming", "exit_file": "OrderEventService"}
-	if _, err := Run(cfg, DefaultRegistry()); err == nil || !strings.Contains(err.Error(), "joern not available") {
+	if _, err := Run(cfg, DefaultRegistry()); err == nil || !strings.Contains(err.Error(), "Docker was not found") {
 		t.Fatalf("expected joern-not-available error, got %v", err)
 	}
 }

@@ -176,12 +176,17 @@ make cpg CONFIG=joern.config.json     # build/refresh cached cpg.bin per source 
 make run CONFIG=joern.config.json     # run the CPG lenses (uses the cache if present)
 ```
 
-- Joern runs from a local binary if present, else the `tools.joern.image` Docker image
-  (`ghcr.io/joernio/joern:nightly` in `joern.config.json`); `jvm_args` (e.g. `-Xmx6g`) is
-  forwarded via `_JAVA_OPTIONS`.
-- `build`/`refresh` parses each source root once into `<projections_dir>/.cpg/<hash>.bin` via
-  `joern-parse`. Lenses then `importCpg` that cache instead of re-importing source — the basis
-  for incremental refresh (re-run `build` for a root after its files change).
+- **Zero-config with Docker.** Joern runs from a local binary if present, otherwise via
+  Docker. No config is required: the default image `ghcr.io/joernio/joern:nightly` is used
+  and **pulled automatically on first use** (one-time, several GB) with progress shown.
+  Override or tune via `tools.joern.image` / `jvm_args` (default `-Xmx6g`, forwarded as
+  `_JAVA_OPTIONS`). If Joern can't run, you get a specific, actionable message (install
+  Docker / start the daemon / pull failed) — never a cryptic one.
+- **Parse once, then query.** A joern lens auto-builds the CPG for its source root with
+  `joern-parse` (the frontend Joern recommends for large codebases) and caches it at
+  `<projections_dir>/.cpg/<hash>.bin`; lenses then `importCpg` instead of re-importing source.
+  Progress + timing are logged at every step (image, CPG build, each query) so a long parse
+  reads as *working*, not stuck. For a big repo, run `make cpg` once up front.
 - Scripts live in `tools/joern/` (`java-var-flow.sc`, `control-flow.sc`) and emit the same
   JSONL the renderer consumes — JSON is hand-built so they run on stock Joern images.
 - `control-flow mode=joern` writes the same branch-per-file output as the lexical lens.

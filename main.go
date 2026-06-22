@@ -1085,17 +1085,26 @@ func AnalyzeJoernVarFlow(cfg Config, lens LensConfig) (Projection, error) {
 
 	mode := coalesce(target.Mode, "auto")
 	if mode != "fallback" {
-		if joernAvailable(cfg) {
-			p, err := RunJoernVarFlow(cfg, lens, target)
-			if err == nil {
-				p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used joern CPG (" + joernEngine(cfg) + ")"})
-				return p, nil
+		if mode == "joern" {
+			// Explicit: surface the clear ensureJoern diagnostics on failure.
+			if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err != nil {
+				return Projection{}, fmt.Errorf("joern-var-flow mode=joern: %w", err)
 			}
-			if mode == "joern" {
+			p, err := RunJoernVarFlow(cfg, lens, target)
+			if err != nil {
 				return Projection{}, err
 			}
-		} else if mode == "joern" {
-			return Projection{}, fmt.Errorf("joern not available: no binary in PATH and no tools.joern.image + docker configured")
+			p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used joern CPG (" + joernEngine(cfg) + ")"})
+			return p, nil
+		}
+		// Auto: try joern only if plausibly available, otherwise fall back silently.
+		if joernAvailable(cfg) {
+			if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err == nil {
+				if p, err := RunJoernVarFlow(cfg, lens, target); err == nil {
+					p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used joern CPG (" + joernEngine(cfg) + ")"})
+					return p, nil
+				}
+			}
 		}
 	}
 
@@ -1130,23 +1139,82 @@ func joernScriptRel(cfg Config, name string) (string, error) {
 
 // joernAvailable reports whether Joern can run, as a local binary or via a configured
 // Docker image (with the daemon reachable).
+// defaultJoernImage is used when no tools.joern.image is configured, so a fresh install
+// with only Docker works without any config.
+const defaultJoernImage = "ghcr.io/joernio/joern:nightly"
+
+func joernImage(cfg Config) string {
+	if tc, ok := cfg.Tools["joern"]; ok && tc.Image != "" {
+		return tc.Image
+	}
+	return defaultJoernImage
+}
+
+func joernJVMArgs(cfg Config) string {
+	if tc, ok := cfg.Tools["joern"]; ok && tc.JVMArgs != "" {
+		return tc.JVMArgs
+	}
+	return "-Xmx6g"
+}
+
+// joernAvailable reports whether Joern can plausibly run: a local binary, or Docker on
+// PATH (the image is defaulted and pulled on demand by ensureJoern). Cheap, no daemon call.
 func joernAvailable(cfg Config) bool {
 	if _, err := exec.LookPath("joern"); err == nil {
 		return true
 	}
-	if tc, ok := cfg.Tools["joern"]; ok && tc.Image != "" {
-		if _, err := exec.LookPath("docker"); err == nil {
-			return true
-		}
-	}
-	return false
+	_, err := exec.LookPath("docker")
+	return err == nil
 }
 
 func joernEngine(cfg Config) string {
 	if _, err := exec.LookPath("joern"); err == nil {
 		return "local binary"
 	}
-	return "docker " + cfg.Tools["joern"].Image
+	return "docker " + joernImage(cfg)
+}
+
+// ensureJoern makes Joern ready to run, with actionable diagnostics at each step and a
+// one-time image pull (streamed so the user sees progress). It is the single place that
+// turns "joern not available" into a clear, fixable message.
+func ensureJoern(cfg Config, out io.Writer) error {
+	if _, err := exec.LookPath("joern"); err == nil {
+		return nil // local binary — nothing to prepare
+	}
+	dockerBin, err := exec.LookPath("docker")
+	if err != nil {
+		return errors.New("Joern is not installed and Docker was not found.\n" +
+			"  Fix: install Docker Desktop (https://www.docker.com/products/docker-desktop) — " +
+			"file-projections will then run Joern in a container automatically.\n" +
+			"  Or install Joern directly: https://docs.joern.io/installation")
+	}
+	if o, err := exec.Command(dockerBin, "info", "--format", "{{.ServerVersion}}").CombinedOutput(); err != nil {
+		return fmt.Errorf("Docker is installed but its daemon isn't responding.\n"+
+			"  Fix: start Docker Desktop and wait until it says \"running\", then retry.\n  (docker info said: %s)",
+			strings.TrimSpace(firstLine(string(o))))
+	}
+	img := joernImage(cfg)
+	if err := exec.Command(dockerBin, "image", "inspect", img).Run(); err == nil {
+		fmt.Fprintf(out, "joern: using docker image %s\n", img)
+		return nil
+	}
+	fmt.Fprintf(out, "joern: image %s not found locally — pulling it now (one-time, several GB)...\n", img)
+	cmd := exec.Command(dockerBin, "pull", img)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("could not pull the Joern image %s.\n"+
+			"  Fix: check your internet/registry access, or pull manually:  docker pull %s\n  (%v)", img, img, err)
+	}
+	fmt.Fprintf(out, "joern: ✓ pulled %s\n", img)
+	return nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // execJoern runs a Joern script with key/value params. Path-valued params (named in
@@ -1189,16 +1257,18 @@ func execJoern(cfg Config, scriptRel string, kv map[string]string, pathKeys map[
 		cmd.Dir = cfg.Root
 		return cmd.CombinedOutput()
 	}
-	tc := cfg.Tools["joern"]
-	dargs := []string{"run", "--rm", "-v", absRoot + ":/src", "-w", "/src"}
-	if tc.JVMArgs != "" {
-		dargs = append(dargs, "-e", "_JAVA_OPTIONS="+tc.JVMArgs)
-	}
-	dargs = append(dargs, tc.Image, "joern")
+	dargs := []string{"run", "--rm", "-v", dockerMount(absRoot), "-w", "/src",
+		"-e", "_JAVA_OPTIONS=" + joernJVMArgs(cfg), joernImage(cfg), "joern"}
 	dargs = append(dargs, scriptArgs...)
 	cmd := exec.Command("docker", dargs...)
 	cmd.Dir = cfg.Root
 	return cmd.CombinedOutput()
+}
+
+// dockerMount builds the `-v host:/src` bind spec. The host path uses forward slashes so
+// Docker Desktop on Windows accepts it (e.g. C:/Users/me/proj:/src).
+func dockerMount(absRoot string) string {
+	return filepath.ToSlash(absRoot) + ":/src"
 }
 
 // RunBuildCPG (the `build`/`refresh` subcommand) parses each unique source root once
@@ -1206,27 +1276,22 @@ func execJoern(cfg Config, scriptRel string, kv map[string]string, pathKeys map[
 // cache (importCpg) instead of re-importing source — the basis for incremental refresh:
 // re-run `build` for a root after its files change.
 func RunBuildCPG(cfg Config) error {
-	if !joernAvailable(cfg) {
-		return errors.New("build: joern not available (no binary, no tools.joern.image + docker)")
-	}
 	ordered := joernSourceRoots(cfg)
 	if len(ordered) == 0 {
 		fmt.Println("build: no joern/control-flow/data-flow/entry-to-exit lenses with a source_root; nothing to build")
 		return nil
 	}
+	if err := ensureJoern(cfg, os.Stdout); err != nil {
+		return err
+	}
 	for _, root := range ordered {
-		outRel := cpgPathRel(cfg, root)
-		if err := os.MkdirAll(filepath.Join(cfg.Root, filepath.Dir(outRel)), 0755); err != nil {
-			return err
-		}
-		// Per-file change detection: skip rebuild when nothing changed, otherwise report
-		// exactly which files were added/modified/removed (finer than always-rebuild).
 		cur, err := sourceManifest(cfg, root)
 		if err != nil {
 			return err
 		}
 		prev := loadManifest(filepath.Join(cfg.Root, cpgManifestRel(cfg, root)))
 		added, modified, removed := diffManifest(prev, cur)
+		outRel := cpgPathRel(cfg, root)
 		_, statErr := os.Stat(filepath.Join(cfg.Root, outRel))
 		if statErr == nil && len(added)+len(modified)+len(removed) == 0 {
 			fmt.Printf("up to date: %s (%d files)\n", root, len(cur))
@@ -1244,17 +1309,78 @@ func RunBuildCPG(cfg Config) error {
 				fmt.Println("  - " + f)
 			}
 		}
-		fmt.Printf("building cpg for %s -> %s ...\n", root, outRel)
-		out, err := execJoernParse(cfg, root, outRel)
-		if err != nil {
-			return fmt.Errorf("build %s: %w\n%s", root, err, out)
-		}
-		if err := saveManifest(filepath.Join(cfg.Root, cpgManifestRel(cfg, root)), cur); err != nil {
+		if _, err := buildCPGForRoot(cfg, root, len(cur), os.Stdout); err != nil {
 			return err
 		}
-		fmt.Printf("  built %s\n", outRel)
 	}
 	return nil
+}
+
+// buildCPGForRoot parses one source root into its cached cpg.bin with progress + timing,
+// and records the manifest. This is the frontend-driven path Joern recommends for large
+// codebases (parse once, then query the cpg) instead of re-importing source per query.
+func buildCPGForRoot(cfg Config, root string, fileCount int, out io.Writer) (string, error) {
+	outRel := cpgPathRel(cfg, root)
+	if err := os.MkdirAll(filepath.Join(cfg.Root, filepath.Dir(outRel)), 0755); err != nil {
+		return "", err
+	}
+	fmt.Fprintf(out, "joern: building CPG for %s (%d files) — this is a one-time parse, large repos can take minutes...\n", root, fileCount)
+	start := nowFunc()
+	o, err := execJoernParse(cfg, root, outRel)
+	if err != nil {
+		return "", fmt.Errorf("building CPG for %s failed: %w\n%s", root, err, firstLines(string(o), 20))
+	}
+	if cur, e := sourceManifest(cfg, root); e == nil {
+		saveManifest(filepath.Join(cfg.Root, cpgManifestRel(cfg, root)), cur)
+	}
+	fmt.Fprintf(out, "joern: ✓ CPG built in %s -> %s\n", nowFunc().Sub(start).Round(time.Second), outRel)
+	return outRel, nil
+}
+
+// ensureCPG returns the cached cpg.bin for a root, building it (with progress) if absent.
+func ensureCPG(cfg Config, root string, out io.Writer) (string, error) {
+	rel := cpgPathRel(cfg, root)
+	if fileExists(filepath.Join(cfg.Root, rel)) {
+		return rel, nil
+	}
+	count := 0
+	if m, err := sourceManifest(cfg, root); err == nil {
+		count = len(m)
+	}
+	return buildCPGForRoot(cfg, root, count, out)
+}
+
+func firstLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = append(lines[:n], "… (truncated)")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// prepareJoernLens readies Joern (clear diagnostics + one-time image pull) and ensures a
+// cached CPG for the lens's source root, so the script loads it fast instead of
+// re-importing source on every run.
+func prepareJoernLens(cfg Config, sourceRoot string, out io.Writer) error {
+	if err := ensureJoern(cfg, out); err != nil {
+		return err
+	}
+	if sourceRoot != "" {
+		if _, err := ensureCPG(cfg, sourceRoot, out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runJoernScript runs a script with start/done progress + timing so the user can tell
+// Joern is working rather than stuck.
+func runJoernScript(cfg Config, name, target, scriptRel string, kv map[string]string, out io.Writer) ([]byte, error) {
+	fmt.Fprintf(out, "joern: running %s on %s ...\n", name, target)
+	start := nowFunc()
+	o, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	fmt.Fprintf(out, "joern: %s finished in %s\n", name, nowFunc().Sub(start).Round(time.Second))
+	return o, err
 }
 
 // joernSourceRoots returns the unique source roots used by joern-backed lenses.
@@ -1350,15 +1476,12 @@ func execJoernParse(cfg Config, sourceRootRel, outRel string) ([]byte, error) {
 		cmd.Dir = cfg.Root
 		return cmd.CombinedOutput()
 	}
-	tc := cfg.Tools["joern"]
-	if tc.Image == "" {
-		return nil, errors.New("joern-parse not in PATH and no tools.joern.image")
+	if _, err := exec.LookPath("docker"); err != nil {
+		return nil, errors.New("joern-parse not in PATH and Docker not available")
 	}
-	dargs := []string{"run", "--rm", "-v", absRoot + ":/src", "-w", "/src"}
-	if tc.JVMArgs != "" {
-		dargs = append(dargs, "-e", "_JAVA_OPTIONS="+tc.JVMArgs)
-	}
-	dargs = append(dargs, tc.Image, "joern-parse", "/src/"+filepath.ToSlash(sourceRootRel), "--output", "/src/"+filepath.ToSlash(outRel))
+	dargs := []string{"run", "--rm", "-v", dockerMount(absRoot), "-w", "/src",
+		"-e", "_JAVA_OPTIONS=" + joernJVMArgs(cfg), joernImage(cfg),
+		"joern-parse", "/src/" + filepath.ToSlash(sourceRootRel), "--output", "/src/" + filepath.ToSlash(outRel)}
 	cmd := exec.Command("docker", dargs...)
 	cmd.Dir = cfg.Root
 	return cmd.CombinedOutput()
@@ -1409,9 +1532,9 @@ func RunJoernVarFlow(cfg Config, lens LensConfig, target VarFlowTarget) (Project
 		"out":          outRel,
 	}
 	kv = withCpgParam(cfg, lens, kv)
-	output, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	output, err := runJoernScript(cfg, "data-flow", target.File, scriptRel, kv, os.Stderr)
 	if err != nil {
-		return Projection{}, fmt.Errorf("joern failed: %w\n%s", err, string(output))
+		return Projection{}, fmt.Errorf("joern failed: %w\n%s", err, firstLines(string(output), 25))
 	}
 	jsonLens := lens
 	jsonLens.Input = outRel
@@ -2585,8 +2708,8 @@ type cfgPath struct {
 // as branch-per-file projections (an index plus one file per path), matching the lexical
 // lens's output shape. Handles else-if chains, switch, and loops.
 func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, method string) (Projection, error) {
-	if !joernAvailable(cfg) {
-		return Projection{}, errors.New("control-flow mode=joern: joern not available (no binary, no tools.joern.image + docker)")
+	if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err != nil {
+		return Projection{}, fmt.Errorf("control-flow mode=joern: %w", err)
 	}
 	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-control-flow.jsonl"))
 	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
@@ -2605,9 +2728,9 @@ func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, met
 	if err != nil {
 		return Projection{}, err
 	}
-	output, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	output, err := runJoernScript(cfg, "control-flow", fmt.Sprintf("%s:%d", file, line), scriptRel, kv, os.Stderr)
 	if err != nil {
-		return Projection{}, fmt.Errorf("joern control-flow failed: %w\n%s", err, string(output))
+		return Projection{}, fmt.Errorf("joern control-flow failed: %w\n%s", err, firstLines(string(output), 25))
 	}
 	jsonLens := lens
 	jsonLens.Input = outRel
@@ -2652,8 +2775,8 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 	if lens.Params == nil || lens.Params["entry"] == "" || lens.Params["exit"] == "" {
 		return Projection{}, errors.New("entry-to-exit: params.entry and params.exit (regexes) are required")
 	}
-	if !joernAvailable(cfg) {
-		return Projection{}, errors.New("entry-to-exit: joern not available (no binary, no tools.joern.image + docker)")
+	if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err != nil {
+		return Projection{}, fmt.Errorf("entry-to-exit: %w", err)
 	}
 	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-entry-to-exit.jsonl"))
 	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
@@ -2673,9 +2796,9 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 	if err != nil {
 		return Projection{}, err
 	}
-	output, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	output, err := runJoernScript(cfg, "entry-to-exit", lens.SourceRoot, scriptRel, kv, os.Stderr)
 	if err != nil {
-		return Projection{}, fmt.Errorf("joern entry-to-exit failed: %w\n%s", err, string(output))
+		return Projection{}, fmt.Errorf("joern entry-to-exit failed: %w\n%s", err, firstLines(string(output), 25))
 	}
 	jsonLens := lens
 	jsonLens.Input = outRel
@@ -3719,6 +3842,16 @@ func RunWizard(root, configPath string, in io.Reader, out io.Writer) error {
 	if yes(allLabel, false) {
 		add(LensConfig{Name: "all-paths", Out: ".projections/all-paths.projection", Analyzer: "entry-to-exit", SourceRoot: sourceRoot,
 			Params: map[string]string{"entry": entryRegexFor(lang), "exit": exitRegexFor(lang)}})
+		// Record the Joern image so it's visible/editable in config; ensureJoern pulls it
+		// on first use. Without Docker, tell the user what's needed.
+		cfg.Tools = map[string]ToolConfig{"joern": {Image: defaultJoernImage, JVMArgs: "-Xmx6g"}}
+		if _, err := exec.LookPath("joern"); err != nil {
+			if _, err := exec.LookPath("docker"); err != nil {
+				fmt.Fprintln(out, "  note: all-paths needs Joern or Docker. Install Docker Desktop; the image is pulled automatically on first run.")
+			} else {
+				fmt.Fprintf(out, "  note: the Joern image (%s, several GB) will be pulled on first run.\n", defaultJoernImage)
+			}
+		}
 	}
 
 	if sb, ok := scan.sampleBookmark(cfg, sourceRoot); ok {

@@ -54,5 +54,7 @@ No domain patterns are built in — all project specifics live in config.
 
 - Engines `rg`/`ast-grep`/`joern` used if installed, else Docker image (`tools.<name>.image`) or
   built-in scanner. Nothing else required.
+- Slow/low-RAM machine? Set `tools.joern.farm` to a joern-farm URL to offload CPG build + queries
+  entirely (no local Joern); `build` downloads the cpg.bin back.
 - control-flow is lexical (if/else+nesting+early-return guards); no else-if/switch/loops yet.
 - Token tip: pick the smallest lens that answers the question.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -13,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +60,9 @@ type Config struct {
 type ToolConfig struct {
 	Image   string `json:"image,omitempty"`
 	JVMArgs string `json:"jvm_args,omitempty"`
+	// Farm is a joern-farm base URL (e.g. http://farmhost:9090). When set for "joern",
+	// CPG building AND queries are offloaded to the farm — the local machine runs no Joern.
+	Farm string `json:"farm,omitempty"`
 }
 
 type LensConfig struct {
@@ -1094,22 +1100,20 @@ func AnalyzeJoernVarFlow(cfg Config, lens LensConfig) (Projection, error) {
 	}
 
 	mode := coalesce(target.Mode, "auto")
+	farm := joernFarm(cfg) != ""
 	if mode != "fallback" {
 		if mode == "joern" {
-			// Explicit: surface the clear ensureJoern diagnostics on failure.
-			if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err != nil {
-				return Projection{}, fmt.Errorf("joern-var-flow mode=joern: %w", err)
-			}
+			// RunJoernVarFlow → runJoernQuery handles farm vs local (incl. diagnostics).
 			p, err := RunJoernVarFlow(cfg, lens, target)
 			if err != nil {
-				return Projection{}, err
+				return Projection{}, fmt.Errorf("joern-var-flow mode=joern: %w", err)
 			}
 			p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used joern CPG (" + joernEngine(cfg) + ")"})
 			return p, nil
 		}
-		// Auto: try joern only if plausibly available, otherwise fall back silently.
-		if joernAvailable(cfg) {
-			if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err == nil {
+		// Auto: try joern only if plausibly available (or a farm is configured), else fall back.
+		if farm || joernAvailable(cfg) {
+			{
 				if p, err := RunJoernVarFlow(cfg, lens, target); err == nil {
 					p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used joern CPG (" + joernEngine(cfg) + ")"})
 					return p, nil
@@ -1291,6 +1295,19 @@ func RunBuildCPG(cfg Config) error {
 		fmt.Println("build: no joern/control-flow/data-flow/entry-to-exit lenses with a source_root; nothing to build")
 		return nil
 	}
+	// Farm mode: parse each root remotely and download the cpg.bin back.
+	if farm := joernFarm(cfg); farm != "" {
+		for _, root := range ordered {
+			jid, err := farmJobForRoot(cfg, farm, root, os.Stdout)
+			if err != nil {
+				return err
+			}
+			if err := farmDownloadCPG(cfg, farm, jid, root, os.Stdout); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if err := ensureJoern(cfg, os.Stdout); err != nil {
 		return err
 	}
@@ -1393,6 +1410,249 @@ func runJoernScript(cfg Config, name, target, scriptRel string, kv map[string]st
 	o, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
 	fmt.Fprintf(out, "joern: %s finished in %s\n", name, nowFunc().Sub(start).Round(time.Second))
 	return o, err
+}
+
+// ============================================================================
+// joern-farm client: offload CPG build + queries to a remote service so the
+// local machine runs no Joern at all (for slow laptops). See joern-farm/.
+// ============================================================================
+
+func joernFarm(cfg Config) string {
+	if tc, ok := cfg.Tools["joern"]; ok {
+		return strings.TrimRight(tc.Farm, "/")
+	}
+	return ""
+}
+
+// runJoernQuery runs one Joern script for a lens and leaves its JSONL at outRel — either
+// locally (docker/binary) or fully offloaded to a joern-farm. Callers AnalyzeJSONL(outRel).
+func runJoernQuery(cfg Config, lens LensConfig, scriptName, outRel string, kv map[string]string, out io.Writer) error {
+	if farm := joernFarm(cfg); farm != "" {
+		jobID, err := farmJobForRoot(cfg, farm, lens.SourceRoot, out)
+		if err != nil {
+			return err
+		}
+		return farmRunScript(cfg, farm, jobID, scriptName, outRel, kv, out)
+	}
+	if err := prepareJoernLens(cfg, lens.SourceRoot, out); err != nil {
+		return err
+	}
+	kv = withCpgParam(cfg, lens, kv)
+	scriptRel, err := joernScriptRel(cfg, scriptName)
+	if err != nil {
+		return err
+	}
+	output, err := runJoernScript(cfg, strings.TrimSuffix(scriptName, ".sc"), lens.SourceRoot, scriptRel, kv, out)
+	if err != nil {
+		return fmt.Errorf("joern %s failed: %w\n%s", scriptName, err, firstLines(string(output), 25))
+	}
+	return nil
+}
+
+// farmJobForRoot ensures the farm holds a parsed CPG (job) for the source root, returning
+// the job id. It caches the id and reuses it while the source is unchanged and the job still
+// exists on the farm; otherwise it (re)uploads + parses and waits.
+func farmJobForRoot(cfg Config, farm, sourceRoot string, out io.Writer) (string, error) {
+	jobFile := filepath.Join(cfg.Root, cpgPathRel(cfg, sourceRoot)) + ".farmjob"
+	cur, _ := sourceManifest(cfg, sourceRoot)
+	if id, err := os.ReadFile(jobFile); err == nil {
+		add, mod, rem := diffManifest(loadManifest(jobFile+".manifest"), cur)
+		if len(add)+len(mod)+len(rem) == 0 {
+			if jid := strings.TrimSpace(string(id)); farmJobDone(farm, jid) {
+				fmt.Fprintf(out, "farm: reusing parsed job %s for %s\n", jid, sourceRoot)
+				return jid, nil
+			}
+		}
+	}
+	zipBuf, n, err := zipDir(filepath.Join(cfg.Root, sourceRoot))
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprintf(out, "farm: uploading %s (%d files) to %s and parsing...\n", sourceRoot, n, farm)
+	jid, err := farmSubmit(farm, filepath.Base(sourceRoot), zipBuf)
+	if err != nil {
+		return "", err
+	}
+	if err := farmWait(farm, jid, out); err != nil {
+		return "", err
+	}
+	os.MkdirAll(filepath.Dir(jobFile), 0755)
+	os.WriteFile(jobFile, []byte(jid), 0644)
+	saveManifest(jobFile+".manifest", cur)
+	fmt.Fprintf(out, "farm: ✓ parsed (job %s)\n", jid)
+	return jid, nil
+}
+
+func farmRunScript(cfg Config, farm, jobID, scriptName, outRel string, kv map[string]string, out io.Writer) error {
+	script, err := embeddedJoernScripts.ReadFile("tools/joern/" + scriptName)
+	if err != nil {
+		return err
+	}
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, _ := mw.CreateFormFile("script", scriptName)
+	fw.Write(script)
+	for k, v := range kv {
+		if k == "out" || k == "cpgPath" { // the farm sets these itself
+			continue
+		}
+		mw.WriteField("param", k+"="+v)
+	}
+	mw.Close()
+	fmt.Fprintf(out, "farm: running %s on job %s ...\n", strings.TrimSuffix(scriptName, ".sc"), jobID)
+	req, _ := http.NewRequestWithContext(joernContext, "POST", farm+"/jobs/"+jobID+"/script", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("farm: query request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("farm: query failed (HTTP %d): %s", resp.StatusCode, firstLines(string(data), 20))
+	}
+	abs := filepath.Join(cfg.Root, outRel)
+	os.MkdirAll(filepath.Dir(abs), 0755)
+	return os.WriteFile(abs, data, 0644)
+}
+
+// farmDownloadCPG fetches the parsed cpg.bin from the farm into the local cache.
+func farmDownloadCPG(cfg Config, farm, jobID, sourceRoot string, out io.Writer) error {
+	rel := cpgPathRel(cfg, sourceRoot)
+	abs := filepath.Join(cfg.Root, rel)
+	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+		return err
+	}
+	resp, err := http.Get(farm + "/jobs/" + jobID + "/cpg")
+	if err != nil {
+		return fmt.Errorf("farm: download cpg: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("farm: download cpg (HTTP %d): %s", resp.StatusCode, firstLines(string(b), 5))
+	}
+	f, err := os.Create(abs)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	n, err := io.Copy(f, resp.Body)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "farm: ✓ downloaded cpg (%d KB) -> %s\n", n/1024, rel)
+	return nil
+}
+
+func farmSubmit(farm, name string, zipData *bytes.Buffer) (string, error) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	mw.WriteField("metadata", fmt.Sprintf(`{"name":%q,"export":false}`, name))
+	fw, _ := mw.CreateFormFile("source", "source.zip")
+	io.Copy(fw, zipData)
+	mw.Close()
+	resp, err := http.Post(farm+"/jobs", mw.FormDataContentType(), &body)
+	if err != nil {
+		return "", fmt.Errorf("farm: cannot reach %s — is the farm running? (%w)", farm, err)
+	}
+	defer resp.Body.Close()
+	var r struct {
+		JobID string `json:"jobId"`
+		Error string `json:"error"`
+	}
+	json.NewDecoder(resp.Body).Decode(&r)
+	if resp.StatusCode >= 300 || r.JobID == "" {
+		return "", fmt.Errorf("farm: submit failed (HTTP %d): %s", resp.StatusCode, r.Error)
+	}
+	return r.JobID, nil
+}
+
+func farmJobStatus(farm, id string) (status, errMsg string, progress int, ok bool) {
+	resp, err := http.Get(farm + "/jobs/" + id)
+	if err != nil {
+		return "", "", 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", 0, false
+	}
+	var j struct {
+		Status   string `json:"status"`
+		Error    string `json:"error"`
+		Progress int    `json:"progress"`
+	}
+	json.NewDecoder(resp.Body).Decode(&j)
+	return j.Status, j.Error, j.Progress, true
+}
+
+func farmJobDone(farm, id string) bool {
+	s, _, _, ok := farmJobStatus(farm, id)
+	return ok && s == "done"
+}
+
+func farmWait(farm, id string, out io.Writer) error {
+	last := ""
+	for {
+		select {
+		case <-joernContext.Done():
+			return joernContext.Err()
+		default:
+		}
+		s, e, p, ok := farmJobStatus(farm, id)
+		if !ok {
+			return fmt.Errorf("farm: lost job %s", id)
+		}
+		if msg := fmt.Sprintf("%s %d%%", s, p); msg != last {
+			fmt.Fprintf(out, "farm: %s\n", msg)
+			last = msg
+		}
+		switch s {
+		case "done":
+			return nil
+		case "failed":
+			return fmt.Errorf("farm: parse failed: %s", e)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// zipDir zips the scannable source files under dir into an in-memory buffer.
+func zipDir(dir string) (*bytes.Buffer, int, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	n := 0
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !isScannableSource(p) {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, p)
+		w, err := zw.Create(filepath.ToSlash(rel))
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		_, cErr := io.Copy(w, f)
+		f.Close()
+		if cErr != nil {
+			return cErr
+		}
+		n++
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, 0, err
+	}
+	return &buf, n, nil
 }
 
 // RunPerf benchmarks the Joern path end-to-end: build the CPG for a (large) repo and run an
@@ -1712,13 +1972,6 @@ func varFlowTarget(lens LensConfig) (VarFlowTarget, error) {
 }
 
 func RunJoernVarFlow(cfg Config, lens LensConfig, target VarFlowTarget) (Projection, error) {
-	scriptRel, err := joernScriptRel(cfg, "java-var-flow.sc")
-	if err != nil {
-		return Projection{}, err
-	}
-	if lens.Params != nil && lens.Params["joern_script"] != "" {
-		scriptRel = lens.Params["joern_script"]
-	}
 	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-var-flow.jsonl"))
 	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
 		return Projection{}, err
@@ -1731,10 +1984,8 @@ func RunJoernVarFlow(cfg Config, lens LensConfig, target VarFlowTarget) (Project
 		"targetMethod": target.Method,
 		"out":          outRel,
 	}
-	kv = withCpgParam(cfg, lens, kv)
-	output, err := runJoernScript(cfg, "data-flow", target.File, scriptRel, kv, os.Stderr)
-	if err != nil {
-		return Projection{}, fmt.Errorf("joern failed: %w\n%s", err, firstLines(string(output), 25))
+	if err := runJoernQuery(cfg, lens, "java-var-flow.sc", outRel, kv, os.Stderr); err != nil {
+		return Projection{}, err
 	}
 	jsonLens := lens
 	jsonLens.Input = outRel
@@ -2908,9 +3159,6 @@ type cfgPath struct {
 // as branch-per-file projections (an index plus one file per path), matching the lexical
 // lens's output shape. Handles else-if chains, switch, and loops.
 func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, method string) (Projection, error) {
-	if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err != nil {
-		return Projection{}, fmt.Errorf("control-flow mode=joern: %w", err)
-	}
 	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-control-flow.jsonl"))
 	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
 		return Projection{}, err
@@ -2923,14 +3171,8 @@ func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, met
 		"out":          outRel,
 		"maxPaths":     coalesce(lens.Params["max_branches"], "32"),
 	}
-	kv = withCpgParam(cfg, lens, kv)
-	scriptRel, err := joernScriptRel(cfg, "control-flow.sc")
-	if err != nil {
-		return Projection{}, err
-	}
-	output, err := runJoernScript(cfg, "control-flow", fmt.Sprintf("%s:%d", file, line), scriptRel, kv, os.Stderr)
-	if err != nil {
-		return Projection{}, fmt.Errorf("joern control-flow failed: %w\n%s", err, firstLines(string(output), 25))
+	if err := runJoernQuery(cfg, lens, "control-flow.sc", outRel, kv, os.Stderr); err != nil {
+		return Projection{}, fmt.Errorf("control-flow mode=joern: %w", err)
 	}
 	jsonLens := lens
 	jsonLens.Input = outRel
@@ -2975,9 +3217,6 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 	if lens.Params == nil || lens.Params["entry"] == "" || lens.Params["exit"] == "" {
 		return Projection{}, errors.New("entry-to-exit: params.entry and params.exit (regexes) are required")
 	}
-	if err := prepareJoernLens(cfg, lens.SourceRoot, os.Stderr); err != nil {
-		return Projection{}, fmt.Errorf("entry-to-exit: %w", err)
-	}
 	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-entry-to-exit.jsonl"))
 	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
 		return Projection{}, err
@@ -2991,14 +3230,8 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 		"maxPairs":  coalesce(lens.Params["max_pairs"], "200"),
 		"out":       outRel,
 	}
-	kv = withCpgParam(cfg, lens, kv)
-	scriptRel, err := joernScriptRel(cfg, "entry-to-exit.sc")
-	if err != nil {
-		return Projection{}, err
-	}
-	output, err := runJoernScript(cfg, "entry-to-exit", lens.SourceRoot, scriptRel, kv, os.Stderr)
-	if err != nil {
-		return Projection{}, fmt.Errorf("joern entry-to-exit failed: %w\n%s", err, firstLines(string(output), 25))
+	if err := runJoernQuery(cfg, lens, "entry-to-exit.sc", outRel, kv, os.Stderr); err != nil {
+		return Projection{}, fmt.Errorf("entry-to-exit: %w", err)
 	}
 	jsonLens := lens
 	jsonLens.Input = outRel

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,6 +194,51 @@ func TestWizardDetectsStackAndWritesConfig(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "All set") {
 		t.Fatalf("wizard output missing the congrats:\n%s", out.String())
+	}
+}
+
+func TestFarmClientOffloadsBuildAndQuery(t *testing.T) {
+	// Mock joern-farm: accept upload, report done, run "script" by returning JSONL.
+	var gotParams []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(202)
+		w.Write([]byte(`{"jobId":"J1","status":"queued"}`))
+	})
+	mux.HandleFunc("GET /jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"done","progress":100}`))
+	})
+	mux.HandleFunc("POST /jobs/{id}/script", func(w http.ResponseWriter, r *http.Request) {
+		r.ParseMultipartForm(1 << 20)
+		gotParams = r.Form["param"]
+		w.Write([]byte(`{"kind":"block","id":"checkout->save","file":"C.java","mode":"entry-to-exit","tool":"joern","lines":["entry checkout"],"facts":["entrypoint: checkout"]}` + "\n"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "src", "C.java"), "class C { void m(){ repo.save(o); } }\n")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections",
+		Tools: map[string]ToolConfig{"joern": {Farm: srv.URL}},
+		Lenses: []LensConfig{{
+			Name: "e2e", Out: filepath.Join(dir, ".projections", "e2e.projection"), Analyzer: "entry-to-exit", SourceRoot: "src",
+			Params: map[string]string{"entry": "@X", "exit": `\.save\(`},
+		}}}
+	if _, err := Run(cfg, DefaultRegistry()); err != nil {
+		t.Fatalf("farm-backed run failed: %v", err)
+	}
+	got := read(t, filepath.Join(dir, ".projections", "e2e.projection"))
+	if !strings.Contains(got, "checkout->save") || !strings.Contains(got, "entry-to-exit") {
+		t.Fatalf("farm result not rendered:\n%s", got)
+	}
+	// The farm must receive the lens params but NOT out/cpgPath (it sets those itself).
+	joined := strings.Join(gotParams, " ")
+	if !strings.Contains(joined, "entry=@X") || strings.Contains(joined, "out=") || strings.Contains(joined, "cpgPath=") {
+		t.Fatalf("unexpected params sent to farm: %v", gotParams)
+	}
+	// Job id was cached for reuse.
+	if !fileExists(filepath.Join(dir, cpgPathRel(cfg, "src")) + ".farmjob") {
+		t.Fatal("farm job id not cached")
 	}
 }
 

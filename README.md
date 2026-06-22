@@ -211,6 +211,34 @@ finer granularity on a large codebase, split it into multiple source roots/lense
 changed root rebuilds. True surgical node-level re-add (frontend AST pass into the live CPG +
 re-run of the linker overlays + persistence back to `cpg.bin`) is scoped as a Phase-3 item.
 
+### Remote Joern (joern-farm) — for slow/low-RAM machines
+
+If the machine can't run Joern comfortably, offload **both** the CPG build and the queries to
+a [joern-farm](joern-farm/) service — the local machine then runs **no Joern at all**:
+
+```json
+"tools": { "joern": { "farm": "http://farmhost:9090" } }
+```
+
+With a farm configured, each joern lens: zips the source root, uploads it (`POST /jobs`,
+`export:false`), waits while the farm parses (progress streamed), then runs the lens's
+embedded `.sc` against the kept CPG on the farm (`POST /jobs/{id}/script`) and renders the
+returned JSONL locally. The parse job is cached and reused while the source is unchanged
+(re-uploaded only when files change). `build` / `make cpg` additionally downloads the parsed
+`cpg.bin` back (`GET /jobs/{id}/cpg`). No `ssh`/`rsync` — plain HTTP, stdlib only.
+
+Run the bundled farm locally to try it:
+
+```sh
+make farm-up                                   # docker compose up the farm on :9090
+make run CONFIG=farm.config.json               # lenses execute on the farm
+make farm-down
+```
+
+The farm itself (`joern-farm/`) is a small Go service + a Joern worker container; it parses
+with `javasrc2cpg` and exposes `POST /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/cpg`,
+`POST /jobs/{id}/script`, and SSE logs.
+
 ## External tools & Docker fallback
 
 `runTool` prefers a local binary; if absent and `tools.<name>.image` is set (and Docker is

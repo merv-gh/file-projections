@@ -1,0 +1,30 @@
+{
+  "root": ".",
+  "projections_dir": ".projections",
+  "tools": {
+    "joern": { "farm": "http://localhost:9090" }
+  },
+  "lenses": [
+    {
+      "name": "shop-entry-to-exit-farm",
+      "out": ".projections/shop-entry-to-exit-farm.projection",
+      "analyzer": "entry-to-exit",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "entry": "@(KafkaListener|Scheduled|EventListener|PostMapping|GetMapping)",
+        "exit": "\\.(save|send)\\s*\\("
+      }
+    },
+    {
+      "name": "shop-checkout-cpg-paths-farm",
+      "out": ".projections/shop-checkout-cpg-paths-farm.projection",
+      "analyzer": "control-flow",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "mode": "joern",
+        "file": "com/example/shop/OrderController.java",
+        "line": "35"
+      }
+    }
+  ]
+}

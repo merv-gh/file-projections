@@ -1,0 +1,53 @@
+services:
+
+  farm-api:
+    build: .
+    container_name: joern-farm-api
+    ports:
+      - "9090:9090"
+    volumes:
+      - farm-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      PORT: "9090"
+      DATA_DIR: /data
+      WORKER_COUNT: "1"
+    depends_on:
+      - joern-worker-1
+    networks:
+      - farm-net
+
+  # DO NOT set _JAVA_OPTIONS or JAVA_TOOL_OPTIONS here!
+  # They infect EVERY subprocess (Delombok, frontend child JVMs) with the same heap,
+  # causing N × Xmx memory usage → OOM.
+  # JVM heap is passed directly per-tool via -J-Xmx in the worker code.
+  # Delombok is disabled (--delombok-mode no-delombok) to avoid spawning extra JVMs.
+  joern-worker-1: &worker-template
+    image: ghcr.io/joernio/joern:master
+    container_name: joern-worker-1
+    entrypoint: ["tail", "-f", "/dev/null"]
+    volumes:
+      - farm-data:/data
+      - ./test-repo:/test-repo:ro
+    deploy:
+      resources:
+        limits:
+          memory: 20g
+          cpus: "8"
+        reservations:
+          memory: 16g
+          cpus: "4"
+    networks:
+      - farm-net
+
+  # Uncomment to add more workers (increase WORKER_COUNT in farm-api accordingly)
+  # joern-worker-2:
+  #   <<: *worker-template
+  #   container_name: joern-worker-2
+
+volumes:
+  farm-data:
+
+networks:
+  farm-net:
+    driver: bridge

@@ -6,7 +6,7 @@ PKG          := .
 VERSION_FILE := VERSION
 VERSION      := $(shell cat $(VERSION_FILE) 2>/dev/null || echo 0.0.0)
 
-.PHONY: all help build run cpg bookmarks menu watch test eval perf fmt vet clean cross \
+.PHONY: all help build run cpg bookmarks menu watch test eval perf farm-up farm-down fmt vet clean cross \
         version release-patch release-minor release-major
 
 all: build
@@ -54,6 +54,14 @@ eval:
 ## perf: benchmark all-to-all entry->exit on a repo (REPO=url|path) with a 5m cap
 perf: build
 	./$(BINDIR)/$(BIN) perf $(if $(REPO),-repo $(REPO),) $(PERF_ARGS)
+
+## farm-up: start the bundled joern-farm (remote Joern) on :9090
+farm-up:
+	cd joern-farm && docker compose up -d --build
+
+## farm-down: stop the bundled joern-farm
+farm-down:
+	cd joern-farm && docker compose down
 
 fmt:
 	go fmt ./...

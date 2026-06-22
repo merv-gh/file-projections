@@ -155,6 +155,44 @@ func TestAstGrepRequiresParamsAndEngine(t *testing.T) {
 	}
 }
 
+func TestWizardDetectsStackAndWritesConfig(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "src", "main", "java", "com", "x", "Foo.java"),
+		"package com.x;\nclass Foo {\n\t@org.springframework.web.bind.annotation.GetMapping(\"/p\")\n\tpublic String ping() {\n\t\treturn repo.save(x);\n\t}\n}\n")
+	cfgPath := filepath.Join(dir, "config.json")
+	// answers: source(default) / entrypoints Y / exitpoints Y / all-paths N / bookmark Y / watch n
+	in := strings.NewReader("\n\n\n\n\nn\n")
+	var out strings.Builder
+	if err := RunWizard(dir, cfgPath, in, &out); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("wizard did not write a loadable config: %v", err)
+	}
+	byName := map[string]LensConfig{}
+	for _, l := range cfg.Lenses {
+		byName[l.Name] = l
+	}
+	for _, want := range []string{"entrypoints", "exitpoints", "first-bookmark"} {
+		if _, ok := byName[want]; !ok {
+			t.Fatalf("missing %q lens; got %v", want, cfg.Lenses)
+		}
+	}
+	if got := byName["entrypoints"].SourceRoot; got != "src/main/java" {
+		t.Fatalf("expected suggested source root src/main/java, got %q", got)
+	}
+	if byName["first-bookmark"].Params["file"] != "com/x/Foo.java" {
+		t.Fatalf("bookmark file = %q", byName["first-bookmark"].Params["file"])
+	}
+	if !fileExists(filepath.Join(dir, ".projections", "entrypoints.projection")) {
+		t.Fatal("wizard did not generate projections")
+	}
+	if !strings.Contains(out.String(), "All set") {
+		t.Fatalf("wizard output missing the congrats:\n%s", out.String())
+	}
+}
+
 func TestResolveSourceFileRejectsTraversal(t *testing.T) {
 	cfg := Config{Root: t.TempDir()}
 	for _, ref := range []string{"../../etc/passwd", "/etc/passwd", "a/../../b.java", ".."} {

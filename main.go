@@ -29,6 +29,12 @@ import (
 //go:embed tools/joern/*.sc
 var embeddedJoernScripts embed.FS
 
+//go:embed VERSION
+var versionRaw string
+
+// version is the released semver, sourced from the VERSION file (bumped by `make release-*`).
+var version = strings.TrimSpace(versionRaw)
+
 // nowFunc is indirected so tests can pin timestamps deterministically.
 var nowFunc = time.Now
 
@@ -50,12 +56,12 @@ type ToolConfig struct {
 
 type LensConfig struct {
 	Name       string            `json:"name"`
-	Out        string            `json:"out"`
+	Out        string            `json:"out,omitempty"`
 	Analyzer   string            `json:"analyzer"`
-	SourceRoot string            `json:"source_root"`
-	Include    []string          `json:"include"`
-	Input      string            `json:"input"`
-	Params     map[string]string `json:"params"`
+	SourceRoot string            `json:"source_root,omitempty"`
+	Include    []string          `json:"include,omitempty"`
+	Input      string            `json:"input,omitempty"`
+	Params     map[string]string `json:"params,omitempty"`
 }
 
 type Projection struct {
@@ -141,6 +147,12 @@ func main() {
 	// on change) are handled before flag parsing so they keep a clean arg surface.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "version", "-version", "--version", "-v":
+			fmt.Println("file-projections", version)
+			return
+		case "help", "-h", "-help", "--help":
+			printHelp(os.Stdout)
+			return
 		case "menu":
 			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
 			must(err)
@@ -171,6 +183,7 @@ func main() {
 		}
 	}
 
+	flag.Usage = func() { printHelp(os.Stderr) }
 	configPath := flag.String("config", "config.json", "config file")
 	analyzer := flag.String("analyzer", "", "run a single ad-hoc lens with this analyzer, e.g. joern-var-flow")
 	sourceRoot := flag.String("source-root", "", "source root for ad-hoc lens")
@@ -183,7 +196,18 @@ func main() {
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
-	must(err)
+	if err != nil && os.IsNotExist(err) {
+		// First run: no config yet. Ad-hoc lens calls get sane defaults; a bare run
+		// launches the interactive setup wizard instead of erroring.
+		if *analyzer != "" || *targetVar != "" {
+			cfg = Config{Root: ".", ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+		} else {
+			must(RunWizard(".", *configPath, os.Stdin, os.Stdout))
+			return
+		}
+	} else {
+		must(err)
+	}
 
 	if *analyzer != "" || *targetVar != "" {
 		params := map[string]string{}
@@ -224,6 +248,51 @@ func main() {
 	}
 }
 
+func printHelp(w io.Writer) {
+	fmt.Fprintf(w, `file-projections %s — cross-file projection views for code
+
+USAGE
+  file-projections [flags]            generate all lenses in config.json
+                                      (with no config.json, launches the setup wizard)
+  file-projections <command> [flags]
+
+COMMANDS
+  menu          interactively add views (control-flow, data-flow, bookmark, …)
+  watch         regenerate on change + sync two-way bookmark edits back to source
+  build         build/refresh the cached Joern CPG (alias: refresh)
+  bookmarks     expand single-line drop-in .projection files into two-way bookmarks
+  version       print the version
+  help          show this help
+
+FLAGS (run one ad-hoc lens without a config)
+  -config <path>       config file (default config.json)
+  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow
+  -source-root <dir>   source root for the ad-hoc lens
+  -file -line -var -method -mode -out   lens parameters
+
+LENSES
+  entrypoints    where control enters (annotations; params.patterns)
+  exitpoints     where control leaves (sink globs; params.sinks)
+  control-flow   all paths entry→line, one file per branch (mode=joern handles else-if/switch/loops)
+  data-flow      the lines that shape a variable, as trailing comments
+  entry-to-exit  all call-graph flows from entrypoints to exitpoints (joern)
+  bookmark       two-way verbatim span; or drop in 'pkg/Foo.java:17'
+  flow           generic "annotated entry reaches a sink"
+
+EXAMPLES
+  file-projections                                   # first run → setup wizard
+  file-projections -config config.json               # generate every lens
+  file-projections menu                              # add a view interactively
+  file-projections watch                             # live regenerate + two-way sync
+  file-projections -analyzer control-flow -source-root src/main/java \
+      -file com/x/Order.java -line 42 -out paths.projection
+  echo 'com/x/Order.java:42' > .projections/o.projection && file-projections bookmarks
+
+DOCS
+  README.md — full reference   ·   skill.md — agent usage   ·   RELEASE_NOTES.md
+`, version)
+}
+
 func LoadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -240,9 +309,13 @@ func LoadConfig(path string) (Config, error) {
 		cfg.ProjectionsDir = ".projections"
 	}
 	if len(cfg.ExcludeDirs) == 0 {
-		cfg.ExcludeDirs = []string{".git", ".gocache", ".gomodcache", ".projections", "node_modules", "target", "build"}
+		cfg.ExcludeDirs = defaultExcludeDirs()
 	}
 	return cfg, nil
+}
+
+func defaultExcludeDirs() []string {
+	return []string{".git", ".gocache", ".gomodcache", ".projections", "node_modules", "target", "build", "dist", "vendor", "__MACOSX"}
 }
 
 func Run(cfg Config, registry Registry) ([]Projection, error) {
@@ -3575,6 +3648,324 @@ func SaveConfig(path string, cfg Config) error {
 		return err
 	}
 	return os.WriteFile(path, append(b, '\n'), 0644)
+}
+
+// ============================================================================
+// First-run setup wizard
+// ============================================================================
+
+// RunWizard is the no-config first-run experience: detect the stack, suggest a source
+// folder, offer entry/exit/all-paths lenses and a first bookmark, write config.json,
+// generate, and (optionally) drop into watch mode. Scriptable via stdin for tests.
+func RunWizard(root, configPath string, in io.Reader, out io.Writer) error {
+	r := bufio.NewReader(in)
+	ask := func(label, def string) string {
+		if def != "" {
+			fmt.Fprintf(out, "%s [%s]: ", label, def)
+		} else {
+			fmt.Fprintf(out, "%s: ", label)
+		}
+		s, _ := r.ReadString('\n')
+		if s = strings.TrimSpace(s); s == "" {
+			return def
+		}
+		return s
+	}
+	yes := func(label string, def bool) bool {
+		hint := "Y/n"
+		if !def {
+			hint = "y/N"
+		}
+		fmt.Fprintf(out, "%s [%s]: ", label, hint)
+		s, _ := r.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "":
+			return def
+		case "y", "yes":
+			return true
+		default:
+			return false
+		}
+	}
+
+	fmt.Fprintln(out, "No config.json found — let's set up file-projections.")
+	fmt.Fprintln(out)
+
+	cfg := Config{Root: root, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+	scan := scanProject(cfg)
+	if scan.total == 0 {
+		fmt.Fprintf(out, "No Java/Go/JS/TS source files found under %q. Run this from your project root.\n", root)
+		return nil
+	}
+	fmt.Fprintf(out, "Detected %s.\n", scan.summary())
+	lang := scan.dominant()
+	sourceRoot := ask("Source folder to analyze", scan.suggestRoot(cfg, lang))
+
+	var lenses []LensConfig
+	add := func(l LensConfig) { lenses = append(lenses, l) }
+
+	if yes("Add an entrypoints lens (where control enters)?", true) {
+		add(LensConfig{Name: "entrypoints", Out: ".projections/entrypoints.projection", Analyzer: "entrypoints", SourceRoot: sourceRoot,
+			Params: map[string]string{"patterns": entrypointPatternsFor(lang)}})
+	}
+	if yes("Add an exitpoints lens (where control leaves)?", true) {
+		add(LensConfig{Name: "exitpoints", Out: ".projections/exitpoints.projection", Analyzer: "exitpoints", SourceRoot: sourceRoot,
+			Params: map[string]string{"sinks": exitSinksFor(lang)}})
+	}
+	allLabel := "Add an all-paths lens (every flow from entrypoints to exitpoints)?"
+	if !joernAvailable(cfg) {
+		allLabel += " (needs Joern or Docker)"
+	}
+	if yes(allLabel, false) {
+		add(LensConfig{Name: "all-paths", Out: ".projections/all-paths.projection", Analyzer: "entry-to-exit", SourceRoot: sourceRoot,
+			Params: map[string]string{"entry": entryRegexFor(lang), "exit": exitRegexFor(lang)}})
+	}
+
+	if sb, ok := scan.sampleBookmark(cfg, sourceRoot); ok {
+		if yes(fmt.Sprintf("Create your first bookmark from %s (%s:%d-%d, two-way)?", sb.label, sb.file, sb.a, sb.b), true) {
+			add(LensConfig{Name: "first-bookmark", Out: ".projections/first-bookmark.projection", Analyzer: "bookmark", SourceRoot: sourceRoot,
+				Params: map[string]string{"file": sb.file, "lines": fmt.Sprintf("%d-%d", sb.a, sb.b)}})
+		}
+	}
+
+	cfg.Lenses = lenses
+	if err := SaveConfig(configPath, cfg); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "\n✓ Wrote %s (%d lens%s).\n", configPath, len(lenses), plural(len(lenses)))
+	if len(lenses) > 0 {
+		if _, err := Run(cfg, DefaultRegistry()); err != nil {
+			fmt.Fprintln(out, "  (some lenses errored:", err, ")")
+		} else {
+			fmt.Fprintf(out, "✓ Generated projections in %s/\n", cfg.ProjectionsDir)
+		}
+	}
+	fmt.Fprintln(out, "\n🎉 All set! Tips:")
+	fmt.Fprintln(out, "  • edit a bookmark block and it syncs back to source on save (under watch)")
+	fmt.Fprintln(out, "  • paste `pkg/Foo.java:17` into a new .projection file for an instant bookmark")
+	fmt.Fprintln(out, "  • run `file-projections menu` to add control-flow / data-flow views")
+
+	if yes("\nStart watch mode now (regenerate + sync on save)?", true) {
+		fmt.Fprintln(out, "watching for changes (Ctrl-C to stop)...")
+		return RunWatchUntil(cfg, out, nil)
+	}
+	fmt.Fprintln(out, "Done. Re-run `file-projections` to generate, or `file-projections watch`.")
+	return nil
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "es"
+}
+
+// projectScan summarizes the source files found during the wizard's auto-detection.
+type projectScan struct {
+	total       int
+	lang        map[string]int
+	files       map[string][]string // lang -> rel paths
+	srcMainJava []string
+}
+
+func scanProject(cfg Config) projectScan {
+	s := projectScan{lang: map[string]int{}, files: map[string][]string{}}
+	srcMain := map[string]bool{}
+	filepath.WalkDir(cfg.Root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if shouldSkipDir(cfg, p, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !isScannableSource(p) {
+			return nil
+		}
+		rel, _ := filepath.Rel(cfg.Root, p)
+		rel = filepath.ToSlash(rel)
+		lang := wizardLang(p)
+		s.lang[lang]++
+		s.total++
+		s.files[lang] = append(s.files[lang], rel)
+		if lang == "java" {
+			if i := strings.Index(rel, "src/main/java"); i >= 0 {
+				srcMain[rel[:i+len("src/main/java")]] = true
+			}
+		}
+		return nil
+	})
+	for k := range srcMain {
+		s.srcMainJava = append(s.srcMainJava, k)
+	}
+	sort.Strings(s.srcMainJava)
+	return s
+}
+
+func wizardLang(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".java":
+		return "java"
+	case ".go":
+		return "go"
+	default:
+		return "js" // .js/.ts/.jsx/.tsx/.mjs/.cjs
+	}
+}
+
+func (s projectScan) summary() string {
+	var parts []string
+	for _, l := range []string{"java", "go", "js"} {
+		if s.lang[l] > 0 {
+			name := map[string]string{"java": ".java", "go": ".go", "js": ".js/.ts"}[l]
+			parts = append(parts, fmt.Sprintf("%d %s", s.lang[l], name))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (s projectScan) dominant() string {
+	best, n := "js", -1
+	for _, l := range []string{"java", "go", "js"} {
+		if s.lang[l] > n {
+			best, n = l, s.lang[l]
+		}
+	}
+	return best
+}
+
+func (s projectScan) suggestRoot(cfg Config, lang string) string {
+	switch lang {
+	case "java":
+		if len(s.srcMainJava) > 0 {
+			return s.srcMainJava[0]
+		}
+		return commonDir(s.files["java"])
+	case "go":
+		if fileExists(filepath.Join(cfg.Root, "go.mod")) {
+			return "."
+		}
+		return commonDir(s.files["go"])
+	default:
+		if fileExists(filepath.Join(cfg.Root, "package.json")) {
+			return "."
+		}
+		return commonDir(s.files["js"])
+	}
+}
+
+// commonDir returns the longest common directory of a set of rel file paths.
+func commonDir(files []string) string {
+	if len(files) == 0 {
+		return "."
+	}
+	parts := strings.Split(filepath.ToSlash(filepath.Dir(files[0])), "/")
+	for _, f := range files[1:] {
+		fp := strings.Split(filepath.ToSlash(filepath.Dir(f)), "/")
+		i := 0
+		for i < len(parts) && i < len(fp) && parts[i] == fp[i] {
+			i++
+		}
+		parts = parts[:i]
+	}
+	if len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
+		return "."
+	}
+	return strings.Join(parts, "/")
+}
+
+type sampleBM struct {
+	file  string
+	a, b  int
+	label string
+}
+
+// sampleBookmark finds a real method (Java) or function (Go/JS) under the source root to
+// offer as the user's first reference bookmark.
+func (s projectScan) sampleBookmark(cfg Config, sourceRoot string) (sampleBM, bool) {
+	base := filepath.Join(cfg.Root, sourceRoot)
+	var got sampleBM
+	found := false
+	funcRE := regexp.MustCompile(`^\s*(?:export\s+)?(?:public\s+|private\s+|func\s+|function\s+|async\s+)`)
+	filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if shouldSkipDir(cfg, p, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !isScannableSource(p) {
+			return nil
+		}
+		rel, _ := filepath.Rel(base, p)
+		rel = filepath.ToSlash(rel)
+		if strings.HasSuffix(p, ".java") {
+			lines, err := readLines(p)
+			if err != nil {
+				return nil
+			}
+			methods, _ := parseJavaMethods(lines)
+			for _, m := range methods {
+				if m.End > m.Start {
+					got = sampleBM{file: rel, a: m.Start, b: m.End, label: javaClassName(lines) + "." + m.Name}
+					found = true
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		// Go/JS: bookmark the first function-ish block (a small window).
+		lines, err := readLines(p)
+		if err != nil {
+			return nil
+		}
+		for i, l := range lines {
+			if funcRE.MatchString(l) && strings.Contains(l, "(") {
+				end := i + 8
+				if end > len(lines) {
+					end = len(lines)
+				}
+				got = sampleBM{file: rel, a: i + 1, b: end, label: "first function in " + filepath.Base(rel)}
+				found = true
+				return filepath.SkipDir
+			}
+		}
+		return nil
+	})
+	return got, found
+}
+
+// Language-appropriate defaults for the wizard's suggested lenses.
+func entrypointPatternsFor(lang string) string {
+	switch lang {
+	case "java":
+		return "kafka-listener=@KafkaListener;scheduled=@Scheduled;event-listener=@EventListener;http-mapping=@(Get|Post|Put|Delete|Patch|Request)Mapping"
+	case "go":
+		return `http-handler=func .*http\.ResponseWriter;route=\.(GET|POST|PUT|DELETE|HandleFunc)\(`
+	default:
+		return `route=\.(get|post|put|delete)\(;listener=addEventListener\(;handler=\.on\(`
+	}
+}
+
+func exitSinksFor(lang string) string {
+	switch lang {
+	case "go":
+		return "*repo*.Save,*.Exec,*.Publish"
+	default: // java + js share the bean-ish convention well enough
+		return "*repository*.save,*kafka*.send,*.publish"
+	}
+}
+
+func entryRegexFor(lang string) string {
+	switch lang {
+	case "java":
+		return "@(KafkaListener|Scheduled|EventListener|PostMapping|GetMapping)"
+	default:
+		return "@(KafkaListener|Scheduled|PostMapping|GetMapping)"
+	}
+}
+
+func exitRegexFor(lang string) string {
+	return `\.(save|send|publish|Save|Exec)\s*\(`
 }
 
 // ============================================================================

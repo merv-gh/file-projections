@@ -1,12 +1,23 @@
 # file-projections — all dev flows go through make.
-BIN      := file-projections
-BINDIR   := bin
-CONFIG   ?= config.json
-PKG      := .
+BIN          := file-projections
+BINDIR       := bin
+CONFIG       ?= config.json
+PKG          := .
+VERSION_FILE := VERSION
+VERSION      := $(shell cat $(VERSION_FILE) 2>/dev/null || echo 0.0.0)
 
-.PHONY: all build run cpg bookmarks menu watch test eval fmt vet clean cross
+.PHONY: all help build run cpg bookmarks menu watch test eval fmt vet clean cross \
+        version release-patch release-minor release-major
 
 all: build
+
+## help: list the available make targets
+help:
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
+
+## version: print the current version (from the VERSION file)
+version:
+	@echo $(VERSION)
 
 ## build: compile the binary for the host platform into bin/
 build:
@@ -55,3 +66,36 @@ cross:
 
 clean:
 	rm -rf $(BINDIR)
+
+# bump <part>: read VERSION, increment major/minor/patch, write it back, then commit and
+# tag. Runs tests first and requires a clean tree. Pushing (which fires the release
+# workflow) is left as an explicit follow-up so the outward-facing step stays deliberate.
+define bump
+	@test -z "$$(git status --porcelain)" || { echo "working tree not clean — commit or stash first"; exit 1; }
+	@go test ./... >/dev/null
+	@old=$$(cat $(VERSION_FILE)); \
+	maj=$$(echo $$old | cut -d. -f1); min=$$(echo $$old | cut -d. -f2); pat=$$(echo $$old | cut -d. -f3); \
+	case "$(1)" in \
+	  major) maj=$$((maj+1)); min=0; pat=0;; \
+	  minor) min=$$((min+1)); pat=0;; \
+	  patch) pat=$$((pat+1));; \
+	esac; \
+	new=$$maj.$$min.$$pat; \
+	echo $$new > $(VERSION_FILE); \
+	git add $(VERSION_FILE); \
+	git commit -m "release v$$new" >/dev/null; \
+	git tag "v$$new"; \
+	echo "bumped $$old -> v$$new and tagged. Publish with: git push --follow-tags"
+endef
+
+## release-patch: bump x.y.Z, commit, tag (then `git push --follow-tags` to release)
+release-patch:
+	$(call bump,patch)
+
+## release-minor: bump x.Y.0, commit, tag (then `git push --follow-tags` to release)
+release-minor:
+	$(call bump,minor)
+
+## release-major: bump X.0.0, commit, tag (then `git push --follow-tags` to release)
+release-major:
+	$(call bump,major)

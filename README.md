@@ -18,8 +18,14 @@ built-in scanner when not.
 
 ## Quick start
 
+First run with no `config.json` launches an interactive **setup wizard**: it detects your
+stack (Java/Go/JS/TS), suggests a source folder (e.g. `src/main/java`), offers
+entrypoints / exitpoints / all-paths lenses and a first two-way bookmark from a real method,
+writes `config.json`, generates the projections, and drops you into watch mode.
+
 ```sh
 make build                 # -> bin/file-projections
+./bin/file-projections     # first run -> setup wizard
 make run                   # generate every lens in config.json into .projections/
 make menu                  # interactively add a view (control-flow, data-flow, ...)
 make watch                 # regenerate on change + sync two-way edits back to source
@@ -215,11 +221,26 @@ conflicts are detected; the menu persists lenses. Fixtures live under `fixtures/
 
 ## Releases
 
+The version lives in the `VERSION` file, embedded into the binary (`file-projections
+version` / `--version`). Bump + tag with one command:
+
+```sh
+make release-patch     # x.y.Z  (bug fixes)
+make release-minor     # x.Y.0  (new features)
+make release-major     # X.0.0  (breaking changes)
+git push --follow-tags # publish — fires the release workflow
+```
+
+Each `release-*` runs the tests, requires a clean tree, writes the new `VERSION`, commits,
+and tags `vX.Y.Z`. Pushing the tag is left explicit so the outward-facing step is deliberate.
+
 CI (`.github/workflows/test.yml`) runs `gofmt`/`vet`/`test`/`build` on every push and PR;
-engine-backed tests self-skip on a stock runner. Pushing a `vX.Y.Z` tag triggers
-`release.yml`, which cross-compiles the four binaries (+ `SHA256SUMS.txt`) and publishes a
-GitHub Release using `RELEASE_NOTES.md`. The binary embeds its Joern scripts, so a single
-downloaded executable is self-sufficient.
+engine-backed tests self-skip on a stock runner. The pushed tag triggers `release.yml`, which
+cross-compiles the four binaries (+ `SHA256SUMS.txt`) and publishes a GitHub Release using
+`RELEASE_NOTES.md`. The binary embeds its Joern scripts, so a single downloaded executable is
+self-sufficient.
+
+Run `file-projections help` for the full command/flag/lens/example reference.
 
 ## Roadmap
 

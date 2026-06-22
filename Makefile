@@ -6,7 +6,7 @@ PKG          := .
 VERSION_FILE := VERSION
 VERSION      := $(shell cat $(VERSION_FILE) 2>/dev/null || echo 0.0.0)
 
-.PHONY: all help build run cpg bookmarks menu watch test eval fmt vet clean cross \
+.PHONY: all help build run cpg bookmarks menu watch test eval perf fmt vet clean cross \
         version release-patch release-minor release-major
 
 all: build
@@ -50,6 +50,10 @@ test:
 ## eval: compare a standard task WITH vs WITHOUT the skill on a local Ollama model
 eval:
 	bash tools/ollama-eval.sh $(MODEL)
+
+## perf: benchmark all-to-all entry->exit on a repo (REPO=url|path) with a 5m cap
+perf: build
+	./$(BINDIR)/$(BIN) perf $(if $(REPO),-repo $(REPO),) $(PERF_ARGS)
 
 fmt:
 	go fmt ./...

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"embed"
 	"encoding/hex"
@@ -21,6 +22,10 @@ import (
 	"strings"
 	"time"
 )
+
+// joernContext bounds the running time of Joern subprocesses. It defaults to no limit; the
+// `perf` benchmark sets a deadline so a runaway parse is killed instead of hanging.
+var joernContext = context.Background()
 
 // Joern scripts are embedded so the binary is self-sufficient — no tools/ dir needs to
 // ship alongside it. They are materialized under <projections_dir>/.joern-scripts/ at run
@@ -168,6 +173,9 @@ func main() {
 			must(err)
 			must(RunBuildCPG(cfg))
 			return
+		case "perf":
+			must(RunPerf(os.Args[2:], os.Stdout))
+			return
 		case "bookmarks":
 			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
 			must(err)
@@ -261,6 +269,7 @@ COMMANDS
   watch         regenerate on change + sync two-way bookmark edits back to source
   build         build/refresh the cached Joern CPG (alias: refresh)
   bookmarks     expand single-line drop-in .projection files into two-way bookmarks
+  perf          benchmark all-to-all entry→exit on a repo, with a wall-clock cap
   version       print the version
   help          show this help
 
@@ -287,6 +296,7 @@ EXAMPLES
   file-projections -analyzer control-flow -source-root src/main/java \
       -file com/x/Order.java -line 42 -out paths.projection
   echo 'com/x/Order.java:42' > .projections/o.projection && file-projections bookmarks
+  file-projections perf -repo https://github.com/spring-projects/spring-petclinic -timeout 5m
 
 DOCS
   README.md — full reference   ·   skill.md — agent usage   ·   RELEASE_NOTES.md
@@ -1253,14 +1263,14 @@ func execJoern(cfg Config, scriptRel string, kv map[string]string, pathKeys map[
 	}
 
 	if local {
-		cmd := exec.Command(joernBin, scriptArgs...)
+		cmd := exec.CommandContext(joernContext, joernBin, scriptArgs...)
 		cmd.Dir = cfg.Root
 		return cmd.CombinedOutput()
 	}
 	dargs := []string{"run", "--rm", "-v", dockerMount(absRoot), "-w", "/src",
 		"-e", "_JAVA_OPTIONS=" + joernJVMArgs(cfg), joernImage(cfg), "joern"}
 	dargs = append(dargs, scriptArgs...)
-	cmd := exec.Command("docker", dargs...)
+	cmd := exec.CommandContext(joernContext, "docker", dargs...)
 	cmd.Dir = cfg.Root
 	return cmd.CombinedOutput()
 }
@@ -1383,6 +1393,111 @@ func runJoernScript(cfg Config, name, target, scriptRel string, kv map[string]st
 	o, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
 	fmt.Fprintf(out, "joern: %s finished in %s\n", name, nowFunc().Sub(start).Round(time.Second))
 	return o, err
+}
+
+// RunPerf benchmarks the Joern path end-to-end: build the CPG for a (large) repo and run an
+// all-to-all entrypoint→exitpoint query, under a hard wall-clock timeout, reporting timings.
+// Cross-platform (uses a context deadline, not the `timeout` binary).
+func RunPerf(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("perf", flag.ContinueOnError)
+	fs.SetOutput(out)
+	repo := fs.String("repo", "spring-petclinic-main", "git URL or local path of the repo to benchmark")
+	sourceRoot := fs.String("source-root", "", "source root within the repo (auto-detected if empty)")
+	budget := fs.Duration("timeout", 5*time.Minute, "hard wall-clock cap for the whole benchmark")
+	entry := fs.String("entry", "@(KafkaListener|Scheduled|EventListener|PostMapping|GetMapping|PutMapping|DeleteMapping|RequestMapping)", "entrypoint annotation regex")
+	exit := fs.String("exit", `\.(save|send|publish|saveAll|persist)\s*\(`, "exitpoint call regex")
+	keep := fs.Bool("keep", false, "keep a cloned repo instead of deleting it")
+	jvm := fs.String("jvm", "-Xmx6g", "jvm_args for Joern (raise for very large repos)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Resolve the repo to a local directory (clone shallow if it's a URL).
+	root := *repo
+	cloned := ""
+	if isGitURL(*repo) {
+		dir, err := os.MkdirTemp("", "fp-perf-*")
+		if err != nil {
+			return err
+		}
+		cloned = dir
+		fmt.Fprintf(out, "perf: cloning %s (shallow) ...\n", *repo)
+		c := exec.Command("git", "clone", "--depth", "1", *repo, dir)
+		c.Stdout, c.Stderr = out, out
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
+		}
+		root = dir
+	}
+	if !*keep && cloned != "" {
+		defer os.RemoveAll(cloned)
+	}
+	if _, err := os.Stat(root); err != nil {
+		return fmt.Errorf("repo path %q not found", root)
+	}
+
+	cfg := Config{Root: root, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs(),
+		Tools: map[string]ToolConfig{"joern": {Image: defaultJoernImage, JVMArgs: *jvm}}}
+	sr := *sourceRoot
+	if sr == "" {
+		sr = scanProject(cfg).suggestRoot(cfg, "java")
+	}
+	files := 0
+	if m, err := sourceManifest(cfg, sr); err == nil {
+		files = len(m)
+	}
+	lens := LensConfig{Name: "perf-all-to-all", Out: ".projections/perf.projection", Analyzer: "entry-to-exit",
+		SourceRoot: sr, Params: map[string]string{"entry": *entry, "exit": *exit, "max_pairs": "100000"}}
+	cfg.Lenses = []LensConfig{lens}
+
+	// Hard wall-clock cap: kill Joern subprocesses when the deadline passes.
+	ctx, cancel := context.WithTimeout(context.Background(), *budget)
+	defer cancel()
+	prev := joernContext
+	joernContext = ctx
+	defer func() { joernContext = prev }()
+
+	fmt.Fprintf(out, "\nperf benchmark\n  repo:        %s\n  source root: %s (%d source files)\n  budget:      %s\n  query:       all-to-all entrypoints→exitpoints\n\n",
+		*repo, sr, files, *budget)
+
+	if err := ensureJoern(cfg, out); err != nil {
+		return err
+	}
+
+	// Phase 1: build the CPG.
+	tBuild := nowFunc()
+	if _, err := ensureCPG(cfg, sr, out); err != nil {
+		return perfErr("CPG build", *budget, ctx, err)
+	}
+	buildDur := nowFunc().Sub(tBuild)
+
+	// Phase 2: the all-to-all query.
+	tQuery := nowFunc()
+	p, err := ExecuteLens(cfg, DefaultRegistry(), lens)
+	if err != nil {
+		return perfErr("entry-to-exit query", *budget, ctx, err)
+	}
+	queryDur := nowFunc().Sub(tQuery)
+
+	fmt.Fprintf(out, "\n========== perf result ==========\n")
+	fmt.Fprintf(out, "  source files:   %d\n", files)
+	fmt.Fprintf(out, "  CPG build:      %s\n", buildDur.Round(time.Millisecond))
+	fmt.Fprintf(out, "  all-to-all:     %s\n", queryDur.Round(time.Millisecond))
+	fmt.Fprintf(out, "  total:          %s (budget %s)\n", (buildDur + queryDur).Round(time.Millisecond), *budget)
+	fmt.Fprintf(out, "  flows found:    %d entrypoint→exitpoint paths\n", len(p.Blocks))
+	fmt.Fprintf(out, "=================================\n")
+	return nil
+}
+
+func perfErr(phase string, budget time.Duration, ctx context.Context, err error) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("perf: %s exceeded the %s budget (killed). Raise -timeout or -jvm, or split into smaller source roots", phase, budget)
+	}
+	return fmt.Errorf("perf: %s failed: %w", phase, err)
+}
+
+func isGitURL(s string) bool {
+	return strings.Contains(s, "://") || strings.HasPrefix(s, "git@") || strings.HasSuffix(s, ".git")
 }
 
 // joernSourceRoots returns the unique source roots used by joern-backed lenses.
@@ -1548,7 +1663,7 @@ func execJoernParse(cfg Config, sourceRootRel, outRel string) ([]byte, error) {
 	if localBin != "" {
 		args := append([]string{}, jflags...)
 		args = append(args, filepath.Join(absRoot, sourceRootRel), "--output", filepath.Join(absRoot, outRel))
-		cmd := exec.Command(localBin, args...)
+		cmd := exec.CommandContext(joernContext, localBin, args...)
 		cmd.Dir = cfg.Root
 		return cmd.CombinedOutput()
 	}
@@ -1567,7 +1682,7 @@ func execJoernParse(cfg Config, sourceRootRel, outRel string) ([]byte, error) {
 		dargs = append(dargs, jflags...)
 		dargs = append(dargs, src, "--output", out)
 	}
-	cmd := exec.Command("docker", dargs...)
+	cmd := exec.CommandContext(joernContext, "docker", dargs...)
 	cmd.Dir = cfg.Root
 	return cmd.CombinedOutput()
 }

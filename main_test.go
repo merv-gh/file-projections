@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const sampleRoot = "fixtures/spring-sample/src/main/java"
@@ -190,6 +192,29 @@ func TestWizardDetectsStackAndWritesConfig(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "All set") {
 		t.Fatalf("wizard output missing the congrats:\n%s", out.String())
+	}
+}
+
+func TestPerfHelpers(t *testing.T) {
+	for _, u := range []string{"https://github.com/x/y", "git@github.com:x/y.git", "x/y.git"} {
+		if !isGitURL(u) {
+			t.Fatalf("%q should be a git URL", u)
+		}
+	}
+	for _, p := range []string{"spring-petclinic-main", "./local", "/abs/path"} {
+		if isGitURL(p) {
+			t.Fatalf("%q should be a local path", p)
+		}
+	}
+	// A blown budget reports a clear, actionable timeout message.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	deadlined, c2 := context.WithTimeout(context.Background(), 0)
+	defer c2()
+	<-deadlined.Done()
+	err := perfErr("CPG build", 5*time.Minute, deadlined, ctx.Err())
+	if err == nil || !strings.Contains(err.Error(), "exceeded the 5m0s budget") {
+		t.Fatalf("expected timeout message, got %v", err)
 	}
 }
 

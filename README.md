@@ -227,6 +227,33 @@ guards; data-flow renders trailing padded comments; bookmark round-trip is idemp
 conflicts are detected; the menu persists lenses. Fixtures live under `fixtures/`; the real
 `spring-petclinic-main` tree is used for non-synthetic entrypoint/exitpoint sanity.
 
+## Performance
+
+Benchmark the Joern path end-to-end (CPG build + all-to-all entrypoint→exitpoint query)
+against any repo, with a hard wall-clock cap so a runaway parse is killed instead of hanging:
+
+```sh
+make perf                                                   # local sample (fast)
+make perf REPO=https://github.com/spring-projects/spring-petclinic
+./bin/file-projections perf -repo <url|path> -source-root . -jvm -Xmx12g -timeout 5m
+```
+
+It clones (shallow) if given a URL, auto-detects the source root, builds the CPG with the
+direct frontend, runs the all-to-all query, and prints a report:
+
+```
+========== perf result ==========
+  source files:   30
+  CPG build:      7.6s
+  all-to-all:     22.4s
+  total:          30.0s (budget 5m0s)
+  flows found:    5 entrypoint→exitpoint paths
+=================================
+```
+
+If a phase exceeds `-timeout`, it's killed and reported as such — raise `-jvm` (heap) or
+`-timeout`, or split the codebase into smaller source roots.
+
 ## Releases
 
 The version lives in the `VERSION` file, embedded into the binary (`file-projections

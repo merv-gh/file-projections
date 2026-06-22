@@ -1,0 +1,11 @@
+{
+  "root": ".",
+  "lenses": [
+    {
+      "name": "jsonl-demo",
+      "out": ".projections/jsonl-demo.projection",
+      "analyzer": "jsonl",
+      "input": "fixtures/tool-output.jsonl"
+    }
+  ]
+}

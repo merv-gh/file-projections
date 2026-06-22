@@ -1,0 +1,54 @@
+{
+  "root": ".",
+  "projections_dir": ".projections",
+  "tools": {
+    "joern": { "image": "ghcr.io/joernio/joern:nightly", "jvm_args": "-Xmx6g" }
+  },
+  "lenses": [
+    {
+      "name": "shop-checkout-order-cpg-data-flow",
+      "out": ".projections/shop-checkout-order-cpg-data-flow.projection",
+      "analyzer": "joern-var-flow",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "mode": "joern",
+        "file": "com/example/shop/OrderController.java",
+        "line": "35",
+        "var": "order"
+      }
+    },
+    {
+      "name": "shop-checkout-cpg-paths",
+      "out": ".projections/shop-checkout-cpg-paths.projection",
+      "analyzer": "control-flow",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "mode": "joern",
+        "file": "com/example/shop/OrderController.java",
+        "line": "35"
+      }
+    },
+    {
+      "name": "shop-routing-cpg-paths",
+      "out": ".projections/shop-routing-cpg-paths.projection",
+      "analyzer": "control-flow",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "mode": "joern",
+        "file": "com/example/shop/RoutingController.java",
+        "line": "48",
+        "max_branches": "32"
+      }
+    },
+    {
+      "name": "shop-entry-to-exit",
+      "out": ".projections/shop-entry-to-exit.projection",
+      "analyzer": "entry-to-exit",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "entry": "@(KafkaListener|Scheduled|EventListener|PostMapping|GetMapping)",
+        "exit": "\\.(save|send)\\s*\\("
+      }
+    }
+  ]
+}

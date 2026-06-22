@@ -1,0 +1,3705 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha1"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Joern scripts are embedded so the binary is self-sufficient — no tools/ dir needs to
+// ship alongside it. They are materialized under <projections_dir>/.joern-scripts/ at run
+// time (that path is inside the Docker bind mount, so containerized Joern can read them).
+//
+//go:embed tools/joern/*.sc
+var embeddedJoernScripts embed.FS
+
+// nowFunc is indirected so tests can pin timestamps deterministically.
+var nowFunc = time.Now
+
+type Config struct {
+	Root           string                `json:"root"`
+	ProjectionsDir string                `json:"projections_dir"`
+	ExcludeDirs    []string              `json:"exclude_dirs"`
+	Tools          map[string]ToolConfig `json:"tools,omitempty"`
+	Lenses         []LensConfig          `json:"lenses"`
+}
+
+// ToolConfig describes how to invoke an external tool that may not be installed
+// locally. When the binary is missing from PATH, runTool falls back to a Docker
+// image. JVMArgs is forwarded to memory-hungry tools like Joern via _JAVA_OPTIONS.
+type ToolConfig struct {
+	Image   string `json:"image,omitempty"`
+	JVMArgs string `json:"jvm_args,omitempty"`
+}
+
+type LensConfig struct {
+	Name       string            `json:"name"`
+	Out        string            `json:"out"`
+	Analyzer   string            `json:"analyzer"`
+	SourceRoot string            `json:"source_root"`
+	Include    []string          `json:"include"`
+	Input      string            `json:"input"`
+	Params     map[string]string `json:"params"`
+}
+
+type Projection struct {
+	Lens   LensConfig
+	Blocks []ProjectionBlock
+	Facts  []ProjectionFact
+	// Sync is the projection-level sync policy: "view-only" (analytical lenses
+	// that are regenerated, never written back) or "two-way" (extract lenses).
+	Sync string
+	// Extra holds additional projection files a single lens emits, e.g. the
+	// control-flow lens emitting one file per branch. Each is rendered to its Path.
+	Extra []ExtraFile
+}
+
+type ExtraFile struct {
+	Path string
+	Proj Projection
+}
+
+type ProjectionBlock struct {
+	ID    string
+	File  string
+	Mode  string
+	Tool  string
+	Lines []string
+	Facts []string
+	Hash  string
+	// Sync/Src fields support two-way "extract" blocks. SrcHash is the hash of
+	// the source span at generation time; it lets SyncProjection detect whether
+	// the source changed independently of the projection (conflict detection).
+	Sync     string
+	SrcFile  string
+	SrcStart int
+	SrcEnd   int
+	SrcHash  string
+}
+
+type ProjectionFact struct {
+	ID   string
+	Text string
+	Tool string
+}
+
+type Analyzer interface {
+	Name() string
+	Analyze(cfg Config, lens LensConfig) (Projection, error)
+}
+
+type AnalyzerFunc struct {
+	name string
+	fn   func(Config, LensConfig) (Projection, error)
+}
+
+func (a AnalyzerFunc) Name() string { return a.name }
+
+func (a AnalyzerFunc) Analyze(cfg Config, lens LensConfig) (Projection, error) {
+	return a.fn(cfg, lens)
+}
+
+type Registry map[string]Analyzer
+
+func DefaultRegistry() Registry {
+	return Registry{
+		"jsonl":             AnalyzerFunc{"jsonl", AnalyzeJSONL},
+		"go-symbols":        AnalyzerFunc{"go-symbols", AnalyzeGoSymbols},
+		"flow":              AnalyzerFunc{"flow", AnalyzeFlow},
+		"java-post-to-save": AnalyzerFunc{"java-post-to-save", AnalyzeFlow}, // back-compat alias for flow
+		"js-events":         AnalyzerFunc{"js-events", AnalyzeJSEvents},
+		"joern-var-flow":    AnalyzerFunc{"joern-var-flow", AnalyzeJoernVarFlow},
+		"entrypoints":       AnalyzerFunc{"entrypoints", AnalyzeEntrypoints},
+		"exitpoints":        AnalyzerFunc{"exitpoints", AnalyzeExitpoints},
+		"ast-grep":          AnalyzerFunc{"ast-grep", AnalyzeAstGrep},
+		"control-flow":      AnalyzerFunc{"control-flow", AnalyzeControlFlow},
+		"entry-to-exit":     AnalyzerFunc{"entry-to-exit", AnalyzeEntryToExit},
+		"data-flow":         AnalyzerFunc{"data-flow", AnalyzeDataFlow},
+		"bookmark":          AnalyzerFunc{"bookmark", AnalyzeBookmark},
+		"extract":           AnalyzerFunc{"extract", AnalyzeBookmark}, // back-compat alias
+	}
+}
+
+func main() {
+	// Subcommand dispatch: `menu` (interactive) and `watch` (regenerate + back-sync
+	// on change) are handled before flag parsing so they keep a clean arg surface.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "menu":
+			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
+			must(err)
+			must(RunMenu(cfg, subConfigPath(os.Args[2:]), os.Stdin, os.Stdout))
+			return
+		case "watch":
+			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
+			must(err)
+			must(RunWatch(cfg))
+			return
+		case "build", "refresh":
+			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
+			must(err)
+			must(RunBuildCPG(cfg))
+			return
+		case "bookmarks":
+			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
+			must(err)
+			expanded, err := expandDropIns(cfg)
+			must(err)
+			if len(expanded) == 0 {
+				fmt.Println("no drop-in bookmarks found (paste e.g. `pkg/Foo.java:17` into a new .projection file)")
+			}
+			for _, p := range expanded {
+				fmt.Println("expanded drop-in bookmark:", p)
+			}
+			return
+		}
+	}
+
+	configPath := flag.String("config", "config.json", "config file")
+	analyzer := flag.String("analyzer", "", "run a single ad-hoc lens with this analyzer, e.g. joern-var-flow")
+	sourceRoot := flag.String("source-root", "", "source root for ad-hoc lens")
+	out := flag.String("out", "", "projection output for ad-hoc lens")
+	targetVar := flag.String("var", "", "target variable for joern-var-flow")
+	targetFile := flag.String("file", "", "target source file for joern-var-flow")
+	targetLine := flag.String("line", "", "target line number for joern-var-flow")
+	targetMethod := flag.String("method", "", "target method name for joern-var-flow")
+	mode := flag.String("mode", "", "adapter mode, e.g. auto, joern, fallback")
+	flag.Parse()
+
+	cfg, err := LoadConfig(*configPath)
+	must(err)
+
+	if *analyzer != "" || *targetVar != "" {
+		params := map[string]string{}
+		if *targetVar != "" {
+			params["var"] = *targetVar
+		}
+		if *targetFile != "" {
+			params["file"] = *targetFile
+		}
+		if *targetLine != "" {
+			params["line"] = *targetLine
+		}
+		if *targetMethod != "" {
+			params["method"] = *targetMethod
+		}
+		if *mode != "" {
+			params["mode"] = *mode
+		}
+		lensOut := *out
+		if lensOut == "" {
+			lensOut = filepath.Join(cfg.ProjectionsDir, "adhoc-"+coalesce(*analyzer, "joern-var-flow")+".projection")
+		}
+		cfg.Lenses = []LensConfig{{
+			Name:       "adhoc-" + coalesce(*analyzer, "joern-var-flow"),
+			Out:        lensOut,
+			Analyzer:   coalesce(*analyzer, "joern-var-flow"),
+			SourceRoot: *sourceRoot,
+			Params:     params,
+		}}
+	}
+
+	results, err := Run(cfg, DefaultRegistry())
+	must(err)
+
+	for _, p := range results {
+		out := LensOut(cfg, p.Lens)
+		fmt.Printf("wrote %s (%d blocks, %d facts)\n", out, len(p.Blocks), len(p.Facts))
+	}
+}
+
+func LoadConfig(path string) (Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return Config{}, err
+	}
+	if cfg.Root == "" {
+		cfg.Root = "."
+	}
+	if cfg.ProjectionsDir == "" {
+		cfg.ProjectionsDir = ".projections"
+	}
+	if len(cfg.ExcludeDirs) == 0 {
+		cfg.ExcludeDirs = []string{".git", ".gocache", ".gomodcache", ".projections", "node_modules", "target", "build"}
+	}
+	return cfg, nil
+}
+
+func Run(cfg Config, registry Registry) ([]Projection, error) {
+	if len(cfg.Lenses) == 0 {
+		return nil, errors.New("config has no lenses")
+	}
+
+	var results []Projection
+	for _, lens := range cfg.Lenses {
+		p, err := ExecuteLens(cfg, registry, lens)
+		if err != nil {
+			return nil, fmt.Errorf("lens %s: %w", lens.Name, err)
+		}
+		if err := RenderProjection(LensOut(cfg, lens), p); err != nil {
+			return nil, err
+		}
+		for _, ex := range p.Extra {
+			if err := RenderProjection(ex.Path, ex.Proj); err != nil {
+				return nil, err
+			}
+		}
+		results = append(results, p)
+	}
+	return results, nil
+}
+
+func ExecuteLens(cfg Config, registry Registry, lens LensConfig) (Projection, error) {
+	analyzer, ok := registry[lens.Analyzer]
+	if !ok {
+		return Projection{}, fmt.Errorf("unknown analyzer %q", lens.Analyzer)
+	}
+	p, err := analyzer.Analyze(cfg, lens)
+	if err != nil {
+		return Projection{}, err
+	}
+	p.Lens = lens
+	finalizeProjection(&p, lens)
+	return p, nil
+}
+
+// finalizeProjection sorts blocks/facts and stamps content hashes. It recurses
+// into Extra files (e.g. control-flow branches) so every emitted projection is
+// stamped consistently.
+func finalizeProjection(p *Projection, lens LensConfig) {
+	if p.Sync == "" {
+		p.Sync = "view-only"
+	}
+	SortProjection(p)
+	for i := range p.Blocks {
+		p.Blocks[i].Hash = hash(strings.Join(p.Blocks[i].Lines, "\n") + "\n")
+	}
+	for i := range p.Extra {
+		p.Extra[i].Proj.Lens = lens
+		finalizeProjection(&p.Extra[i].Proj, lens)
+	}
+}
+
+func LensOut(cfg Config, lens LensConfig) string {
+	if lens.Out != "" {
+		if filepath.IsAbs(lens.Out) {
+			return lens.Out
+		}
+		return filepath.Join(cfg.Root, lens.Out)
+	}
+	name := lens.Name
+	if filepath.Ext(name) == "" {
+		name += ".projection"
+	}
+	return filepath.Join(cfg.Root, cfg.ProjectionsDir, name)
+}
+
+func RenderProjection(path string, p Projection) error {
+	var b strings.Builder
+	body := projectionBody(p)
+	sync := p.Sync
+	if sync == "" {
+		sync = "view-only"
+	}
+	fmt.Fprintf(&b, "# generated by file-projections\n")
+	fmt.Fprintf(&b, "# lens: %s\n", p.Lens.Name)
+	fmt.Fprintf(&b, "# analyzer: %s\n", p.Lens.Analyzer)
+	fmt.Fprintf(&b, "# sync: %s\n", sync)
+	fmt.Fprintf(&b, "# source-hash: %s\n", hash(body))
+	fmt.Fprintf(&b, "# generated-at: %s\n\n", nowFunc().UTC().Format(time.RFC3339))
+	b.WriteString(body)
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(b.String()), 0644)
+}
+
+// projectionBody renders the stable, timestamp-free body (blocks + facts). The
+// header carries the volatile generated-at; idempotency is defined over this body.
+func projectionBody(p Projection) string {
+	var b strings.Builder
+	for _, block := range p.Blocks {
+		b.WriteString(renderAnchor(block))
+		b.WriteString("\n")
+		for _, line := range block.Lines {
+			b.WriteString(line)
+			if !strings.HasSuffix(line, "\n") {
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("@@\n")
+		for _, fact := range block.Facts {
+			fmt.Fprintf(&b, "=> %s: %s\n", block.ID, fact)
+		}
+		b.WriteString("\n")
+	}
+
+	for _, fact := range p.Facts {
+		if fact.Tool == "" {
+			fmt.Fprintf(&b, "=> %s: %s\n", fact.ID, fact.Text)
+		} else {
+			fmt.Fprintf(&b, "=> %s.%s: %s\n", fact.Tool, fact.ID, fact.Text)
+		}
+	}
+	if len(p.Facts) > 0 {
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderAnchor builds the "@@ ..." block header. Two-way extract blocks carry
+// extra metadata (sync/src/srchash) so SyncProjection can map edits back to source.
+func renderAnchor(block ProjectionBlock) string {
+	anchor := fmt.Sprintf("@@ %s#%s [%s.%s hash=%s", block.File, block.ID, block.Tool, block.Mode, block.Hash)
+	if block.Sync == "two-way" && block.SrcFile != "" {
+		anchor += fmt.Sprintf(" sync=two-way src=%s:%d-%d srchash=%s", block.SrcFile, block.SrcStart, block.SrcEnd, block.SrcHash)
+	}
+	return anchor + "]"
+}
+
+func SortProjection(p *Projection) {
+	sort.SliceStable(p.Blocks, func(i, j int) bool {
+		if p.Blocks[i].File == p.Blocks[j].File {
+			return p.Blocks[i].ID < p.Blocks[j].ID
+		}
+		return p.Blocks[i].File < p.Blocks[j].File
+	})
+	sort.SliceStable(p.Facts, func(i, j int) bool { return p.Facts[i].ID < p.Facts[j].ID })
+}
+
+// JSONL analyzer: generic adapter for external tool outputs.
+func AnalyzeJSONL(cfg Config, lens LensConfig) (Projection, error) {
+	path := filepath.Join(cfg.Root, lens.Input)
+	f, err := os.Open(path)
+	if err != nil {
+		return Projection{}, err
+	}
+	defer f.Close()
+
+	var p Projection
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024), 1024*1024)
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Kind  string   `json:"kind"`
+			ID    string   `json:"id"`
+			File  string   `json:"file"`
+			Mode  string   `json:"mode"`
+			Tool  string   `json:"tool"`
+			Text  string   `json:"text"`
+			Lines []string `json:"lines"`
+			Facts []string `json:"facts"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return Projection{}, fmt.Errorf("%s:%d: %w", lens.Input, lineNo, err)
+		}
+		switch rec.Kind {
+		case "block":
+			p.Blocks = append(p.Blocks, ProjectionBlock{ID: rec.ID, File: rec.File, Mode: rec.Mode, Tool: coalesce(rec.Tool, "jsonl"), Lines: rec.Lines, Facts: rec.Facts})
+		case "fact":
+			p.Facts = append(p.Facts, ProjectionFact{ID: rec.ID, Tool: coalesce(rec.Tool, "jsonl"), Text: rec.Text})
+		default:
+			return Projection{}, fmt.Errorf("%s:%d unknown kind %q", lens.Input, lineNo, rec.Kind)
+		}
+	}
+	return p, sc.Err()
+}
+
+// Go symbols analyzer: language adapter, not renderer/core.
+type GoFile struct {
+	Rel   string
+	Lines []string
+	Types []GoDecl
+	Funcs []GoFunc
+}
+
+type GoDecl struct {
+	Name string
+	Kind string
+	Line int
+	End  int
+	Sig  string
+}
+
+type GoFunc struct {
+	Name  string
+	Line  int
+	End   int
+	Sig   string
+	Calls []string
+}
+
+var (
+	goTypeRE = regexp.MustCompile(`^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(\S+)`)
+	goFuncRE = regexp.MustCompile(`^\s*func\s*(\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	goPkgRE  = regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)`)
+)
+
+func AnalyzeGoSymbols(cfg Config, lens LensConfig) (Projection, error) {
+	files, err := scanGoFiles(cfg, lens)
+	if err != nil {
+		return Projection{}, err
+	}
+
+	funcNames := map[string]bool{}
+	for _, f := range files {
+		for _, fn := range f.Funcs {
+			funcNames[fn.Name] = true
+		}
+	}
+	for fi := range files {
+		for i := range files[fi].Funcs {
+			fn := &files[fi].Funcs[i]
+			fn.Calls = findCalls(fn.Name, files[fi].Lines[fn.Line-1:fn.End], funcNames)
+		}
+	}
+
+	var p Projection
+	for _, f := range files {
+		var typeLines []string
+		for _, t := range f.Types {
+			typeLines = append(typeLines, fmt.Sprintf("%s %s lines=%d-%d :: %s", t.Kind, t.Name, t.Line, t.End, t.Sig))
+		}
+		if len(typeLines) > 0 {
+			p.Blocks = append(p.Blocks, ProjectionBlock{ID: "types", File: f.Rel, Mode: "types", Tool: "go-symbols", Lines: typeLines})
+		}
+
+		var funcLines []string
+		for _, fn := range f.Funcs {
+			funcLines = append(funcLines, fmt.Sprintf("%s lines=%d-%d calls=%s", fn.Sig, fn.Line, fn.End, strings.Join(fn.Calls, ",")))
+		}
+		if len(funcLines) > 0 {
+			p.Blocks = append(p.Blocks, ProjectionBlock{ID: "functions", File: f.Rel, Mode: "functions", Tool: "go-symbols", Lines: funcLines})
+		}
+	}
+
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "main-callgraph", File: "model", Mode: "callgraph", Tool: "go-symbols", Lines: goCallGraph(files)})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "core", Tool: "go-symbols", Text: "Run -> ExecuteLens -> Analyzer -> RenderProjection is the generic path."})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "adapters", Tool: "go-symbols", Text: "Language/tool-specific behavior lives behind analyzer adapters registered in DefaultRegistry."})
+	return p, nil
+}
+
+func scanGoFiles(cfg Config, lens LensConfig) ([]GoFile, error) {
+	root := filepath.Join(cfg.Root, lens.SourceRoot)
+	allowed := map[string]bool{}
+	for _, inc := range lens.Include {
+		allowed[filepath.ToSlash(inc)] = true
+		allowed[filepath.Base(inc)] = true
+	}
+
+	var out []GoFile
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipDir(cfg, path, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, _ := filepath.Rel(cfg.Root, path)
+		rel = filepath.ToSlash(rel)
+		if len(allowed) > 0 && !allowed[rel] && !allowed[filepath.Base(rel)] {
+			return nil
+		}
+		gf, err := parseGoFile(cfg.Root, path)
+		if err != nil {
+			return err
+		}
+		out = append(out, gf)
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Rel < out[j].Rel })
+	return out, err
+}
+
+func parseGoFile(root, path string) (GoFile, error) {
+	lines, err := readLines(path)
+	if err != nil {
+		return GoFile{}, err
+	}
+	rel, _ := filepath.Rel(root, path)
+	rel = filepath.ToSlash(rel)
+	gf := GoFile{Rel: rel, Lines: lines}
+
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		_ = goPkgRE.FindStringSubmatch(line)
+		if m := goTypeRE.FindStringSubmatch(line); m != nil {
+			end := i + 1
+			if strings.Contains(line, "{") {
+				if close, err := findClosingBrace(lines, i); err == nil {
+					end = close + 1
+				}
+			}
+			gf.Types = append(gf.Types, GoDecl{Name: m[1], Kind: m[2], Line: i + 1, End: end, Sig: trimBeforeBrace(line)})
+		}
+		if m := goFuncRE.FindStringSubmatch(line); m != nil {
+			close, err := findClosingBrace(lines, i)
+			if err != nil {
+				continue
+			}
+			gf.Funcs = append(gf.Funcs, GoFunc{Name: m[2], Line: i + 1, End: close + 1, Sig: trimBeforeBrace(line)})
+			i = close
+		}
+	}
+	return gf, nil
+}
+
+func findCalls(current string, lines []string, funcNames map[string]bool) []string {
+	rx := regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	seen := map[string]bool{}
+	var calls []string
+	for _, line := range lines {
+		for _, m := range rx.FindAllStringSubmatch(stripLineComment(line), -1) {
+			name := m[1]
+			if name == current || !funcNames[name] || seen[name] {
+				continue
+			}
+			seen[name] = true
+			calls = append(calls, name)
+		}
+	}
+	sort.Strings(calls)
+	return calls
+}
+
+func goCallGraph(files []GoFile) []string {
+	graph := map[string][]string{}
+	for _, f := range files {
+		for _, fn := range f.Funcs {
+			graph[fn.Name] = fn.Calls
+		}
+	}
+	var lines []string
+	var walk func(string, int, map[string]bool)
+	walk = func(name string, depth int, seen map[string]bool) {
+		prefix := strings.Repeat("  ", depth)
+		if seen[name] {
+			lines = append(lines, prefix+"-> "+name+" (seen)")
+			return
+		}
+		lines = append(lines, prefix+"-> "+name)
+		seen[name] = true
+		calls := append([]string{}, graph[name]...)
+		sort.Strings(calls)
+		for _, c := range calls {
+			walk(c, depth+1, seen)
+		}
+	}
+	walk("main", 0, map[string]bool{})
+	return lines
+}
+
+// Java PostMapping-to-save analyzer: adapter that emits generic projection blocks.
+type JavaFile struct {
+	Rel     string
+	Lines   []string
+	Class   string
+	Methods []JavaMethod
+}
+
+type JavaMethod struct {
+	Name        string
+	Annotations []string
+	Start       int
+	End         int
+	Lines       []string
+}
+
+var (
+	classRE  = regexp.MustCompile(`\b(class|interface|record|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	callRE   = regexp.MustCompile(`\b([a-z][A-Za-z0-9_]*)\s*\(`)
+	ifRE     = regexp.MustCompile(`^\s*if\s*\((.*)\)\s*\{?\s*$`)
+	retRE    = regexp.MustCompile(`^\s*return\b`)
+	rejectRE = regexp.MustCompile(`\brejectValue\s*\(`)
+)
+
+// defaultFlowStopCalls are general Java/keyword call names ignored when looking for
+// helper methods. Domain-specific names (getBirthDate, addPet, ...) are NOT built in —
+// pass them via params.stop_calls so the program stays project-agnostic.
+var defaultFlowStopCalls = map[string]bool{
+	"if": true, "for": true, "while": true, "switch": true, "return": true,
+	"equals": true, "new": true,
+}
+
+// AnalyzeFlow is the generic "annotated source reaches a sink" analyzer (the config-driven
+// successor to the Spring-specific java-post-to-save). It is parameterised entirely by
+// regexes in the lens, so the program ships no domain knowledge:
+//
+//	params.entry        regex marking the entry method (annotation or signature), e.g. @PostMapping
+//	params.sink         regex marking the sink call, e.g. \.save\s*\(
+//	params.file_suffix  optional file filter, e.g. Controller.java
+//	params.stop_calls   optional csv of call names to ignore during helper discovery
+//	params.mode/tool    optional output labels (default flow/flow)
+func AnalyzeFlow(cfg Config, lens LensConfig) (Projection, error) {
+	if lens.Params == nil || lens.Params["entry"] == "" || lens.Params["sink"] == "" {
+		return Projection{}, errors.New("flow: params.entry and params.sink (regexes) are required")
+	}
+	entryRe, err := regexp.Compile(lens.Params["entry"])
+	if err != nil {
+		return Projection{}, fmt.Errorf("flow: bad entry regex: %w", err)
+	}
+	sinkRe, err := regexp.Compile(lens.Params["sink"])
+	if err != nil {
+		return Projection{}, fmt.Errorf("flow: bad sink regex: %w", err)
+	}
+	suffix := lens.Params["file_suffix"]
+	mode := coalesce(lens.Params["mode"], "flow")
+	tool := coalesce(lens.Params["tool"], "flow")
+	stopCalls := mergeStopSet(defaultFlowStopCalls, lens.Params["stop_calls"])
+
+	files, err := scanJavaFiles(cfg, lens)
+	if err != nil {
+		return Projection{}, err
+	}
+	methodIndex := map[string]JavaMethod{}
+	for _, f := range files {
+		for _, m := range f.Methods {
+			methodIndex[f.Rel+"#"+m.Name] = m
+		}
+	}
+
+	var p Projection
+	for _, f := range files {
+		if suffix != "" && !strings.HasSuffix(f.Rel, suffix) {
+			continue
+		}
+		for _, m := range f.Methods {
+			if !methodMatchesEntry(m, entryRe) {
+				continue
+			}
+			block := javaFlowBlock(f, m, methodIndex, entryRe, sinkRe, stopCalls, mode, tool)
+			if len(block.Lines) > 0 {
+				p.Blocks = append(p.Blocks, block)
+			}
+		}
+	}
+	return p, nil
+}
+
+func mergeStopSet(base map[string]bool, csv string) map[string]bool {
+	out := map[string]bool{}
+	for k := range base {
+		out[k] = true
+	}
+	for _, s := range splitCSV(csv) {
+		out[s] = true
+	}
+	return out
+}
+
+func scanJavaFiles(cfg Config, lens LensConfig) ([]JavaFile, error) {
+	root := filepath.Join(cfg.Root, lens.SourceRoot)
+	var out []JavaFile
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipDir(cfg, path, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".java") {
+			return nil
+		}
+		jf, err := parseJavaFile(cfg.Root, path)
+		if err != nil {
+			return err
+		}
+		out = append(out, jf)
+		return nil
+	})
+	return out, err
+}
+
+func parseJavaFile(root, path string) (JavaFile, error) {
+	lines, err := readLines(path)
+	if err != nil {
+		return JavaFile{}, err
+	}
+	rel, _ := filepath.Rel(root, path)
+	rel = filepath.ToSlash(rel)
+	jf := JavaFile{Rel: rel, Lines: lines}
+	for _, line := range lines {
+		if jf.Class == "" {
+			if m := classRE.FindStringSubmatch(line); m != nil {
+				jf.Class = m[2]
+			}
+		}
+	}
+	ms, err := parseJavaMethods(lines)
+	if err != nil {
+		return JavaFile{}, err
+	}
+	jf.Methods = ms
+	return jf, nil
+}
+
+func parseJavaMethods(lines []string) ([]JavaMethod, error) {
+	var methods []JavaMethod
+	var anns []string
+	for i := 0; i < len(lines); i++ {
+		trim := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trim, "@") {
+			anns = append(anns, trim)
+			continue
+		}
+		if !looksLikeJavaMethod(trim) {
+			if trim != "" && !strings.HasPrefix(trim, "//") && !strings.HasPrefix(trim, "*") {
+				anns = nil
+			}
+			continue
+		}
+
+		start := i
+		sig := []string{}
+		for j := i; j < len(lines); j++ {
+			sig = append(sig, strings.TrimSpace(lines[j]))
+			if strings.Contains(lines[j], "{") {
+				i = j
+				break
+			}
+		}
+		name := javaMethodName(strings.Join(sig, " "))
+		if name == "" {
+			anns = nil
+			continue
+		}
+		close, err := findClosingBrace(lines, i)
+		if err != nil {
+			return nil, err
+		}
+		methods = append(methods, JavaMethod{Name: name, Annotations: append([]string{}, anns...), Start: start + 1, End: close + 1, Lines: append([]string{}, lines[start:close+1]...)})
+		anns = nil
+		i = close
+	}
+	return methods, nil
+}
+
+func looksLikeJavaMethod(trim string) bool {
+	if !strings.Contains(trim, "(") {
+		return false
+	}
+	for _, prefix := range []string{"if ", "for ", "while ", "switch ", "catch ", "return ", "@", "new "} {
+		if strings.HasPrefix(trim, prefix) {
+			return false
+		}
+	}
+	return strings.Contains(trim, "{") || strings.HasSuffix(trim, ",") || strings.HasSuffix(trim, ")")
+}
+
+func javaMethodName(sig string) string {
+	idx := strings.Index(sig, "(")
+	if idx < 0 {
+		return ""
+	}
+	parts := strings.Fields(sig[:idx])
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
+func methodMatchesEntry(m JavaMethod, re *regexp.Regexp) bool {
+	for _, a := range m.Annotations {
+		if re.MatchString(a) {
+			return true
+		}
+	}
+	return len(m.Lines) > 0 && re.MatchString(m.Lines[0])
+}
+
+func javaEntryLabel(m JavaMethod, re *regexp.Regexp) string {
+	for _, a := range m.Annotations {
+		if re.MatchString(a) {
+			return strings.TrimSpace(a)
+		}
+	}
+	return re.String()
+}
+
+func javaFlowBlock(f JavaFile, m JavaMethod, methodIndex map[string]JavaMethod, entryRe, sinkRe *regexp.Regexp, stopCalls map[string]bool, mode, tool string) ProjectionBlock {
+	var sinks []string
+	var facts []string
+	var lines []string
+	label := javaEntryLabel(m, entryRe)
+	lines = append(lines, "// entry "+label)
+	lines = append(lines, fmt.Sprintf("// source %s:%d-%d", f.Rel, m.Start, m.End))
+	lines = append(lines, m.Lines...)
+
+	for i, line := range m.Lines {
+		abs := m.Start + i
+		trim := strings.TrimSpace(line)
+		if sinkRe.MatchString(trim) {
+			sinks = append(sinks, fmt.Sprintf("sink: %s:%d `%s`", f.Rel, abs, trim))
+		}
+	}
+
+	for _, helper := range javaCalledHelpers(m, stopCalls) {
+		h, ok := methodIndex[f.Rel+"#"+helper]
+		if !ok {
+			continue
+		}
+		helperHasSink := false
+		for i, line := range h.Lines {
+			abs := h.Start + i
+			trim := strings.TrimSpace(line)
+			if sinkRe.MatchString(trim) {
+				helperHasSink = true
+				sinks = append(sinks, fmt.Sprintf("sink: %s:%d `%s`", f.Rel, abs, trim))
+			}
+		}
+		if helperHasSink {
+			lines = append(lines, "")
+			lines = append(lines, fmt.Sprintf("// helper reached from %s; source %s:%d-%d", m.Name, f.Rel, h.Start, h.End))
+			lines = append(lines, h.Lines...)
+			facts = append(facts, "helper: "+m.Name+" calls "+helper+", which reaches the sink")
+			facts = append(facts, javaFacts("helper."+helper, h.Lines)...)
+		}
+	}
+
+	if len(sinks) == 0 {
+		return ProjectionBlock{}
+	}
+	facts = append(facts, "entry: "+f.Class+"."+m.Name+" "+label)
+	facts = append(facts, javaFacts("", m.Lines)...)
+	facts = append(facts, sinks...)
+
+	return ProjectionBlock{ID: f.Class + "." + m.Name, File: f.Rel, Mode: mode, Tool: tool, Lines: lines, Facts: dedupe(facts)}
+}
+
+func javaCalledHelpers(m JavaMethod, stopCalls map[string]bool) []string {
+	seen := map[string]bool{}
+	var names []string
+	for idx, line := range m.Lines {
+		if idx == 0 || strings.Contains(line, m.Name+"(") && strings.Contains(line, "public ") {
+			continue
+		}
+		for _, mm := range callRE.FindAllStringSubmatch(strings.TrimSpace(line), -1) {
+			name := mm[1]
+			if name == m.Name || stopCalls[name] || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func javaFacts(prefix string, lines []string) []string {
+	var facts []string
+	add := func(s string) {
+		if prefix != "" {
+			facts = append(facts, prefix+": "+s)
+		} else {
+			facts = append(facts, s)
+		}
+	}
+	for idx, line := range lines {
+		trim := strings.TrimSpace(line)
+		if m := ifRE.FindStringSubmatch(trim); m != nil {
+			cond := strings.TrimSpace(m[1])
+			add("condition: if " + cond)
+			if strings.Contains(cond, "hasErrors()") {
+				add("required-before-save: " + cond + " must be false")
+			}
+		}
+		if rejectRE.MatchString(trim) {
+			prev := nearestIf(lines, idx)
+			if prev != "" {
+				add("can-set-error: " + prev + " -> " + trim)
+			} else {
+				add("can-set-error: " + trim)
+			}
+		}
+		if retRE.MatchString(trim) {
+			prev := nearestIf(lines, idx)
+			if prev != "" {
+				add("early-return: " + prev + " -> " + trim)
+			} else {
+				add("return: " + trim)
+			}
+		}
+	}
+	return facts
+}
+
+func nearestIf(lines []string, idx int) string {
+	depth := 0
+	for i := idx - 1; i >= 0 && i >= idx-8; i-- {
+		trim := strings.TrimSpace(lines[i])
+		for _, ch := range trim {
+			if ch == '}' {
+				depth++
+			}
+			if ch == '{' && depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 {
+			if m := ifRE.FindStringSubmatch(trim); m != nil {
+				return "if " + strings.TrimSpace(m[1])
+			}
+		}
+	}
+	return ""
+}
+
+// Joern variable-flow analyzer: adapter contract for real Joern plus deterministic Java fallback.
+type VarFlowTarget struct {
+	Variable string
+	File     string
+	Line     int
+	Method   string
+	Mode     string
+}
+
+type VarFlowResult struct {
+	Target       VarFlowTarget
+	MethodName   string
+	File         string
+	MethodStart  int
+	MethodEnd    int
+	Lines        []string
+	Contributors []string
+	Facts        []string
+	// Hits are the structured contributing lines (source line + reason), used by
+	// the data-flow lens to render trailing padded comments instead of // prefixes.
+	Hits []lineHit
+}
+
+var (
+	javaAssignRE     = regexp.MustCompile(`^\s*(?:(?:final\s+)?[A-Za-z_][A-Za-z0-9_<>,.?[\]\s]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);\s*$`)
+	javaMutatorRE    = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(set[A-Za-z0-9_]*|add[A-Za-z0-9_]*|put[A-Za-z0-9_]*|remove[A-Za-z0-9_]*)\s*\((.*)\)`)
+	javaIdentRE      = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\b`)
+	javaParamStripRE = regexp.MustCompile(`@\w+(?:\([^)]*\))?\s*`)
+)
+
+func AnalyzeJoernVarFlow(cfg Config, lens LensConfig) (Projection, error) {
+	target, err := varFlowTarget(lens)
+	if err != nil {
+		return Projection{}, err
+	}
+
+	mode := coalesce(target.Mode, "auto")
+	if mode != "fallback" {
+		if joernAvailable(cfg) {
+			p, err := RunJoernVarFlow(cfg, lens, target)
+			if err == nil {
+				p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used joern CPG (" + joernEngine(cfg) + ")"})
+				return p, nil
+			}
+			if mode == "joern" {
+				return Projection{}, err
+			}
+		} else if mode == "joern" {
+			return Projection{}, fmt.Errorf("joern not available: no binary in PATH and no tools.joern.image + docker configured")
+		}
+	}
+
+	p, err := AnalyzeJavaVarFlowFallback(cfg, lens, target)
+	if err != nil {
+		return Projection{}, err
+	}
+	p.Facts = append(p.Facts, ProjectionFact{ID: "mode", Tool: "joern-var-flow", Text: "used fallback static Java slicer; install Joern or set tools.joern.image and mode=joern for CPG data-flow"})
+	return p, nil
+}
+
+// joernScriptRel ensures the named embedded Joern script is written under
+// <projections_dir>/.joern-scripts/ and returns its path relative to cfg.Root. This keeps
+// the single binary self-sufficient while placing the script inside the Docker bind mount.
+func joernScriptRel(cfg Config, name string) (string, error) {
+	data, err := embeddedJoernScripts.ReadFile("tools/joern/" + name)
+	if err != nil {
+		return "", fmt.Errorf("embedded joern script %q not found: %w", name, err)
+	}
+	dirRel := filepath.Join(cfg.ProjectionsDir, ".joern-scripts")
+	if err := os.MkdirAll(filepath.Join(cfg.Root, dirRel), 0755); err != nil {
+		return "", err
+	}
+	abs := filepath.Join(cfg.Root, dirRel, name)
+	if cur, err := os.ReadFile(abs); err != nil || !bytes.Equal(cur, data) {
+		if err := os.WriteFile(abs, data, 0644); err != nil {
+			return "", err
+		}
+	}
+	return filepath.ToSlash(filepath.Join(dirRel, name)), nil
+}
+
+// joernAvailable reports whether Joern can run, as a local binary or via a configured
+// Docker image (with the daemon reachable).
+func joernAvailable(cfg Config) bool {
+	if _, err := exec.LookPath("joern"); err == nil {
+		return true
+	}
+	if tc, ok := cfg.Tools["joern"]; ok && tc.Image != "" {
+		if _, err := exec.LookPath("docker"); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func joernEngine(cfg Config) string {
+	if _, err := exec.LookPath("joern"); err == nil {
+		return "local binary"
+	}
+	return "docker " + cfg.Tools["joern"].Image
+}
+
+// execJoern runs a Joern script with key/value params. Path-valued params (named in
+// pathKeys) and the script path are rewritten for the execution context: absolute host
+// paths for a local joern binary, or /src-mounted container paths for the Docker
+// fallback. jvm_args is forwarded via _JAVA_OPTIONS (Joern is memory-hungry).
+func execJoern(cfg Config, scriptRel string, kv map[string]string, pathKeys map[string]bool) ([]byte, error) {
+	absRoot, _ := filepath.Abs(cfg.Root)
+	joernBin, localErr := exec.LookPath("joern")
+	local := localErr == nil
+
+	prefix := "/src"
+	if local {
+		prefix = filepath.ToSlash(absRoot)
+	}
+	join := func(rel string) string { return prefix + "/" + filepath.ToSlash(rel) }
+
+	keys := make([]string, 0, len(kv))
+	for k := range kv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		v := kv[k]
+		if pathKeys[k] && v != "" {
+			v = join(v)
+		}
+		parts = append(parts, k+"="+v)
+	}
+	scriptPath := join(scriptRel)
+	// Joern takes repeatable `--param key=value` flags (not a single --params list).
+	scriptArgs := []string{"--script", scriptPath}
+	for _, p := range parts {
+		scriptArgs = append(scriptArgs, "--param", p)
+	}
+
+	if local {
+		cmd := exec.Command(joernBin, scriptArgs...)
+		cmd.Dir = cfg.Root
+		return cmd.CombinedOutput()
+	}
+	tc := cfg.Tools["joern"]
+	dargs := []string{"run", "--rm", "-v", absRoot + ":/src", "-w", "/src"}
+	if tc.JVMArgs != "" {
+		dargs = append(dargs, "-e", "_JAVA_OPTIONS="+tc.JVMArgs)
+	}
+	dargs = append(dargs, tc.Image, "joern")
+	dargs = append(dargs, scriptArgs...)
+	cmd := exec.Command("docker", dargs...)
+	cmd.Dir = cfg.Root
+	return cmd.CombinedOutput()
+}
+
+// RunBuildCPG (the `build`/`refresh` subcommand) parses each unique source root once
+// into a cached cpg.bin under <projections_dir>/.cpg/. Subsequent joern lenses load the
+// cache (importCpg) instead of re-importing source — the basis for incremental refresh:
+// re-run `build` for a root after its files change.
+func RunBuildCPG(cfg Config) error {
+	if !joernAvailable(cfg) {
+		return errors.New("build: joern not available (no binary, no tools.joern.image + docker)")
+	}
+	ordered := joernSourceRoots(cfg)
+	if len(ordered) == 0 {
+		fmt.Println("build: no joern/control-flow/data-flow/entry-to-exit lenses with a source_root; nothing to build")
+		return nil
+	}
+	for _, root := range ordered {
+		outRel := cpgPathRel(cfg, root)
+		if err := os.MkdirAll(filepath.Join(cfg.Root, filepath.Dir(outRel)), 0755); err != nil {
+			return err
+		}
+		// Per-file change detection: skip rebuild when nothing changed, otherwise report
+		// exactly which files were added/modified/removed (finer than always-rebuild).
+		cur, err := sourceManifest(cfg, root)
+		if err != nil {
+			return err
+		}
+		prev := loadManifest(filepath.Join(cfg.Root, cpgManifestRel(cfg, root)))
+		added, modified, removed := diffManifest(prev, cur)
+		_, statErr := os.Stat(filepath.Join(cfg.Root, outRel))
+		if statErr == nil && len(added)+len(modified)+len(removed) == 0 {
+			fmt.Printf("up to date: %s (%d files)\n", root, len(cur))
+			continue
+		}
+		if statErr == nil {
+			fmt.Printf("changes in %s: +%d ~%d -%d\n", root, len(added), len(modified), len(removed))
+			for _, f := range added {
+				fmt.Println("  + " + f)
+			}
+			for _, f := range modified {
+				fmt.Println("  ~ " + f)
+			}
+			for _, f := range removed {
+				fmt.Println("  - " + f)
+			}
+		}
+		fmt.Printf("building cpg for %s -> %s ...\n", root, outRel)
+		out, err := execJoernParse(cfg, root, outRel)
+		if err != nil {
+			return fmt.Errorf("build %s: %w\n%s", root, err, out)
+		}
+		if err := saveManifest(filepath.Join(cfg.Root, cpgManifestRel(cfg, root)), cur); err != nil {
+			return err
+		}
+		fmt.Printf("  built %s\n", outRel)
+	}
+	return nil
+}
+
+// joernSourceRoots returns the unique source roots used by joern-backed lenses.
+func joernSourceRoots(cfg Config) []string {
+	roots := map[string]bool{}
+	for _, lens := range cfg.Lenses {
+		switch lens.Analyzer {
+		case "joern-var-flow", "control-flow", "data-flow", "entry-to-exit":
+			if lens.SourceRoot != "" {
+				roots[lens.SourceRoot] = true
+			}
+		}
+	}
+	ordered := make([]string, 0, len(roots))
+	for r := range roots {
+		ordered = append(ordered, r)
+	}
+	sort.Strings(ordered)
+	return ordered
+}
+
+func cpgManifestRel(cfg Config, sourceRoot string) string {
+	return cpgPathRel(cfg, sourceRoot) + ".manifest"
+}
+
+// sourceManifest maps each scannable source file under root to a content hash.
+func sourceManifest(cfg Config, rootRel string) (map[string]string, error) {
+	base := filepath.Join(cfg.Root, rootRel)
+	m := map[string]string{}
+	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipDir(cfg, path, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !isScannableSource(path) {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(base, path)
+		m[filepath.ToSlash(rel)] = hash(string(b))
+		return nil
+	})
+	return m, err
+}
+
+func loadManifest(path string) map[string]string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var m map[string]string
+	if json.Unmarshal(b, &m) != nil {
+		return nil
+	}
+	return m
+}
+
+func saveManifest(path string, m map[string]string) error {
+	b, _ := json.MarshalIndent(m, "", "  ")
+	return os.WriteFile(path, b, 0644)
+}
+
+// diffManifest reports files added, modified, and removed between two manifests.
+func diffManifest(prev, cur map[string]string) (added, modified, removed []string) {
+	for f, h := range cur {
+		if ph, ok := prev[f]; !ok {
+			added = append(added, f)
+		} else if ph != h {
+			modified = append(modified, f)
+		}
+	}
+	for f := range prev {
+		if _, ok := cur[f]; !ok {
+			removed = append(removed, f)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(modified)
+	sort.Strings(removed)
+	return
+}
+
+// execJoernParse runs joern-parse (local or via the Docker image) to produce a cpg.bin.
+func execJoernParse(cfg Config, sourceRootRel, outRel string) ([]byte, error) {
+	absRoot, _ := filepath.Abs(cfg.Root)
+	if bin, err := exec.LookPath("joern-parse"); err == nil {
+		cmd := exec.Command(bin, filepath.Join(absRoot, sourceRootRel), "--output", filepath.Join(absRoot, outRel))
+		cmd.Dir = cfg.Root
+		return cmd.CombinedOutput()
+	}
+	tc := cfg.Tools["joern"]
+	if tc.Image == "" {
+		return nil, errors.New("joern-parse not in PATH and no tools.joern.image")
+	}
+	dargs := []string{"run", "--rm", "-v", absRoot + ":/src", "-w", "/src"}
+	if tc.JVMArgs != "" {
+		dargs = append(dargs, "-e", "_JAVA_OPTIONS="+tc.JVMArgs)
+	}
+	dargs = append(dargs, tc.Image, "joern-parse", "/src/"+filepath.ToSlash(sourceRootRel), "--output", "/src/"+filepath.ToSlash(outRel))
+	cmd := exec.Command("docker", dargs...)
+	cmd.Dir = cfg.Root
+	return cmd.CombinedOutput()
+}
+
+func varFlowTarget(lens LensConfig) (VarFlowTarget, error) {
+	line := 0
+	if lens.Params != nil && lens.Params["line"] != "" {
+		fmt.Sscanf(lens.Params["line"], "%d", &line)
+	}
+	t := VarFlowTarget{
+		Variable: lens.Params["var"],
+		File:     lens.Params["file"],
+		Line:     line,
+		Method:   lens.Params["method"],
+		Mode:     lens.Params["mode"],
+	}
+	if t.Variable == "" {
+		return t, errors.New("params.var is required")
+	}
+	if t.File == "" {
+		return t, errors.New("params.file is required")
+	}
+	if t.Line <= 0 && t.Method == "" {
+		return t, errors.New("params.line or params.method is required")
+	}
+	return t, nil
+}
+
+func RunJoernVarFlow(cfg Config, lens LensConfig, target VarFlowTarget) (Projection, error) {
+	scriptRel, err := joernScriptRel(cfg, "java-var-flow.sc")
+	if err != nil {
+		return Projection{}, err
+	}
+	if lens.Params != nil && lens.Params["joern_script"] != "" {
+		scriptRel = lens.Params["joern_script"]
+	}
+	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-var-flow.jsonl"))
+	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
+		return Projection{}, err
+	}
+	kv := map[string]string{
+		"root":         lens.SourceRoot,
+		"targetFile":   target.File,
+		"targetVar":    target.Variable,
+		"targetLine":   strconv.Itoa(target.Line),
+		"targetMethod": target.Method,
+		"out":          outRel,
+	}
+	kv = withCpgParam(cfg, lens, kv)
+	output, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	if err != nil {
+		return Projection{}, fmt.Errorf("joern failed: %w\n%s", err, string(output))
+	}
+	jsonLens := lens
+	jsonLens.Input = outRel
+	jsonLens.Analyzer = "jsonl"
+	return AnalyzeJSONL(cfg, jsonLens)
+}
+
+// joernPathKeys are the param keys execJoern rewrites to host/container paths.
+var joernPathKeys = map[string]bool{"root": true, "out": true, "cpgPath": true}
+
+// withCpgParam points the script at a prebuilt cpg.bin when one exists for this source
+// root (see `build`/`refresh`), so scripts importCpg instead of re-importing source.
+// The key is cpgPath (not cpg) to avoid shadowing Joern's global `cpg` query root.
+func withCpgParam(cfg Config, lens LensConfig, kv map[string]string) map[string]string {
+	rel := cpgPathRel(cfg, lens.SourceRoot)
+	if _, err := os.Stat(filepath.Join(cfg.Root, rel)); err == nil {
+		kv["cpgPath"] = rel
+	}
+	return kv
+}
+
+func cpgPathRel(cfg Config, sourceRoot string) string {
+	return filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".cpg", hash(sourceRoot)+".bin"))
+}
+
+// locateJavaMethod reads the target file and returns its lines plus the enclosing
+// method for the target (by method name or by line). It also fills in target.Line
+// when only a method was given. Shared by the data-flow and var-flow lenses.
+func locateJavaMethod(cfg Config, lens LensConfig, target VarFlowTarget) ([]string, JavaMethod, VarFlowTarget, error) {
+	root := filepath.Join(cfg.Root, lens.SourceRoot)
+	path := filepath.Join(root, filepath.FromSlash(target.File))
+	lines, err := readLines(path)
+	if err != nil {
+		return nil, JavaMethod{}, target, err
+	}
+	methods, err := parseJavaMethods(lines)
+	if err != nil {
+		return nil, JavaMethod{}, target, err
+	}
+	var method JavaMethod
+	found := false
+	for _, m := range methods {
+		if target.Method != "" && m.Name == target.Method {
+			method, found = m, true
+			break
+		}
+		if target.Line > 0 && target.Line >= m.Start && target.Line <= m.End {
+			method, found = m, true
+			break
+		}
+	}
+	if !found {
+		return nil, JavaMethod{}, target, fmt.Errorf("no enclosing Java method found for %s:%d method=%s", target.File, target.Line, target.Method)
+	}
+	if target.Line <= 0 {
+		target.Line = method.End
+	}
+	return lines, method, target, nil
+}
+
+func AnalyzeJavaVarFlowFallback(cfg Config, lens LensConfig, target VarFlowTarget) (Projection, error) {
+	lines, method, target, err := locateJavaMethod(cfg, lens, target)
+	if err != nil {
+		return Projection{}, err
+	}
+
+	res := fallbackVarFlow(lines, method, target)
+	var p Projection
+	block := ProjectionBlock{
+		ID:    fmt.Sprintf("%s.%s:%s@%d", javaClassName(lines), method.Name, target.Variable, target.Line),
+		File:  target.File,
+		Mode:  "var-flow",
+		Tool:  "joern-var-flow:fallback",
+		Lines: res.Lines,
+		Facts: res.Facts,
+	}
+	p.Blocks = append(p.Blocks, block)
+	p.Facts = append(p.Facts, ProjectionFact{ID: "target", Tool: "joern-var-flow", Text: fmt.Sprintf("%s %s:%d variable %s", method.Name, target.File, target.Line, target.Variable)})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "contributors", Tool: "joern-var-flow", Text: strings.Join(res.Contributors, ", ")})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "limits", Tool: "joern-var-flow", Text: "fallback is lexical/intraprocedural plus object mutation heuristics; Joern mode should replace this for true interprocedural data-flow"})
+	return p, nil
+}
+
+func fallbackVarFlow(fileLines []string, method JavaMethod, target VarFlowTarget) VarFlowResult {
+	targetRelLine := target.Line - method.Start
+	if targetRelLine < 0 || targetRelLine >= len(method.Lines) {
+		targetRelLine = len(method.Lines) - 1
+	}
+
+	contrib := map[string]bool{target.Variable: true}
+	var facts []string
+	var focus []lineHit
+
+	// Method signature contributes parameters.
+	if len(method.Lines) > 0 {
+		focus = append(focus, lineHit{Line: method.Start, Text: method.Lines[0], Why: "method signature"})
+		for _, p := range javaParams(javaMethodSignatureText(method.Lines)) {
+			if p == target.Variable {
+				facts = append(facts, "source: target variable is method parameter "+p)
+				contrib[p] = true
+			}
+		}
+	}
+
+	changed := true
+	for changed {
+		changed = false
+		for idx := 0; idx <= targetRelLine && idx < len(method.Lines); idx++ {
+			abs := method.Start + idx
+			trim := strings.TrimSpace(method.Lines[idx])
+			if trim == "" {
+				continue
+			}
+
+			if m := ifRE.FindStringSubmatch(trim); m != nil {
+				ids := identifiers(m[1])
+				touches := anyContributor(ids, contrib)
+				if touches || strings.Contains(trim, "hasErrors()") || strings.Contains(trim, target.Variable) {
+					focus = append(focus, lineHit{Line: abs, Text: method.Lines[idx], Why: "reachability condition"})
+					for _, id := range ids {
+						if isJavaValueIdent(id) && !contrib[id] {
+							contrib[id] = true
+							changed = true
+						}
+					}
+					facts = append(facts, "condition: "+cleanJavaIf(trim))
+				}
+				if strings.Contains(trim, "hasErrors()") {
+					facts = append(facts, "required-before-target: "+strings.TrimPrefix(cleanJavaIf(trim), "if ")+" must not route to early return before line")
+				}
+				continue
+			}
+
+			if retRE.MatchString(trim) {
+				prev := nearestIf(method.Lines, idx)
+				if prev != "" {
+					focus = append(focus, lineHit{Line: abs, Text: method.Lines[idx], Why: "early return"})
+					facts = append(facts, "early-return: "+prev+" -> "+trim)
+				}
+				continue
+			}
+
+			if m := javaAssignRE.FindStringSubmatch(trim); m != nil {
+				lhs, rhs := m[1], m[2]
+				ids := identifiers(rhs)
+				if contrib[lhs] || lhs == target.Variable || anyContributor(ids, contrib) {
+					focus = append(focus, lineHit{Line: abs, Text: method.Lines[idx], Why: "assignment"})
+					for _, id := range ids {
+						if isJavaValueIdent(id) && !contrib[id] {
+							contrib[id] = true
+							changed = true
+						}
+					}
+					vals := filterValueIdents(ids)
+					if len(vals) > 0 {
+						facts = append(facts, "assignment: "+lhs+" receives data from "+strings.Join(vals, ", "))
+					}
+				}
+				continue
+			}
+
+			if m := javaMutatorRE.FindStringSubmatch(trim); m != nil {
+				obj, mut, args := m[1], m[2], m[3]
+				ids := identifiers(args)
+				if contrib[obj] || obj == target.Variable {
+					focus = append(focus, lineHit{Line: abs, Text: method.Lines[idx], Why: "object mutation"})
+					for _, id := range ids {
+						if isJavaValueIdent(id) && !contrib[id] {
+							contrib[id] = true
+							changed = true
+						}
+					}
+					vals := filterValueIdents(ids)
+					if len(vals) > 0 {
+						facts = append(facts, "mutation: "+obj+"."+mut+" receives "+strings.Join(vals, ", "))
+					} else {
+						facts = append(facts, "mutation: "+obj+"."+mut)
+					}
+				}
+			}
+		}
+	}
+
+	if target.Line > 0 && target.Line <= len(fileLines) {
+		focus = append(focus, lineHit{Line: target.Line, Text: fileLines[target.Line-1], Why: "target line"})
+		for _, id := range identifiers(fileLines[target.Line-1]) {
+			if isJavaValueIdent(id) {
+				contrib[id] = true
+			}
+		}
+	}
+
+	focus = uniqueHits(focus)
+	sort.Slice(focus, func(i, j int) bool { return focus[i].Line < focus[j].Line })
+	var out []string
+	out = append(out, fmt.Sprintf("// target variable %s at %s:%d", target.Variable, target.File, target.Line))
+	out = append(out, fmt.Sprintf("// enclosing method %s lines=%d-%d", method.Name, method.Start, method.End))
+	for _, h := range focus {
+		out = append(out, fmt.Sprintf("// line %d: %s", h.Line, h.Why))
+		out = append(out, h.Text)
+	}
+
+	contributors := mapKeys(contrib)
+	sort.Strings(contributors)
+	facts = append(facts, "contributors: "+strings.Join(contributors, ", "))
+	return VarFlowResult{Target: target, MethodName: method.Name, File: target.File, MethodStart: method.Start, MethodEnd: method.End, Lines: out, Contributors: contributors, Facts: dedupe(facts), Hits: focus}
+}
+
+type lineHit struct {
+	Line int
+	Text string
+	Why  string
+}
+
+func javaClassName(lines []string) string {
+	for _, l := range lines {
+		if m := classRE.FindStringSubmatch(l); m != nil {
+			return m[2]
+		}
+	}
+	return "Java"
+}
+
+func javaMethodSignatureText(lines []string) string {
+	var parts []string
+	for _, l := range lines {
+		parts = append(parts, strings.TrimSpace(l))
+		if strings.Contains(l, "{") {
+			break
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func javaParams(sig string) []string {
+	open := strings.Index(sig, "(")
+	close := strings.LastIndex(sig, ")")
+	if open < 0 || close <= open {
+		return nil
+	}
+	inside := sig[open+1 : close]
+	parts := strings.Split(inside, ",")
+	var params []string
+	for _, part := range parts {
+		part = strings.TrimSpace(javaParamStripRE.ReplaceAllString(part, ""))
+		fields := strings.Fields(part)
+		if len(fields) == 0 {
+			continue
+		}
+		name := strings.Trim(fields[len(fields)-1], "[]...")
+		if isJavaValueIdent(name) {
+			params = append(params, name)
+		}
+	}
+	return params
+}
+
+func identifiers(s string) []string {
+	s = stripJavaStrings(s)
+	var out []string
+	matches := javaIdentRE.FindAllStringIndex(s, -1)
+	for _, mm := range matches {
+		id := s[mm[0]:mm[1]]
+		if !isJavaValueIdent(id) {
+			continue
+		}
+		prev := byteBefore(s, mm[0])
+		next := byteAfterSpaces(s, mm[1])
+		// Skip method/property names in obj.method(...), but keep obj.
+		if prev == '.' || next == '(' {
+			continue
+		}
+		out = append(out, id)
+	}
+	return dedupe(out)
+}
+
+func cleanJavaIf(trim string) string {
+	trim = strings.TrimSpace(trim)
+	if strings.HasPrefix(trim, "if") {
+		cond := strings.TrimSpace(strings.TrimPrefix(trim, "if"))
+		cond = strings.TrimSpace(strings.TrimSuffix(cond, "{"))
+		cond = strings.TrimSpace(cond)
+		if strings.HasPrefix(cond, "(") && strings.HasSuffix(cond, ")") {
+			cond = strings.TrimPrefix(strings.TrimSuffix(cond, ")"), "(")
+		}
+		return "if " + strings.TrimSpace(cond)
+	}
+	return trim
+}
+
+func stripJavaStrings(s string) string {
+	var b strings.Builder
+	in := rune(0)
+	esc := false
+	for _, r := range s {
+		if in != 0 {
+			if esc {
+				esc = false
+				b.WriteRune(' ')
+				continue
+			}
+			if r == '\\' {
+				esc = true
+				b.WriteRune(' ')
+				continue
+			}
+			if r == in {
+				in = 0
+			}
+			b.WriteRune(' ')
+			continue
+		}
+		if r == '"' || r == '\'' || r == '`' {
+			in = r
+			b.WriteRune(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func byteBefore(s string, idx int) byte {
+	for i := idx - 1; i >= 0; i-- {
+		if s[i] == ' ' || s[i] == '\t' {
+			continue
+		}
+		return s[i]
+	}
+	return 0
+}
+
+func byteAfterSpaces(s string, idx int) byte {
+	for i := idx; i < len(s); i++ {
+		if s[i] == ' ' || s[i] == '\t' {
+			continue
+		}
+		return s[i]
+	}
+	return 0
+}
+
+func anyContributor(ids []string, c map[string]bool) bool {
+	for _, id := range ids {
+		if c[id] {
+			return true
+		}
+	}
+	return false
+}
+
+func filterValueIdents(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		if isJavaValueIdent(id) {
+			out = append(out, id)
+		}
+	}
+	return dedupe(out)
+}
+
+func isJavaValueIdent(id string) bool {
+	if id == "" {
+		return false
+	}
+	switch id {
+	case "if", "return", "new", "null", "true", "false", "this", "public", "private", "protected", "final",
+		"String", "Integer", "int", "boolean", "void", "LocalDate", "Objects", "StringUtils", "RedirectAttributes",
+		"BindingResult", "Valid", "PathVariable", "ModelAttribute", "Owner", "Pet", "Visit",
+		"equals", "getId", "getName", "getPet", "getBirthDate", "hasErrors", "hasText", "isAfter", "isNew", "now", "save", "owners":
+		return false
+	default:
+		return true
+	}
+}
+
+func uniqueHits(in []lineHit) []lineHit {
+	seen := map[int]bool{}
+	var out []lineHit
+	for _, h := range in {
+		if h.Line <= 0 || seen[h.Line] {
+			continue
+		}
+		seen[h.Line] = true
+		out = append(out, h)
+	}
+	return out
+}
+
+func mapKeys(m map[string]bool) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// JavaScript event-surface analyzer: adapter for composable event-driven structures.
+type JSFile struct {
+	Rel       string
+	Lines     []string
+	Exports   []JSSymbol
+	Functions []JSSymbol
+	Classes   []JSSymbol
+	Events    []JSEvent
+	Regs      []JSRegistration
+}
+
+type JSSymbol struct {
+	Name string
+	Kind string
+	Line int
+	Sig  string
+}
+
+type JSEvent struct {
+	Kind string
+	Name string
+	Line int
+	Code string
+}
+
+type JSRegistration struct {
+	Kind string
+	Name string
+	Line int
+	Code string
+}
+
+var (
+	jsExportFuncRE   = regexp.MustCompile(`^\s*export\s+(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	jsExportClassRE  = regexp.MustCompile(`^\s*export\s+class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
+	jsFunctionRE     = regexp.MustCompile(`^\s*(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	jsClassRE        = regexp.MustCompile(`^\s*class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
+	jsConstFuncRE    = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\(?[^=]*?\)?\s*=>`)
+	jsMethodRE       = regexp.MustCompile(`^\s*(?:async\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*\{`)
+	jsEmitRE         = regexp.MustCompile(`(?:\.|\b)(emit|dispatchEvent)\s*\(\s*(?:new\s+CustomEvent\s*\()?['"` + "`" + `]([^'"` + "`" + `]+)['"` + "`" + `]`)
+	jsOnRE           = regexp.MustCompile(`(?:\.|\b)(on|once|addEventListener)\s*\(\s*['"` + "`" + `]([^'"` + "`" + `]+)['"` + "`" + `]`)
+	jsRegisterRE     = regexp.MustCompile(`\b(register(?:Action|Scene|Character|Item|Stat|Quest|MiniGame|Hotkey)|core\.register(?:Action|Scene|Character|Item|Stat|Quest|MiniGame|Hotkey))\s*\(\s*['"` + "`" + `]?([^,'"` + "`" + `)\s]+)`)
+	jsModsRegisterRE = regexp.MustCompile(`\b(mods\.register|registerMod)\s*\(\s*['"` + "`" + `]?([^,'"` + "`" + `)\s]+)`)
+	jsImportRE       = regexp.MustCompile(`^\s*import\b`)
+)
+
+func AnalyzeJSEvents(cfg Config, lens LensConfig) (Projection, error) {
+	files, err := scanJSFiles(cfg, lens)
+	if err != nil {
+		return Projection{}, err
+	}
+
+	var p Projection
+	var summary []string
+	totalEmits, totalListeners, totalRegs := 0, 0, 0
+
+	for _, f := range files {
+		if len(f.Exports)+len(f.Functions)+len(f.Classes) > 0 {
+			var lines []string
+			for _, x := range f.Exports {
+				lines = append(lines, fmt.Sprintf("export %s %s line=%d :: %s", x.Kind, x.Name, x.Line, x.Sig))
+			}
+			for _, x := range f.Classes {
+				lines = append(lines, fmt.Sprintf("class %s line=%d :: %s", x.Name, x.Line, x.Sig))
+			}
+			for _, x := range f.Functions {
+				lines = append(lines, fmt.Sprintf("function %s line=%d :: %s", x.Name, x.Line, x.Sig))
+			}
+			p.Blocks = append(p.Blocks, ProjectionBlock{ID: "surface", File: f.Rel, Mode: "surface", Tool: "js-events", Lines: dedupe(lines)})
+		}
+
+		if len(f.Events) > 0 {
+			var lines []string
+			var facts []string
+			for _, ev := range f.Events {
+				lines = append(lines, fmt.Sprintf("%s %s line=%d :: %s", ev.Kind, ev.Name, ev.Line, ev.Code))
+				if ev.Kind == "emit" || ev.Kind == "dispatch" {
+					totalEmits++
+				} else {
+					totalListeners++
+				}
+			}
+			facts = append(facts, fmt.Sprintf("event surface: %d events/listeners in %s", len(f.Events), f.Rel))
+			p.Blocks = append(p.Blocks, ProjectionBlock{ID: "events", File: f.Rel, Mode: "events", Tool: "js-events", Lines: dedupe(lines), Facts: facts})
+		}
+
+		if len(f.Regs) > 0 {
+			var lines []string
+			for _, r := range f.Regs {
+				lines = append(lines, fmt.Sprintf("%s %s line=%d :: %s", r.Kind, r.Name, r.Line, r.Code))
+				totalRegs++
+			}
+			p.Blocks = append(p.Blocks, ProjectionBlock{ID: "registrations", File: f.Rel, Mode: "registrations", Tool: "js-events", Lines: dedupe(lines)})
+		}
+	}
+
+	summary = append(summary, fmt.Sprintf("files scanned: %d", len(files)))
+	summary = append(summary, fmt.Sprintf("event emits/dispatches: %d", totalEmits))
+	summary = append(summary, fmt.Sprintf("event listeners/subscriptions: %d", totalListeners))
+	summary = append(summary, fmt.Sprintf("registrations: %d", totalRegs))
+	summary = append(summary, "use this lens to see composable event-driven working surface without opening full files")
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "summary", File: "model", Mode: "summary", Tool: "js-events", Lines: summary})
+
+	return p, nil
+}
+
+func scanJSFiles(cfg Config, lens LensConfig) ([]JSFile, error) {
+	root := filepath.Join(cfg.Root, lens.SourceRoot)
+	include := map[string]bool{}
+	for _, inc := range lens.Include {
+		include[filepath.ToSlash(inc)] = true
+		include[filepath.Base(inc)] = true
+	}
+
+	var files []JSFile
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipDir(cfg, path, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !isJSFile(path) {
+			return nil
+		}
+		rel, _ := filepath.Rel(cfg.Root, path)
+		rel = filepath.ToSlash(rel)
+		if strings.Contains(rel, "__MACOSX/") || strings.Contains(rel, "/._") || strings.HasPrefix(filepath.Base(rel), "._") {
+			return nil
+		}
+		if len(include) > 0 && !include[rel] && !include[filepath.Base(rel)] {
+			return nil
+		}
+		f, err := parseJSFile(cfg.Root, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, f)
+		return nil
+	})
+	sort.Slice(files, func(i, j int) bool { return files[i].Rel < files[j].Rel })
+	return files, err
+}
+
+func isJSFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseJSFile(root, path string) (JSFile, error) {
+	lines, err := readLines(path)
+	if err != nil {
+		return JSFile{}, err
+	}
+	rel, _ := filepath.Rel(root, path)
+	rel = filepath.ToSlash(rel)
+	f := JSFile{Rel: rel, Lines: lines}
+
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		lineNo := i + 1
+		if trim == "" || strings.HasPrefix(trim, "//") {
+			continue
+		}
+		if m := jsExportFuncRE.FindStringSubmatch(trim); m != nil {
+			f.Exports = append(f.Exports, JSSymbol{Name: m[1], Kind: "function", Line: lineNo, Sig: trimBeforeBrace(trim)})
+			continue
+		}
+		if m := jsExportClassRE.FindStringSubmatch(trim); m != nil {
+			f.Exports = append(f.Exports, JSSymbol{Name: m[1], Kind: "class", Line: lineNo, Sig: trimBeforeBrace(trim)})
+			continue
+		}
+		if strings.HasPrefix(trim, "export ") {
+			f.Exports = append(f.Exports, JSSymbol{Name: compactJSName(trim), Kind: "value", Line: lineNo, Sig: trimBeforeBrace(trim)})
+		}
+		if m := jsClassRE.FindStringSubmatch(trim); m != nil {
+			f.Classes = append(f.Classes, JSSymbol{Name: m[1], Kind: "class", Line: lineNo, Sig: trimBeforeBrace(trim)})
+		}
+		// Keep the surface compact: top-level functions/arrow functions only.
+		// Class internals and inline callbacks are intentionally left to event/registration facts.
+		isTopLevel := len(line) > 0 && line[0] != ' ' && line[0] != '\t'
+		if isTopLevel {
+			if m := jsFunctionRE.FindStringSubmatch(trim); m != nil {
+				f.Functions = append(f.Functions, JSSymbol{Name: m[1], Kind: "function", Line: lineNo, Sig: trimBeforeBrace(trim)})
+			}
+			if m := jsConstFuncRE.FindStringSubmatch(trim); m != nil {
+				f.Functions = append(f.Functions, JSSymbol{Name: m[1], Kind: "function", Line: lineNo, Sig: trimBeforeBrace(trim)})
+			}
+		}
+		for _, m := range jsEmitRE.FindAllStringSubmatch(trim, -1) {
+			kind := "emit"
+			if m[1] == "dispatchEvent" {
+				kind = "dispatch"
+			}
+			f.Events = append(f.Events, JSEvent{Kind: kind, Name: m[2], Line: lineNo, Code: trim})
+		}
+		for _, m := range jsOnRE.FindAllStringSubmatch(trim, -1) {
+			kind := "listen"
+			if m[1] == "on" || m[1] == "once" {
+				kind = "subscribe"
+			}
+			f.Events = append(f.Events, JSEvent{Kind: kind, Name: m[2], Line: lineNo, Code: trim})
+		}
+		for _, m := range jsRegisterRE.FindAllStringSubmatch(trim, -1) {
+			f.Regs = append(f.Regs, JSRegistration{Kind: strings.TrimPrefix(m[1], "core."), Name: m[2], Line: lineNo, Code: trim})
+		}
+		for _, m := range jsModsRegisterRE.FindAllStringSubmatch(trim, -1) {
+			f.Regs = append(f.Regs, JSRegistration{Kind: m[1], Name: m[2], Line: lineNo, Code: trim})
+		}
+	}
+	return f, nil
+}
+
+func compactJSName(line string) string {
+	line = strings.TrimPrefix(strings.TrimSpace(line), "export ")
+	fields := strings.Fields(line)
+	if len(fields) >= 2 {
+		return strings.Trim(fields[1], "{};,")
+	}
+	return "export"
+}
+
+func jsControlWord(s string) bool {
+	switch s {
+	case "if", "for", "while", "switch", "catch", "function":
+		return true
+	default:
+		return false
+	}
+}
+
+// Shared source utilities.
+func findClosingBrace(lines []string, openLine int) (int, error) {
+	depth := 0
+	seen := false
+	for i := openLine; i < len(lines); i++ {
+		for _, ch := range stripLineComment(lines[i]) {
+			switch ch {
+			case '{':
+				depth++
+				seen = true
+			case '}':
+				if !seen {
+					// A leading '}' before any '{' on this line belongs to a prior
+					// block (e.g. the "} else {" / "} catch" idiom); ignore it.
+					continue
+				}
+				depth--
+				if depth == 0 {
+					return i, nil
+				}
+			}
+		}
+	}
+	return -1, errors.New("unclosed brace")
+}
+
+func readLines(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024), 1024*1024)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	return lines, sc.Err()
+}
+
+func shouldSkipDir(cfg Config, path string, d fs.DirEntry) bool {
+	if !d.IsDir() {
+		return false
+	}
+	name := d.Name()
+	if path == cfg.Root || name == "." {
+		return false
+	}
+	for _, ex := range cfg.ExcludeDirs {
+		if ex == name || strings.HasSuffix(filepath.ToSlash(path), "/"+ex) || strings.Contains(filepath.ToSlash(path), "/"+ex+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func trimBeforeBrace(s string) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, "{"); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	return s
+}
+
+func stripLineComment(s string) string {
+	if idx := strings.Index(s, "//"); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func coalesce(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+func hash(s string) string {
+	sum := sha1.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func atoi(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
+}
+
+func atoiDefault(s string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		return n
+	}
+	return def
+}
+
+// subConfigPath extracts -config/--config from subcommand args (default config.json).
+func subConfigPath(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-config" || a == "--config" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		}
+		for _, pre := range []string{"-config=", "--config="} {
+			if strings.HasPrefix(a, pre) {
+				return strings.TrimPrefix(a, pre)
+			}
+		}
+	}
+	return "config.json"
+}
+
+// ============================================================================
+// External tools (rg / ast-grep / joern) with Docker fallback
+// ============================================================================
+
+// runTool runs an external tool, preferring a local binary and falling back to a
+// configured Docker image when the binary is absent. JVMArgs is forwarded via
+// _JAVA_OPTIONS for memory-hungry tools like Joern.
+func runTool(cfg Config, tool string, args ...string) ([]byte, error) {
+	if bin, err := exec.LookPath(tool); err == nil {
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = cfg.Root
+		return cmd.CombinedOutput()
+	}
+	tc, ok := cfg.Tools[tool]
+	if !ok || tc.Image == "" {
+		return nil, fmt.Errorf("%s not in PATH and no docker image configured (set tools.%s.image)", tool, tool)
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		return nil, fmt.Errorf("%s not in PATH and docker unavailable for fallback", tool)
+	}
+	abs, _ := filepath.Abs(cfg.Root)
+	dargs := []string{"run", "--rm", "-v", abs + ":/src", "-w", "/src"}
+	if tc.JVMArgs != "" {
+		dargs = append(dargs, "-e", "_JAVA_OPTIONS="+tc.JVMArgs)
+	}
+	dargs = append(dargs, tc.Image, tool)
+	dargs = append(dargs, args...)
+	cmd := exec.Command("docker", dargs...)
+	return cmd.CombinedOutput()
+}
+
+type grepHit struct {
+	File string
+	Line int
+	Text string
+}
+
+// ripgrep searches for a regex under cfg.Root/root using rg, falling back to a
+// stdlib regex scan when rg is unavailable. rg exit code 1 (no matches) is not an error.
+func ripgrep(cfg Config, pattern, root string) ([]grepHit, error) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		if tc, ok := cfg.Tools["rg"]; ok && tc.Image != "" {
+			if out, derr := runTool(cfg, "rg", "-n", "--no-heading", "--color=never", "-e", pattern, root); derr == nil {
+				return parseGrep(out), nil
+			}
+		}
+		return scanRegex(cfg, pattern, root)
+	}
+	cmd := exec.Command("rg", "-n", "--no-heading", "--color=never", "-e", pattern, root)
+	cmd.Dir = cfg.Root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("rg failed: %w\n%s", err, out)
+	}
+	return parseGrep(out), nil
+}
+
+func parseGrep(out []byte) []grepHit {
+	var hits []grepHit
+	for _, ln := range strings.Split(string(out), "\n") {
+		if ln == "" {
+			continue
+		}
+		p1 := strings.IndexByte(ln, ':')
+		if p1 < 0 {
+			continue
+		}
+		rest := ln[p1+1:]
+		p2 := strings.IndexByte(rest, ':')
+		if p2 < 0 {
+			continue
+		}
+		num, err := strconv.Atoi(rest[:p2])
+		if err != nil {
+			continue
+		}
+		hits = append(hits, grepHit{File: filepath.ToSlash(ln[:p1]), Line: num, Text: strings.TrimSpace(rest[p2+1:])})
+	}
+	return hits
+}
+
+func scanRegex(cfg Config, pattern, root string) ([]grepHit, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	base := filepath.Join(cfg.Root, root)
+	var hits []grepHit
+	err = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipDir(cfg, path, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !isScannableSource(path) {
+			return nil
+		}
+		lines, err := readLines(path)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(cfg.Root, path)
+		rel = filepath.ToSlash(rel)
+		for i, l := range lines {
+			if re.MatchString(l) {
+				hits = append(hits, grepHit{File: rel, Line: i + 1, Text: strings.TrimSpace(l)})
+			}
+		}
+		return nil
+	})
+	return hits, err
+}
+
+func isScannableSource(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".java", ".go", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".kt", ".scala", ".py":
+		return true
+	default:
+		return false
+	}
+}
+
+// globToRegex converts a shell-glob-ish sink pattern (e.g. *kafka*.send) to a
+// regex. '*' matches an identifier/dot run; '.' is literal; other regex meta is escaped.
+func globToRegex(g string) string {
+	var b strings.Builder
+	for _, r := range g {
+		switch r {
+		case '*':
+			b.WriteString(`[A-Za-z0-9_.$]*`)
+		case '.':
+			b.WriteString(`\.`)
+		default:
+			if strings.ContainsRune(`+()[]{}^$|?\`, r) {
+				b.WriteRune('\\')
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// ============================================================================
+// Entrypoints / Exitpoints lenses (rg-driven, view-only)
+// ============================================================================
+
+type labeledPattern struct {
+	Label string
+	Regex string
+}
+
+// The program ships with NO domain-specific patterns/sinks. They are project-specific
+// (e.g. @KafkaListener, *repository*.save) and live entirely in config.json lens params,
+// keeping the tool general across stacks.
+
+// parsePatternParam parses "label=regex;label=regex" into labeled patterns.
+func parsePatternParam(s string) []labeledPattern {
+	var out []labeledPattern
+	for _, part := range strings.Split(s, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if i := strings.IndexByte(part, '='); i > 0 {
+			out = append(out, labeledPattern{strings.TrimSpace(part[:i]), strings.TrimSpace(part[i+1:])})
+		} else {
+			out = append(out, labeledPattern{part, part})
+		}
+	}
+	return out
+}
+
+func AnalyzeEntrypoints(cfg Config, lens LensConfig) (Projection, error) {
+	if lens.Params == nil || lens.Params["patterns"] == "" {
+		return Projection{}, errors.New("entrypoints: params.patterns is required, e.g. \"kafka-listener=@KafkaListener;http-mapping=@(Get|Post)Mapping\"")
+	}
+	patterns := parsePatternParam(lens.Params["patterns"])
+	return searchMapProjection(cfg, lens, patterns, "entrypoints", "entrypoints")
+}
+
+func AnalyzeExitpoints(cfg Config, lens LensConfig) (Projection, error) {
+	if lens.Params == nil || lens.Params["sinks"] == "" {
+		return Projection{}, errors.New("exitpoints: params.sinks is required, e.g. \"*repository*.save,*kafka*.send\"")
+	}
+	sinks := splitCSV(lens.Params["sinks"])
+	var patterns []labeledPattern
+	for _, s := range sinks {
+		// Case-insensitive: real bean names are camelCase (orderRepository, kafkaTemplate)
+		// while sink globs are usually written lowercase (*repository*.save).
+		patterns = append(patterns, labeledPattern{s, `(?i)` + globToRegex(s) + `\s*\(`})
+	}
+	return searchMapProjection(cfg, lens, patterns, "exitpoints", "exitpoints")
+}
+
+// searchMapProjection runs each labeled pattern via rg and emits a single sorted
+// map block plus per-label count facts. Shared by entrypoints and exitpoints.
+func searchMapProjection(cfg Config, lens LensConfig, patterns []labeledPattern, tool, mode string) (Projection, error) {
+	root := lens.SourceRoot
+	if root == "" {
+		root = "."
+	}
+	type row struct {
+		file  string
+		line  int
+		label string
+		text  string
+	}
+	var rows []row
+	counts := map[string]int{}
+	for _, lp := range patterns {
+		hits, err := ripgrep(cfg, lp.Regex, root)
+		if err != nil {
+			return Projection{}, fmt.Errorf("%s: pattern %q: %w", tool, lp.Label, err)
+		}
+		for _, h := range hits {
+			rows = append(rows, row{h.File, h.Line, lp.Label, h.Text})
+			counts[lp.Label]++
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].file != rows[j].file {
+			return rows[i].file < rows[j].file
+		}
+		return rows[i].line < rows[j].line
+	})
+	// Configurable formatter: params.line_format with {file} {line} {label} {code}
+	// placeholders, so output shape lives in config too. Defaults to the :: layout.
+	tmpl := coalesce(lens.Params["line_format"], "{file}:{line} :: {label} :: {code}")
+	var lines []string
+	for _, r := range rows {
+		lines = append(lines, formatRow(tmpl, r.file, r.line, r.label, r.text))
+	}
+	if len(lines) == 0 {
+		lines = append(lines, "// no matches under "+root)
+	}
+	var facts []string
+	var labels []string
+	for k := range counts {
+		labels = append(labels, k)
+	}
+	sort.Strings(labels)
+	for _, k := range labels {
+		facts = append(facts, fmt.Sprintf("%s: %d", k, counts[k]))
+	}
+	facts = append(facts, fmt.Sprintf("total: %d across %s", len(rows), root))
+	usedRg := true
+	if _, err := exec.LookPath("rg"); err != nil {
+		usedRg = false
+	}
+	p := Projection{Sync: "view-only"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: mode, File: "model", Mode: mode, Tool: tool, Lines: lines, Facts: facts})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "engine", Tool: tool, Text: coalesce(map[bool]string{true: "ripgrep", false: "stdlib-scan-fallback"}[usedRg], "stdlib-scan-fallback")})
+	return p, nil
+}
+
+// AnalyzeAstGrep runs an ast-grep structural pattern and emits a map block of matches.
+// Uses a local ast-grep/sg binary if present, else the configured Docker image
+// (tools.ast-grep.image). params.pattern and params.lang are required.
+func AnalyzeAstGrep(cfg Config, lens LensConfig) (Projection, error) {
+	if lens.Params == nil || lens.Params["pattern"] == "" || lens.Params["lang"] == "" {
+		return Projection{}, errors.New("ast-grep: params.pattern and params.lang are required")
+	}
+	root := lens.SourceRoot
+	if root == "" {
+		root = "."
+	}
+	out, err := astGrepRun(cfg, lens.Params["pattern"], lens.Params["lang"], root)
+	if err != nil {
+		return Projection{}, err
+	}
+	var matches []struct {
+		File  string `json:"file"`
+		Text  string `json:"text"`
+		Range struct {
+			Start struct {
+				Line int `json:"line"`
+			} `json:"start"`
+		} `json:"range"`
+	}
+	if len(strings.TrimSpace(string(out))) > 0 {
+		if err := json.Unmarshal(out, &matches); err != nil {
+			return Projection{}, fmt.Errorf("ast-grep: parsing JSON output: %w\n%s", err, truncate(string(out), 300))
+		}
+	}
+	label := coalesce(lens.Params["label"], "match")
+	tmpl := coalesce(lens.Params["line_format"], "{file}:{line} :: {label} :: {code}")
+	var lines []string
+	for _, m := range matches {
+		first := m.Text
+		if i := strings.IndexByte(first, '\n'); i >= 0 {
+			first = first[:i]
+		}
+		lines = append(lines, formatRow(tmpl, filepath.ToSlash(m.File), m.Range.Start.Line+1, label, strings.TrimSpace(first)))
+	}
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		lines = append(lines, "// no ast-grep matches under "+root)
+	}
+	p := Projection{Sync: "view-only"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "ast-grep", File: "model", Mode: "ast-grep", Tool: "ast-grep", Lines: lines})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "matches", Tool: "ast-grep", Text: fmt.Sprintf("%d match(es) for %q (%s)", len(matches), lens.Params["pattern"], lens.Params["lang"])})
+	return p, nil
+}
+
+// astGrepRun invokes ast-grep (binary `ast-grep` or `sg`, else the configured Docker
+// image) with JSON output. ast-grep exits 0 even with no matches.
+func astGrepRun(cfg Config, pattern, lang, root string) ([]byte, error) {
+	args := []string{"run", "-p", pattern, "-l", lang, "--json", root}
+	for _, bin := range []string{"ast-grep", "sg"} {
+		if path, err := exec.LookPath(bin); err == nil {
+			cmd := exec.Command(path, args...)
+			cmd.Dir = cfg.Root
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				return nil, fmt.Errorf("ast-grep failed: %w\n%s", err, truncate(string(out), 300))
+			}
+			return out, nil
+		}
+	}
+	tc, ok := cfg.Tools["ast-grep"]
+	if !ok || tc.Image == "" {
+		return nil, errors.New("ast-grep: not in PATH and no tools.ast-grep.image configured")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		return nil, errors.New("ast-grep: not in PATH and docker unavailable for fallback")
+	}
+	absRoot, _ := filepath.Abs(cfg.Root)
+	dargs := []string{"run", "--rm", "-v", absRoot + ":/src", "-w", "/src", tc.Image, "ast-grep"}
+	dargs = append(dargs, args...)
+	cmd := exec.Command("docker", dargs...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("ast-grep (docker) failed: %w\n%s", err, truncate(string(out), 300))
+	}
+	return out, nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
+// formatRow substitutes {file}/{line}/{label}/{code} placeholders in a line template.
+func formatRow(tmpl, file string, line int, label, code string) string {
+	r := strings.NewReplacer(
+		"{file}", file,
+		"{line}", strconv.Itoa(line),
+		"{label}", label,
+		"{code}", code,
+	)
+	return r.Replace(tmpl)
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ============================================================================
+// Control-flow lens: ways from method entry to a target line, branch per file
+// ============================================================================
+
+type cfgNode struct {
+	kind     string // "stmt" | "if"
+	line     int    // 1-based
+	text     string // raw source line
+	exits    bool   // stmt: return/throw
+	cond     string // if: condition text
+	thenLo   int    // 1-based content range of then-block
+	thenHi   int
+	thenBody []cfgNode
+	hasElse  bool
+	elseLo   int
+	elseHi   int
+	elseBody []cfgNode
+}
+
+type cfgEvent struct {
+	kind  string // "guard" | "stmt"
+	line  int
+	text  string
+	truth bool
+	cond  string
+}
+
+type cfgPath struct {
+	events  []cfgEvent
+	reached bool
+	dead    bool
+}
+
+// RunJoernControlFlow runs control-flow.sc to enumerate real CFG paths and renders them
+// as branch-per-file projections (an index plus one file per path), matching the lexical
+// lens's output shape. Handles else-if chains, switch, and loops.
+func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, method string) (Projection, error) {
+	if !joernAvailable(cfg) {
+		return Projection{}, errors.New("control-flow mode=joern: joern not available (no binary, no tools.joern.image + docker)")
+	}
+	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-control-flow.jsonl"))
+	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
+		return Projection{}, err
+	}
+	kv := map[string]string{
+		"root":         lens.SourceRoot,
+		"targetFile":   file,
+		"targetLine":   strconv.Itoa(line),
+		"targetMethod": method,
+		"out":          outRel,
+		"maxPaths":     coalesce(lens.Params["max_branches"], "32"),
+	}
+	kv = withCpgParam(cfg, lens, kv)
+	scriptRel, err := joernScriptRel(cfg, "control-flow.sc")
+	if err != nil {
+		return Projection{}, err
+	}
+	output, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	if err != nil {
+		return Projection{}, fmt.Errorf("joern control-flow failed: %w\n%s", err, string(output))
+	}
+	jsonLens := lens
+	jsonLens.Input = outRel
+	jsonLens.Analyzer = "jsonl"
+	flat, err := AnalyzeJSONL(cfg, jsonLens)
+	if err != nil {
+		return Projection{}, err
+	}
+
+	stem := strings.TrimSuffix(LensOut(cfg, lens), ".projection")
+	p := Projection{Sync: "view-only"}
+	var indexLines []string
+	branchNo := 0
+	for _, blk := range flat.Blocks {
+		branchNo++
+		rel := filepath.Base(stem) + fmt.Sprintf(".branch-%d.projection", branchNo)
+		indexLines = append(indexLines, fmt.Sprintf("branch %d: %s -> %s", branchNo, joernGuardSummary(blk.Facts), rel))
+		branch := Projection{Sync: "view-only"}
+		branch.Blocks = append(branch.Blocks, ProjectionBlock{
+			ID: fmt.Sprintf("branch-%d", branchNo), File: file, Mode: "cfg-path", Tool: "control-flow:joern",
+			Lines: blk.Lines, Facts: blk.Facts,
+		})
+		p.Extra = append(p.Extra, ExtraFile{Path: fmt.Sprintf("%s.branch-%d.projection", stem, branchNo), Proj: branch})
+	}
+	if branchNo == 0 {
+		indexLines = append(indexLines, fmt.Sprintf("// joern found no CFG path to %s:%d", file, line))
+		for _, f := range flat.Facts {
+			indexLines = append(indexLines, "// "+f.Text)
+		}
+	}
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "control-flow", File: file, Mode: "index", Tool: "control-flow:joern", Lines: indexLines})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "target", Tool: "control-flow", Text: fmt.Sprintf("%s:%d", file, line)})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "branches", Tool: "control-flow", Text: fmt.Sprintf("%d CFG path(s) via joern (%s)", branchNo, joernEngine(cfg))})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "engine", Tool: "control-flow", Text: "real CPG: handles else-if, switch, loops (acyclic path enumeration)"})
+	return p, nil
+}
+
+// AnalyzeEntryToExit enumerates control flows from entrypoints (methods with an annotation
+// matching params.entry) to exitpoints (calls matching params.exit) over the CPG call graph.
+// Default is all-to-all; narrow with params.entry_name / params.exit_file for 1-to-1.
+func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
+	if lens.Params == nil || lens.Params["entry"] == "" || lens.Params["exit"] == "" {
+		return Projection{}, errors.New("entry-to-exit: params.entry and params.exit (regexes) are required")
+	}
+	if !joernAvailable(cfg) {
+		return Projection{}, errors.New("entry-to-exit: joern not available (no binary, no tools.joern.image + docker)")
+	}
+	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-entry-to-exit.jsonl"))
+	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
+		return Projection{}, err
+	}
+	kv := map[string]string{
+		"root":      lens.SourceRoot,
+		"entry":     lens.Params["entry"],
+		"exit":      lens.Params["exit"],
+		"entryName": lens.Params["entry_name"],
+		"exitFile":  lens.Params["exit_file"],
+		"maxPairs":  coalesce(lens.Params["max_pairs"], "200"),
+		"out":       outRel,
+	}
+	kv = withCpgParam(cfg, lens, kv)
+	scriptRel, err := joernScriptRel(cfg, "entry-to-exit.sc")
+	if err != nil {
+		return Projection{}, err
+	}
+	output, err := execJoern(cfg, scriptRel, kv, joernPathKeys)
+	if err != nil {
+		return Projection{}, fmt.Errorf("joern entry-to-exit failed: %w\n%s", err, string(output))
+	}
+	jsonLens := lens
+	jsonLens.Input = outRel
+	jsonLens.Analyzer = "jsonl"
+	p, err := AnalyzeJSONL(cfg, jsonLens)
+	if err != nil {
+		return Projection{}, err
+	}
+	p.Sync = "view-only"
+	p.Facts = append(p.Facts, ProjectionFact{ID: "engine", Tool: "entry-to-exit", Text: "call-graph reachability via joern (" + joernEngine(cfg) + ")"})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "flows", Tool: "entry-to-exit", Text: fmt.Sprintf("%d entrypoint->exitpoint control flow(s)", len(p.Blocks))})
+	return p, nil
+}
+
+// joernGuardSummary distills a path block's guard facts into a one-line index summary.
+func joernGuardSummary(facts []string) string {
+	var g []string
+	for _, f := range facts {
+		if strings.HasPrefix(f, "guard: ") {
+			g = append(g, strings.TrimPrefix(f, "guard: "))
+		}
+	}
+	if len(g) == 0 {
+		return "(unconditional)"
+	}
+	return strings.Join(g, " & ")
+}
+
+func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
+	file := lens.Params["file"]
+	method := lens.Params["method"]
+	line := atoi(lens.Params["line"])
+	if file == "" {
+		return Projection{}, errors.New("params.file is required")
+	}
+	if line <= 0 && method == "" {
+		return Projection{}, errors.New("params.line or params.method is required")
+	}
+	// Opt-in real-CPG mode (handles else-if chains, switch, loops). The lexical
+	// enumerator stays the default since it needs no external engine.
+	if lens.Params["mode"] == "joern" {
+		return RunJoernControlFlow(cfg, lens, file, line, method)
+	}
+	lines, m, target, err := locateJavaMethod(cfg, lens, VarFlowTarget{File: file, Line: line, Method: method})
+	if err != nil {
+		return Projection{}, err
+	}
+	braceLine := firstBraceLine(lines, m.Start-1)
+	closeLine, err := findClosingBrace(lines, braceLine)
+	if err != nil {
+		return Projection{}, fmt.Errorf("control-flow: %w", err)
+	}
+	nodes := parseCFG(lines, braceLine+1, closeLine-1)
+	paths := enumeratePaths(nodes, target.Line)
+
+	maxBranches := atoiDefault(lens.Params["max_branches"], 16)
+	truncated := false
+	if len(paths) > maxBranches {
+		paths = paths[:maxBranches]
+		truncated = true
+	}
+
+	sig := strings.TrimSpace(m.Lines[0])
+	stem := strings.TrimSuffix(LensOut(cfg, lens), ".projection")
+
+	p := Projection{Sync: "view-only"}
+	var indexLines []string
+	if len(paths) == 0 {
+		indexLines = append(indexLines, fmt.Sprintf("// no path found from %s entry to %s:%d", m.Name, file, target.Line))
+	}
+	for k, path := range paths {
+		branchNo := k + 1
+		summary := branchSummary(path)
+		rel := filepath.Base(stem) + fmt.Sprintf(".branch-%d.projection", branchNo)
+		indexLines = append(indexLines, fmt.Sprintf("branch %d: %s -> %s", branchNo, summary, rel))
+
+		var bl []string
+		var bf []string
+		bl = append(bl, fmt.Sprintf("// branch %d of %d: %s entry -> %s:%d", branchNo, len(paths), m.Name, file, target.Line))
+		bl = append(bl, sig)
+		for _, ev := range path.events {
+			if ev.kind == "guard" {
+				bl = append(bl, fmt.Sprintf("    // guard: %s == %v", ev.cond, ev.truth))
+				bf = append(bf, fmt.Sprintf("guard: %s == %v", ev.cond, ev.truth))
+			} else {
+				marker := ""
+				if ev.line == target.Line {
+					marker = "   // <== target"
+				}
+				bl = append(bl, strings.TrimRight(ev.text, "\n")+marker)
+			}
+		}
+		bf = append(bf, fmt.Sprintf("reaches: %s:%d", file, target.Line))
+		branch := Projection{Sync: "view-only"}
+		branch.Blocks = append(branch.Blocks, ProjectionBlock{
+			ID: fmt.Sprintf("%s.branch-%d", m.Name, branchNo), File: file, Mode: "branch", Tool: "control-flow", Lines: bl, Facts: bf,
+		})
+		p.Extra = append(p.Extra, ExtraFile{Path: fmt.Sprintf("%s.branch-%d.projection", stem, branchNo), Proj: branch})
+	}
+
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "control-flow", File: file, Mode: "index", Tool: "control-flow", Lines: indexLines})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "target", Tool: "control-flow", Text: fmt.Sprintf("%s %s:%d", m.Name, file, target.Line)})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "branches", Tool: "control-flow", Text: fmt.Sprintf("%d distinct path(s) reach the target line", len(paths))})
+	if truncated {
+		p.Facts = append(p.Facts, ProjectionFact{ID: "truncated", Tool: "control-flow", Text: fmt.Sprintf("more than max_branches=%d paths; showing first %d", maxBranches, maxBranches)})
+	}
+	p.Facts = append(p.Facts, ProjectionFact{ID: "limits", Tool: "control-flow", Text: "lexical intraprocedural CFG; models if/else + nesting + early-return guards (no else-if chains, switch, loops)"})
+	return p, nil
+}
+
+func branchSummary(path cfgPath) string {
+	var guards []string
+	for _, ev := range path.events {
+		if ev.kind == "guard" {
+			guards = append(guards, fmt.Sprintf("%s=%v", ev.cond, ev.truth))
+		}
+	}
+	if len(guards) == 0 {
+		return "(unconditional)"
+	}
+	return strings.Join(guards, " & ")
+}
+
+// parseCFG builds a shallow control-flow tree for the body lines in [lo,hi]
+// (0-indexed, inclusive). Supports if / else and nesting; skips else-if chains.
+func parseCFG(lines []string, lo, hi int) []cfgNode {
+	var nodes []cfgNode
+	i := lo
+	for i <= hi && i < len(lines) {
+		raw := lines[i]
+		trim := strings.TrimSpace(stripLineComment(raw))
+		if trim == "" || strings.HasPrefix(strings.TrimSpace(raw), "//") || strings.HasPrefix(trim, "*") || strings.HasPrefix(trim, "/*") {
+			i++
+			continue
+		}
+		if isIfHeader(trim) {
+			braceLine := firstBraceLine(lines, i)
+			if braceLine > hi {
+				nodes = append(nodes, cfgNode{kind: "stmt", line: i + 1, text: raw, exits: isExitStmt(trim)})
+				i++
+				continue
+			}
+			closeLine, err := findClosingBrace(lines, braceLine)
+			if err != nil || closeLine > hi {
+				nodes = append(nodes, cfgNode{kind: "stmt", line: i + 1, text: raw, exits: isExitStmt(trim)})
+				i++
+				continue
+			}
+			node := cfgNode{
+				kind: "if", line: i + 1, text: trim, cond: extractCond(lines, i, braceLine),
+				thenLo: braceLine + 2, thenHi: closeLine, thenBody: parseCFG(lines, braceLine+1, closeLine-1),
+			}
+			end := closeLine
+			has, elseIf, ebl, ecl := detectElse(lines, closeLine, hi)
+			if has && !elseIf {
+				node.hasElse = true
+				node.elseLo = ebl + 2
+				node.elseHi = ecl
+				node.elseBody = parseCFG(lines, ebl+1, ecl-1)
+				end = ecl
+			} else if has && elseIf {
+				end = ecl // skip the unmodeled else-if region
+			}
+			nodes = append(nodes, node)
+			i = end + 1
+			continue
+		}
+		nodes = append(nodes, cfgNode{kind: "stmt", line: i + 1, text: raw, exits: isExitStmt(trim)})
+		i++
+	}
+	return nodes
+}
+
+func isIfHeader(trim string) bool {
+	return strings.HasPrefix(trim, "if ") || strings.HasPrefix(trim, "if(")
+}
+
+func isExitStmt(trim string) bool {
+	return strings.HasPrefix(trim, "return") || strings.HasPrefix(trim, "throw")
+}
+
+func firstBraceLine(lines []string, from int) int {
+	for i := from; i < len(lines); i++ {
+		if strings.Contains(stripLineComment(lines[i]), "{") {
+			return i
+		}
+	}
+	return from
+}
+
+// extractCond joins the if-header lines and returns the parenthesized condition.
+func extractCond(lines []string, ifLine, braceLine int) string {
+	var parts []string
+	for i := ifLine; i <= braceLine && i < len(lines); i++ {
+		parts = append(parts, strings.TrimSpace(lines[i]))
+	}
+	s := strings.Join(parts, " ")
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return strings.TrimSpace(s)
+	}
+	close := matchParen(s, open)
+	if close < 0 {
+		return strings.TrimSpace(s[open+1:])
+	}
+	return strings.TrimSpace(s[open+1 : close])
+}
+
+func matchParen(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// detectElse looks for an else attached to the block closing at closeLine. Returns
+// whether an else exists, whether it is an (unmodeled) else-if, and the else block's
+// brace/close line indices.
+func detectElse(lines []string, closeLine, hi int) (has, elseIf bool, braceLine, closeOfElse int) {
+	tail := ""
+	if idx := strings.LastIndex(lines[closeLine], "}"); idx >= 0 {
+		tail = strings.TrimSpace(lines[closeLine][idx+1:])
+	}
+	scan := closeLine
+	if !strings.HasPrefix(tail, "else") {
+		j := closeLine + 1
+		for j <= hi && strings.TrimSpace(lines[j]) == "" {
+			j++
+		}
+		if j <= hi && strings.HasPrefix(strings.TrimSpace(lines[j]), "else") {
+			scan = j
+			tail = strings.TrimSpace(lines[j])
+		} else {
+			return false, false, 0, 0
+		}
+	}
+	afterElse := strings.TrimSpace(strings.TrimPrefix(tail, "else"))
+	if strings.HasPrefix(afterElse, "if") {
+		// else-if chain: locate its full extent so the caller can skip it.
+		bl := firstBraceLine(lines, scan)
+		cl, err := findClosingBrace(lines, bl)
+		if err != nil {
+			return false, false, 0, 0
+		}
+		return true, true, bl, cl
+	}
+	bl := firstBraceLine(lines, scan)
+	cl, err := findClosingBrace(lines, bl)
+	if err != nil {
+		return false, false, 0, 0
+	}
+	return true, false, bl, cl
+}
+
+func enumeratePaths(nodes []cfgNode, target int) []cfgPath {
+	var out []cfgPath
+	for _, p := range walkNodes(nodes, 0, target) {
+		if p.reached && !p.dead {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func walkNodes(nodes []cfgNode, i, target int) []cfgPath {
+	if i >= len(nodes) {
+		return []cfgPath{{}}
+	}
+	n := nodes[i]
+	var out []cfgPath
+	if n.kind == "stmt" {
+		ev := cfgEvent{kind: "stmt", line: n.line, text: n.text}
+		if n.line == target {
+			return []cfgPath{{events: []cfgEvent{ev}, reached: true}}
+		}
+		if n.exits && n.line < target {
+			return []cfgPath{{events: []cfgEvent{ev}, dead: true}}
+		}
+		for _, c := range walkNodes(nodes, i+1, target) {
+			out = append(out, cfgPath{events: prependEvent(ev, c.events), reached: c.reached, dead: c.dead})
+		}
+		return out
+	}
+	// if node: target inside then-block -> forced true
+	if target >= n.thenLo && target <= n.thenHi {
+		g := cfgEvent{kind: "guard", line: n.line, cond: n.cond, truth: true}
+		for _, ip := range walkNodes(n.thenBody, 0, target) {
+			if ip.reached && !ip.dead {
+				out = append(out, cfgPath{events: prependEvent(g, ip.events), reached: true})
+			}
+		}
+		return out
+	}
+	// target inside else-block -> forced false
+	if n.hasElse && target >= n.elseLo && target <= n.elseHi {
+		g := cfgEvent{kind: "guard", line: n.line, cond: n.cond, truth: false}
+		for _, ip := range walkNodes(n.elseBody, 0, target) {
+			if ip.reached && !ip.dead {
+				out = append(out, cfgPath{events: prependEvent(g, ip.events), reached: true})
+			}
+		}
+		return out
+	}
+	// fork: target is after this if. Each non-exiting side continues to target.
+	cont := walkNodes(nodes, i+1, target)
+	gTrue := cfgEvent{kind: "guard", line: n.line, cond: n.cond, truth: true}
+	for _, tp := range walkNodes(n.thenBody, 0, target) {
+		if tp.dead {
+			continue
+		}
+		for _, c := range cont {
+			out = append(out, cfgPath{events: concatEvents(gTrue, tp.events, c.events), reached: c.reached, dead: c.dead})
+		}
+	}
+	gFalse := cfgEvent{kind: "guard", line: n.line, cond: n.cond, truth: false}
+	if n.hasElse {
+		for _, ep := range walkNodes(n.elseBody, 0, target) {
+			if ep.dead {
+				continue
+			}
+			for _, c := range cont {
+				out = append(out, cfgPath{events: concatEvents(gFalse, ep.events, c.events), reached: c.reached, dead: c.dead})
+			}
+		}
+	} else {
+		for _, c := range cont {
+			out = append(out, cfgPath{events: prependEvent(gFalse, c.events), reached: c.reached, dead: c.dead})
+		}
+	}
+	return out
+}
+
+func prependEvent(ev cfgEvent, rest []cfgEvent) []cfgEvent {
+	out := make([]cfgEvent, 0, len(rest)+1)
+	out = append(out, ev)
+	out = append(out, rest...)
+	return out
+}
+
+func concatEvents(head cfgEvent, mid, tail []cfgEvent) []cfgEvent {
+	out := make([]cfgEvent, 0, len(mid)+len(tail)+1)
+	out = append(out, head)
+	out = append(out, mid...)
+	out = append(out, tail...)
+	return out
+}
+
+// ============================================================================
+// Data-flow lens: contributing lines with trailing padded comments (view-only)
+// ============================================================================
+
+const dataFlowCommentCol = 56
+
+func AnalyzeDataFlow(cfg Config, lens LensConfig) (Projection, error) {
+	target, err := varFlowTarget(lens)
+	if err != nil {
+		return Projection{}, err
+	}
+	lines, method, target, err := locateJavaMethod(cfg, lens, target)
+	if err != nil {
+		return Projection{}, err
+	}
+	res := fallbackVarFlow(lines, method, target)
+
+	var out []string
+	for _, h := range res.Hits {
+		out = append(out, padComment(strings.TrimRight(h.Text, "\n"), dataFlowNote(h.Why, target.Variable)))
+	}
+	p := Projection{Sync: "view-only"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{
+		ID:    fmt.Sprintf("%s.%s:%s@%d", javaClassName(lines), method.Name, target.Variable, target.Line),
+		File:  target.File,
+		Mode:  "dataflow-inline",
+		Tool:  "data-flow",
+		Lines: out,
+		Facts: res.Facts,
+	})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "target", Tool: "data-flow", Text: fmt.Sprintf("%s %s:%d variable %s", method.Name, target.File, target.Line, target.Variable)})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "contributors", Tool: "data-flow", Text: strings.Join(res.Contributors, ", ")})
+	return p, nil
+}
+
+func dataFlowNote(why, varName string) string {
+	switch why {
+	case "method signature":
+		return "<- source: parameter feeding " + varName
+	case "assignment":
+		return "<- assigns into the flow"
+	case "object mutation":
+		return "<- mutates " + varName
+	case "reachability condition":
+		return "<- guards whether the value is set"
+	case "early return":
+		return "<- could skip this value"
+	case "target line":
+		return "<- final use of " + varName
+	default:
+		return "<- " + why
+	}
+}
+
+// padComment right-pads code to a fixed column then appends a trailing // comment,
+// so contributing lines stay scannable. Tabs count as 4 columns for alignment.
+func padComment(code, note string) string {
+	width := 0
+	for _, r := range code {
+		if r == '\t' {
+			width += 4
+		} else {
+			width++
+		}
+	}
+	pad := dataFlowCommentCol - width
+	if pad < 1 {
+		pad = 1
+	}
+	return code + strings.Repeat(" ", pad) + "// " + note
+}
+
+// ============================================================================
+// Extract lens + two-way sync engine
+// ============================================================================
+
+// AnalyzeBookmark pins a verbatim source span as a two-way "bookmark" block: edits
+// inside the block sync back to the source span (see SyncProjection). Registered as
+// both "bookmark" and the legacy "extract" alias.
+func AnalyzeBookmark(cfg Config, lens LensConfig) (Projection, error) {
+	file := lens.Params["file"]
+	if file == "" {
+		return Projection{}, errors.New("params.file is required")
+	}
+	root := lens.SourceRoot
+	path := filepath.Join(cfg.Root, root, filepath.FromSlash(file))
+	lines, err := readLines(path)
+	if err != nil {
+		return Projection{}, err
+	}
+	var a, b int
+	if lens.Params["method"] != "" {
+		methods, err := parseJavaMethods(lines)
+		if err != nil {
+			return Projection{}, err
+		}
+		found := false
+		for _, m := range methods {
+			if m.Name == lens.Params["method"] {
+				a, b, found = m.Start, m.End, true
+				break
+			}
+		}
+		if !found {
+			return Projection{}, fmt.Errorf("bookmark: method %q not found in %s", lens.Params["method"], file)
+		}
+	} else {
+		a, b = parseLineRange(lens.Params["lines"])
+	}
+	return makeBookmarkProjection(cfg, root, file, a, b)
+}
+
+// makeBookmarkProjection builds a two-way bookmark over source span a-b. Shared by the
+// bookmark analyzer and the single-line drop-in expander.
+func makeBookmarkProjection(cfg Config, sourceRoot, file string, a, b int) (Projection, error) {
+	path := filepath.Join(cfg.Root, sourceRoot, filepath.FromSlash(file))
+	lines, err := readLines(path)
+	if err != nil {
+		return Projection{}, err
+	}
+	if a < 1 || b < a || b > len(lines) {
+		return Projection{}, fmt.Errorf("bookmark: invalid line range %d-%d for %s (%d lines)", a, b, file, len(lines))
+	}
+	span := append([]string{}, lines[a-1:b]...)
+	srcRel := filepath.ToSlash(filepath.Join(sourceRoot, file))
+	p := Projection{Sync: "two-way"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{
+		ID: fmt.Sprintf("%s:%d-%d", filepath.Base(file), a, b), File: file, Mode: "bookmark", Tool: "bookmark",
+		Lines: span, Sync: "two-way", SrcFile: srcRel, SrcStart: a, SrcEnd: b, SrcHash: hash(strings.Join(span, "\n") + "\n"),
+	})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "sync", Tool: "bookmark", Text: "two-way: edits inside the block sync back to source on `watch` or `sync`"})
+	return p, nil
+}
+
+// ============================================================================
+// Single-line drop-in bookmarks
+// ============================================================================
+
+var dropInRE = regexp.MustCompile(`^([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?$`)
+
+// expandDropIns scans the projections dir for "drop-in" files — a freshly created
+// .projection whose only content is a single `path/File.ext:line` (or `:a-b`) reference —
+// and expands each in place into a full two-way bookmark with proper headers. Idempotent:
+// once expanded the file has a header, so it is not matched again.
+func expandDropIns(cfg Config) ([]string, error) {
+	dir := filepath.Join(cfg.Root, cfg.ProjectionsDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var expanded []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".projection") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		ref, a, b, ok := parseDropIn(path)
+		if !ok {
+			continue
+		}
+		sourceRoot, rel, err := resolveSourceFile(cfg, ref)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "drop-in %s: %v\n", e.Name(), err)
+			continue
+		}
+		proj, err := makeBookmarkProjection(cfg, sourceRoot, rel, a, b)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "drop-in %s: %v\n", e.Name(), err)
+			continue
+		}
+		proj.Lens = LensConfig{Name: strings.TrimSuffix(e.Name(), ".projection"), Analyzer: "bookmark", SourceRoot: sourceRoot}
+		finalizeProjection(&proj, proj.Lens)
+		if err := RenderProjection(path, proj); err != nil {
+			return expanded, err
+		}
+		expanded = append(expanded, path)
+	}
+	return expanded, nil
+}
+
+// parseDropIn returns the reference if the file's only meaningful content is a single
+// `path:line` / `path:a-b` line (and it has no generated header yet).
+func parseDropIn(path string) (ref string, a, b int, ok bool) {
+	lines, err := readLines(path)
+	if err != nil {
+		return "", 0, 0, false
+	}
+	var content []string
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" {
+			continue
+		}
+		if strings.HasPrefix(t, "#") || strings.HasPrefix(t, "@@") {
+			return "", 0, 0, false // already a rendered projection
+		}
+		content = append(content, t)
+	}
+	if len(content) != 1 {
+		return "", 0, 0, false
+	}
+	m := dropInRE.FindStringSubmatch(content[0])
+	if m == nil {
+		return "", 0, 0, false
+	}
+	a = atoi(m[2])
+	b = a
+	if m[3] != "" {
+		b = atoi(m[3])
+	}
+	if b < a {
+		a, b = b, a
+	}
+	return m[1], a, b, true
+}
+
+// resolveSourceFile locates a referenced source file, returning its source root and the
+// path relative to that root. Tries configured source roots, then the repo root, then a
+// suffix search across the tree. References must stay inside the repo (no `..`/absolute).
+func resolveSourceFile(cfg Config, ref string) (sourceRoot, rel string, err error) {
+	ref = filepath.ToSlash(ref)
+	if filepath.IsAbs(ref) || ref == ".." || strings.HasPrefix(ref, "../") || strings.Contains(ref, "/../") || strings.HasSuffix(ref, "/..") {
+		return "", "", fmt.Errorf("unsafe source reference %q (must be inside the repo)", ref)
+	}
+	for _, lens := range cfg.Lenses {
+		if lens.SourceRoot == "" {
+			continue
+		}
+		if fileExists(filepath.Join(cfg.Root, lens.SourceRoot, filepath.FromSlash(ref))) {
+			return lens.SourceRoot, ref, nil
+		}
+	}
+	if fileExists(filepath.Join(cfg.Root, filepath.FromSlash(ref))) {
+		return ".", ref, nil
+	}
+	// Suffix search: find a file whose path ends with the reference.
+	var foundRoot, foundRel string
+	_ = filepath.WalkDir(cfg.Root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if shouldSkipDir(cfg, p, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || foundRel != "" {
+			return nil
+		}
+		relPath, _ := filepath.Rel(cfg.Root, p)
+		relPath = filepath.ToSlash(relPath)
+		if relPath == ref || strings.HasSuffix(relPath, "/"+ref) {
+			foundRoot = strings.TrimSuffix(strings.TrimSuffix(relPath, ref), "/")
+			if foundRoot == "" {
+				foundRoot = "."
+			}
+			foundRel = ref
+		}
+		return nil
+	})
+	if foundRel != "" {
+		return foundRoot, foundRel, nil
+	}
+	return "", "", fmt.Errorf("could not resolve source file %q under any source root", ref)
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func parseLineRange(s string) (int, int) {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '-'); i > 0 {
+		return atoi(s[:i]), atoi(s[i+1:])
+	}
+	n := atoi(s)
+	return n, n
+}
+
+// ParsedBlock is a block recovered from an existing projection file, including
+// the source anchor metadata needed for two-way sync.
+type ParsedBlock struct {
+	Anchor   string
+	File     string
+	ID       string
+	Tool     string
+	Mode     string
+	Hash     string
+	Sync     string
+	SrcFile  string
+	SrcStart int
+	SrcEnd   int
+	SrcHash  string
+	Lines    []string
+}
+
+var anchorRE = regexp.MustCompile(`^@@ (.+?)#(.+?) \[([^.]+)\.([^ \]]+) hash=([0-9a-f]+)(?: sync=two-way src=(.+?):(\d+)-(\d+) srchash=([0-9a-f]+))?\]$`)
+
+// parseProjectionFile recovers blocks (with anchor metadata) from a rendered
+// projection so the sync engine can detect edits and map them back to source.
+func parseProjectionFile(path string) ([]ParsedBlock, error) {
+	lines, err := readLines(path)
+	if err != nil {
+		return nil, err
+	}
+	var blocks []ParsedBlock
+	for i := 0; i < len(lines); i++ {
+		m := anchorRE.FindStringSubmatch(lines[i])
+		if m == nil {
+			continue
+		}
+		blk := ParsedBlock{Anchor: lines[i], File: m[1], ID: m[2], Tool: m[3], Mode: m[4], Hash: m[5]}
+		if m[6] != "" {
+			blk.Sync = "two-way"
+			blk.SrcFile = m[6]
+			blk.SrcStart = atoi(m[7])
+			blk.SrcEnd = atoi(m[8])
+			blk.SrcHash = m[9]
+		}
+		j := i + 1
+		for j < len(lines) && lines[j] != "@@" {
+			blk.Lines = append(blk.Lines, lines[j])
+			j++
+		}
+		blocks = append(blocks, blk)
+		i = j
+	}
+	return blocks, nil
+}
+
+// SyncResult reports what SyncProjection did for one projection file.
+type SyncResult struct {
+	ToProjection int
+	ToSource     int
+	Conflicts    []string
+}
+
+// SyncProjection reconciles a two-way projection file with its source files. For
+// each two-way block: if only the source changed, refresh the projection; if only
+// the projection changed, write it back to source; if both changed, report a conflict.
+func SyncProjection(cfg Config, projPath string) (SyncResult, error) {
+	var res SyncResult
+	blocks, err := parseProjectionFile(projPath)
+	if err != nil {
+		return res, err
+	}
+	// Group edits to source per file; apply with running offset for line-count drift.
+	for _, blk := range blocks {
+		if blk.Sync != "two-way" || blk.SrcFile == "" {
+			continue
+		}
+		srcPath := filepath.Join(cfg.Root, filepath.FromSlash(blk.SrcFile))
+		srcLines, err := readLines(srcPath)
+		if err != nil {
+			return res, err
+		}
+		if blk.SrcStart < 1 || blk.SrcEnd > len(srcLines) || blk.SrcEnd < blk.SrcStart {
+			res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s: stale range %d-%d", blk.SrcFile, blk.SrcStart, blk.SrcEnd))
+			continue
+		}
+		liveSpan := srcLines[blk.SrcStart-1 : blk.SrcEnd]
+		liveHash := hash(strings.Join(liveSpan, "\n") + "\n")
+		projHash := hash(strings.Join(blk.Lines, "\n") + "\n")
+
+		projEdited := projHash != blk.Hash
+		srcChanged := liveHash != blk.SrcHash
+
+		// Header retarget: the user edited the anchor's file/class (before #) or the a-b
+		// range in the ID. Re-extract the view for the new target on save.
+		wantFile, wantA, wantB := bookmarkTarget(cfg, blk)
+		if wantFile != blk.SrcFile || wantA != blk.SrcStart || wantB != blk.SrcEnd {
+			res.ToProjection++
+			continue
+		}
+
+		switch {
+		case projEdited && srcChanged:
+			res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s#%s: both source and projection changed", blk.File, blk.ID))
+		case projEdited && !srcChanged:
+			// projection -> source
+			newLines := append([]string{}, srcLines[:blk.SrcStart-1]...)
+			newLines = append(newLines, blk.Lines...)
+			newLines = append(newLines, srcLines[blk.SrcEnd:]...)
+			if err := writeLines(srcPath, newLines); err != nil {
+				return res, err
+			}
+			res.ToSource++
+		case !projEdited && srcChanged:
+			res.ToProjection++
+		}
+	}
+	// If any source was updated or refreshed, rebuild the projection's two-way blocks
+	// from current source so anchors (hash/srchash) are consistent again — this keeps
+	// round-trips clean and works for both configured bookmarks and drop-ins (no lens).
+	if res.ToSource > 0 || res.ToProjection > 0 {
+		if err := refreshTwoWayProjection(cfg, projPath); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
+
+// refreshTwoWayProjection re-reads the source span of every two-way block in a projection
+// and rewrites the file with consistent anchors. View-only blocks are preserved verbatim.
+// Lens-independent, so it serves configured bookmark lenses and drop-in bookmarks alike.
+func refreshTwoWayProjection(cfg Config, projPath string) error {
+	name, analyzer, sync := readHeaderMeta(projPath)
+	blocks, err := parseProjectionFile(projPath)
+	if err != nil {
+		return err
+	}
+	p := Projection{Sync: coalesce(sync, "two-way"), Lens: LensConfig{Name: name, Analyzer: coalesce(analyzer, "bookmark")}}
+	for _, blk := range blocks {
+		nb := ProjectionBlock{ID: blk.ID, File: blk.File, Tool: blk.Tool, Mode: blk.Mode, Lines: blk.Lines}
+		if blk.Sync == "two-way" && blk.SrcFile != "" {
+			// The header (display file + ID range) is authoritative, so editing it retargets
+			// the view. Fall back to the anchor's src= span when the header is unchanged.
+			wantFile, wantA, wantB := bookmarkTarget(cfg, blk)
+			srcLines, err := readLines(filepath.Join(cfg.Root, filepath.FromSlash(wantFile)))
+			if err != nil {
+				return err
+			}
+			if wantA >= 1 && wantB <= len(srcLines) && wantB >= wantA {
+				span := append([]string{}, srcLines[wantA-1:wantB]...)
+				nb.Lines = span
+				nb.Sync = "two-way"
+				nb.SrcFile = wantFile
+				nb.SrcStart = wantA
+				nb.SrcEnd = wantB
+				nb.SrcHash = hash(strings.Join(span, "\n") + "\n")
+				nb.ID = fmt.Sprintf("%s:%d-%d", filepath.Base(wantFile), wantA, wantB)
+			}
+		}
+		p.Blocks = append(p.Blocks, nb)
+	}
+	finalizeProjection(&p, p.Lens)
+	return RenderProjection(projPath, p)
+}
+
+var idRangeRE = regexp.MustCompile(`:(\d+)-(\d+)$`)
+
+// bookmarkTarget derives the requested source target from a two-way block's header: the
+// display file (before #, repo- or package-relative) and the a-b range in the ID. This is
+// what makes editing the header — the class/file or the line range — refresh the view.
+func bookmarkTarget(cfg Config, blk ParsedBlock) (srcFile string, a, b int) {
+	a, b = blk.SrcStart, blk.SrcEnd
+	if m := idRangeRE.FindStringSubmatch(blk.ID); m != nil {
+		a, b = atoi(m[1]), atoi(m[2])
+	}
+	srcFile = blk.SrcFile
+	if root, rel, err := resolveSourceFile(cfg, blk.File); err == nil {
+		srcFile = filepath.ToSlash(filepath.Join(root, rel))
+	}
+	return srcFile, a, b
+}
+
+// readHeaderMeta extracts the lens name, analyzer, and sync policy from a projection header.
+func readHeaderMeta(projPath string) (name, analyzer, sync string) {
+	lines, err := readLines(projPath)
+	if err != nil {
+		return "", "", ""
+	}
+	for _, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "# lens: "):
+			name = strings.TrimPrefix(l, "# lens: ")
+		case strings.HasPrefix(l, "# analyzer: "):
+			analyzer = strings.TrimPrefix(l, "# analyzer: ")
+		case strings.HasPrefix(l, "# sync: "):
+			sync = strings.TrimPrefix(l, "# sync: ")
+		case !strings.HasPrefix(l, "#") && strings.TrimSpace(l) != "":
+			return
+		}
+	}
+	return
+}
+
+func writeLines(path string, lines []string) error {
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+}
+
+// ============================================================================
+// Interactive menu
+// ============================================================================
+
+// RunMenu drives an interactive loop to add views, persisting each new lens to the
+// config file so views are reproducible. It is scriptable via piped stdin.
+func RunMenu(cfg Config, configPath string, in io.Reader, out io.Writer) error {
+	r := bufio.NewReader(in)
+	prompt := func(label string) string {
+		fmt.Fprintf(out, "%s: ", label)
+		s, _ := r.ReadString('\n')
+		return strings.TrimSpace(s)
+	}
+	// Background watch toggle: started/stopped without leaving the menu.
+	var watchStop chan struct{}
+	defer func() {
+		if watchStop != nil {
+			close(watchStop)
+		}
+	}()
+	for {
+		watchState := "off"
+		if watchStop != nil {
+			watchState = "on"
+		}
+		fmt.Fprintln(out, "\nfile-projections menu")
+		fmt.Fprintln(out, "  1) regenerate all lenses")
+		fmt.Fprintln(out, "  2) add control-flow view (entry -> line)")
+		fmt.Fprintln(out, "  3) add data-flow view (variable)")
+		fmt.Fprintln(out, "  4) add entrypoints view")
+		fmt.Fprintln(out, "  5) add exitpoints view")
+		fmt.Fprintln(out, "  6) add bookmark view (two-way)")
+		fmt.Fprintf(out, "  7) toggle watch (regenerate + sync on change) [%s]\n", watchState)
+		fmt.Fprintln(out, "  8) quit")
+		choice := prompt("choice")
+		switch choice {
+		case "1":
+			if err := runAndReport(cfg, cfg.Lenses, out); err != nil {
+				fmt.Fprintln(out, "error:", err)
+			}
+		case "2":
+			lens := LensConfig{
+				Name:       prompt("name"),
+				Analyzer:   "control-flow",
+				SourceRoot: prompt("source root"),
+				Params:     map[string]string{"file": prompt("file (relative to source root)"), "line": prompt("target line")},
+			}
+			cfg = addLens(cfg, configPath, lens, out)
+		case "3":
+			lens := LensConfig{
+				Name:       prompt("name"),
+				Analyzer:   "data-flow",
+				SourceRoot: prompt("source root"),
+				Params:     map[string]string{"file": prompt("file (relative to source root)"), "line": prompt("target line"), "var": prompt("variable"), "mode": "fallback"},
+			}
+			cfg = addLens(cfg, configPath, lens, out)
+		case "4":
+			lens := LensConfig{
+				Name: prompt("name"), Analyzer: "entrypoints", SourceRoot: prompt("source root"),
+				Params: map[string]string{"patterns": prompt("patterns (label=regex;label=regex)")},
+			}
+			cfg = addLens(cfg, configPath, lens, out)
+		case "5":
+			lens := LensConfig{
+				Name: prompt("name"), Analyzer: "exitpoints", SourceRoot: prompt("source root"),
+				Params: map[string]string{"sinks": prompt("sinks (comma globs, e.g. *repository*.save,*kafka*.send)")},
+			}
+			cfg = addLens(cfg, configPath, lens, out)
+		case "6":
+			lens := LensConfig{
+				Name:       prompt("name"),
+				Analyzer:   "bookmark",
+				SourceRoot: prompt("source root"),
+				Params:     map[string]string{"file": prompt("file (relative to source root)"), "lines": prompt("line range a-b")},
+			}
+			cfg = addLens(cfg, configPath, lens, out)
+		case "7":
+			if watchStop == nil {
+				watchStop = make(chan struct{})
+				go RunWatchUntil(cfg, out, watchStop)
+				fmt.Fprintln(out, "watch started (background)")
+			} else {
+				close(watchStop)
+				watchStop = nil
+				fmt.Fprintln(out, "watch stopped")
+			}
+		case "8", "q", "quit", "":
+			return nil
+		default:
+			fmt.Fprintln(out, "unknown choice")
+		}
+	}
+}
+
+func addLens(cfg Config, configPath string, lens LensConfig, out io.Writer) Config {
+	if lens.Out == "" {
+		lens.Out = filepath.Join(cfg.ProjectionsDir, lens.Name+".projection")
+	}
+	cfg.Lenses = append(cfg.Lenses, lens)
+	if err := SaveConfig(configPath, cfg); err != nil {
+		fmt.Fprintln(out, "error saving config:", err)
+		return cfg
+	}
+	if err := runAndReport(cfg, []LensConfig{lens}, out); err != nil {
+		fmt.Fprintln(out, "error:", err)
+	}
+	return cfg
+}
+
+func runAndReport(cfg Config, lenses []LensConfig, out io.Writer) error {
+	sub := cfg
+	sub.Lenses = lenses
+	results, err := Run(sub, DefaultRegistry())
+	if err != nil {
+		return err
+	}
+	for _, p := range results {
+		fmt.Fprintf(out, "wrote %s (%d blocks", LensOut(cfg, p.Lens), len(p.Blocks))
+		if len(p.Extra) > 0 {
+			fmt.Fprintf(out, ", %d branch files", len(p.Extra))
+		}
+		fmt.Fprintln(out, ")")
+	}
+	return nil
+}
+
+// SaveConfig writes the config back as indented JSON (used when the menu adds a lens).
+func SaveConfig(path string, cfg Config) error {
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0644)
+}
+
+// ============================================================================
+// Watch mode
+// ============================================================================
+
+// RunWatch blocks, watching until the process is interrupted (CLI `watch`).
+func RunWatch(cfg Config) error {
+	fmt.Println("watching for changes (Ctrl-C to stop)...")
+	return RunWatchUntil(cfg, os.Stdout, nil)
+}
+
+// RunWatchUntil regenerates projections when source files change and syncs two-way
+// bookmark projections back to source when they are edited. It polls mtimes (stdlib)
+// until stop is closed; pass nil to run forever. Used both by the CLI and the menu's
+// background watch toggle.
+func RunWatchUntil(cfg Config, out io.Writer, stop <-chan struct{}) error {
+	mtimes := map[string]time.Time{}
+	snapshot := func() map[string]time.Time {
+		m := map[string]time.Time{}
+		for _, lens := range cfg.Lenses {
+			base := filepath.Join(cfg.Root, lens.SourceRoot)
+			filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				if shouldSkipDir(cfg, p, d) {
+					return filepath.SkipDir
+				}
+				if !d.IsDir() && isScannableSource(p) {
+					if info, err := d.Info(); err == nil {
+						m[p] = info.ModTime()
+					}
+				}
+				return nil
+			})
+		}
+		// Track every .projection in the projections dir so drop-ins and non-lens
+		// two-way bookmarks are watched too.
+		projDir := filepath.Join(cfg.Root, cfg.ProjectionsDir)
+		if entries, err := os.ReadDir(projDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".projection") {
+					if info, err := e.Info(); err == nil {
+						m["proj:"+filepath.Join(projDir, e.Name())] = info.ModTime()
+					}
+				}
+			}
+		}
+		return m
+	}
+	mtimes = snapshot()
+	for {
+		select {
+		case <-stop:
+			return nil
+		case <-time.After(time.Second):
+		}
+		cur := snapshot()
+		srcChanged := false
+		for k, t := range cur {
+			if strings.HasPrefix(k, "proj:") {
+				continue
+			}
+			if old, ok := mtimes[k]; !ok || !old.Equal(t) {
+				srcChanged = true
+				fmt.Fprintln(out, "source changed:", k)
+			}
+		}
+		// Expand any freshly dropped-in single-line bookmarks (path:line) into full
+		// two-way bookmarks. New files appear in cur but not mtimes.
+		for key := range cur {
+			if !strings.HasPrefix(key, "proj:") {
+				continue
+			}
+			if _, known := mtimes[key]; !known {
+				if expanded, err := expandDropIns(cfg); err == nil {
+					for _, p := range expanded {
+						fmt.Fprintln(out, "expanded drop-in bookmark:", p)
+					}
+				}
+				break
+			}
+		}
+		// Two-way projection edits -> sync back to source (any .projection in the dir).
+		for key, t := range cur {
+			if !strings.HasPrefix(key, "proj:") {
+				continue
+			}
+			projPath := strings.TrimPrefix(key, "proj:")
+			old, ok := mtimes[key]
+			if !ok || old.Equal(t) || !hasTwoWayBlock(projPath) {
+				continue
+			}
+			if r, err := SyncProjection(cfg, projPath); err == nil && (r.ToSource > 0 || len(r.Conflicts) > 0) {
+				fmt.Fprintf(out, "synced %s: %d->source, conflicts=%v\n", projPath, r.ToSource, r.Conflicts)
+			}
+		}
+		if srcChanged {
+			// Incremental CPG refresh for joern lenses (skips unchanged roots).
+			if joernAvailable(cfg) && len(joernSourceRoots(cfg)) > 0 {
+				if err := RunBuildCPG(cfg); err != nil {
+					fmt.Fprintln(out, "cpg refresh error:", err)
+				}
+			}
+			if _, err := Run(cfg, DefaultRegistry()); err != nil {
+				fmt.Fprintln(out, "regen error:", err)
+			} else {
+				fmt.Fprintln(out, "regenerated projections")
+			}
+		}
+		mtimes = snapshot()
+	}
+}
+
+// hasTwoWayBlock reports whether a projection file contains a two-way (bookmark) block.
+func hasTwoWayBlock(projPath string) bool {
+	blocks, err := parseProjectionFile(projPath)
+	if err != nil {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Sync == "two-way" {
+			return true
+		}
+	}
+	return false
+}

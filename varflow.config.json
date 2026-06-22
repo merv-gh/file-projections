@@ -1,0 +1,30 @@
+{
+  "root": ".",
+  "projections_dir": ".projections",
+  "lenses": [
+    {
+      "name": "owner-update-owner-var-flow",
+      "out": ".projections/owner-update-owner-var-flow.projection",
+      "analyzer": "joern-var-flow",
+      "source_root": "spring-petclinic-main/src/main/java",
+      "params": {
+        "mode": "fallback",
+        "file": "org/springframework/samples/petclinic/owner/OwnerController.java",
+        "line": "156",
+        "var": "owner"
+      }
+    },
+    {
+      "name": "pet-create-owner-var-flow",
+      "out": ".projections/pet-create-owner-var-flow.projection",
+      "analyzer": "joern-var-flow",
+      "source_root": "spring-petclinic-main/src/main/java",
+      "params": {
+        "mode": "fallback",
+        "file": "org/springframework/samples/petclinic/owner/PetController.java",
+        "line": "124",
+        "var": "owner"
+      }
+    }
+  ]
+}

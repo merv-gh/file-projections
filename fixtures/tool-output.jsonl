@@ -1,0 +1,2 @@
+{"kind": "block", "id": "demo", "file": "virtual.txt", "mode": "note", "tool": "fixture", "lines": ["hello from generic jsonl"], "facts": ["jsonl block facts survive rendering"]}
+{"kind": "fact", "id": "external-tool", "tool": "fixture", "text": "external tool facts use the same renderer"}

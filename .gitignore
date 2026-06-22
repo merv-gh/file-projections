@@ -1,0 +1,12 @@
+# build outputs
+bin/
+file-projections
+.projections/
+tmp/
+# Joern artifacts (regenerable)
+workspace/
+.projections/.cpg/
+.projections/.joern-*.jsonl
+
+# OS noise
+.DS_Store

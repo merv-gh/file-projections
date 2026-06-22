@@ -1,0 +1,105 @@
+{
+  "root": ".",
+  "projections_dir": ".projections",
+  "tools": {
+    "rg": { "image": "" },
+    "joern": { "image": "ghcr.io/joernio/joern:nightly", "jvm_args": "-Xmx6g" }
+  },
+  "lenses": [
+    {
+      "name": "self-model",
+      "out": ".projections/self-model.projection",
+      "analyzer": "go-symbols",
+      "source_root": ".",
+      "include": ["main.go"]
+    },
+    {
+      "name": "js-sample-event-surface",
+      "out": ".projections/js-sample-event-surface.projection",
+      "analyzer": "js-events",
+      "source_root": "fixtures/js-sample",
+      "include": ["core.js"]
+    },
+
+    {
+      "name": "petclinic-postmapping-to-saves",
+      "out": ".projections/petclinic-postmapping-to-saves.projection",
+      "analyzer": "flow",
+      "source_root": "spring-petclinic-main/src/main/java",
+      "params": {
+        "entry": "@PostMapping",
+        "sink": "\\.\\s*save\\s*\\(",
+        "file_suffix": "Controller.java",
+        "mode": "post-to-save",
+        "tool": "flow",
+        "stop_calls": "hasErrors,addFlashAttribute,rejectValue,getId,getName,getBirthDate,isAfter,now,isNew,getPet,addPet,save,hasText,state,setName,setBirthDate,setType"
+      }
+    },
+    {
+      "name": "petclinic-entrypoints",
+      "out": ".projections/petclinic-entrypoints.projection",
+      "analyzer": "entrypoints",
+      "source_root": "spring-petclinic-main/src/main/java",
+      "params": {
+        "patterns": "kafka-listener=@KafkaListener;scheduled=@Scheduled;event-listener=@EventListener;http-mapping=@(Get|Post|Put|Delete|Patch|Request)Mapping"
+      }
+    },
+    {
+      "name": "petclinic-exitpoints",
+      "out": ".projections/petclinic-exitpoints.projection",
+      "analyzer": "exitpoints",
+      "source_root": "spring-petclinic-main/src/main/java",
+      "params": { "sinks": "*.save,*kafka*.send" }
+    },
+
+    {
+      "name": "shop-entrypoints",
+      "out": ".projections/shop-entrypoints.projection",
+      "analyzer": "entrypoints",
+      "source_root": "fixtures/spring-sample",
+      "params": {
+        "patterns": "kafka-listener=@KafkaListener;scheduled=@Scheduled;event-listener=@EventListener;http-mapping=@(Get|Post|Put|Delete|Patch|Request)Mapping"
+      }
+    },
+    {
+      "name": "shop-exitpoints",
+      "out": ".projections/shop-exitpoints.projection",
+      "analyzer": "exitpoints",
+      "source_root": "fixtures/spring-sample",
+      "params": { "sinks": "*repository*.save,*kafka*.send" }
+    },
+    {
+      "name": "shop-checkout-paths",
+      "out": ".projections/shop-checkout-paths.projection",
+      "analyzer": "control-flow",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "file": "com/example/shop/OrderController.java",
+        "line": "35",
+        "max_branches": "16"
+      }
+    },
+    {
+      "name": "shop-checkout-order-data-flow",
+      "out": ".projections/shop-checkout-order-data-flow.projection",
+      "analyzer": "data-flow",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "file": "com/example/shop/OrderController.java",
+        "line": "35",
+        "var": "order",
+        "mode": "fallback"
+      }
+    },
+    {
+      "name": "shop-order-ctor-bookmark",
+      "out": ".projections/shop-order-ctor-bookmark.projection",
+      "analyzer": "bookmark",
+      "source_root": "fixtures/spring-sample/src/main/java",
+      "params": {
+        "file": "com/example/shop/OrderController.java",
+        "lines": "16-18"
+      }
+    }
+  ]
+}

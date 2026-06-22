@@ -1,0 +1,31 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: test
+        run: go test ./...
+      - name: cross-compile
+        run: make cross
+      - name: checksums
+        run: cd bin && sha256sum * > SHA256SUMS.txt
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/*
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true

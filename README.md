@@ -182,11 +182,14 @@ make run CONFIG=joern.config.json     # run the CPG lenses (uses the cache if pr
   Override or tune via `tools.joern.image` / `jvm_args` (default `-Xmx6g`, forwarded as
   `_JAVA_OPTIONS`). If Joern can't run, you get a specific, actionable message (install
   Docker / start the daemon / pull failed) — never a cryptic one.
-- **Parse once, then query.** A joern lens auto-builds the CPG for its source root with
-  `joern-parse` (the frontend Joern recommends for large codebases) and caches it at
-  `<projections_dir>/.cpg/<hash>.bin`; lenses then `importCpg` instead of re-importing source.
-  Progress + timing are logged at every step (image, CPG build, each query) so a long parse
-  reads as *working*, not stuck. For a big repo, run `make cpg` once up front.
+- **Parse once, then query.** A joern lens auto-builds the CPG for its source root and caches
+  it at `<projections_dir>/.cpg/<hash>.bin`; lenses then `importCpg` instead of re-importing
+  source. For Java/Go it invokes the language frontend **directly** (`javasrc2cpg`/`gosrc2cpg`
+  with `-J-Xmx…`) rather than `joern-parse` — Joern's recommended path for large/memory-heavy
+  codebases, which avoids spawning a second JVM (measurably faster). Progress + timing are
+  logged at every step (image, frontend + heap, each query) so a long parse reads as *working*,
+  not stuck. For a big repo, run `make cpg` once up front, and raise `tools.joern.jvm_args`
+  (e.g. `-Xmx12g`) if the parse is memory-bound.
 - Scripts live in `tools/joern/` (`java-var-flow.sc`, `control-flow.sc`) and emit the same
   JSONL the renderer consumes — JSON is hand-built so they run on stock Joern images.
 - `control-flow mode=joern` writes the same branch-per-file output as the lexical lens.

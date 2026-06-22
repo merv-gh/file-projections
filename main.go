@@ -1324,7 +1324,9 @@ func buildCPGForRoot(cfg Config, root string, fileCount int, out io.Writer) (str
 	if err := os.MkdirAll(filepath.Join(cfg.Root, filepath.Dir(outRel)), 0755); err != nil {
 		return "", err
 	}
-	fmt.Fprintf(out, "joern: building CPG for %s (%d files) — this is a one-time parse, large repos can take minutes...\n", root, fileCount)
+	tool, jflags := cpgBuildPlan(cfg, root)
+	fmt.Fprintf(out, "joern: building CPG for %s (%d files) with %s %s — one-time parse, large repos can take minutes (raise tools.joern.jvm_args if it's slow)...\n",
+		root, fileCount, tool, strings.Join(jflags, " "))
 	start := nowFunc()
 	o, err := execJoernParse(cfg, root, outRel)
 	if err != nil {
@@ -1468,20 +1470,103 @@ func diffManifest(prev, cur map[string]string) (added, modified, removed []strin
 	return
 }
 
-// execJoernParse runs joern-parse (local or via the Docker image) to produce a cpg.bin.
+// rootLanguage returns the dominant source language (java/go/js) under a source root.
+func rootLanguage(cfg Config, root string) string {
+	base := filepath.Join(cfg.Root, root)
+	count := map[string]int{}
+	filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if shouldSkipDir(cfg, p, d) {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && isScannableSource(p) {
+			count[wizardLang(p)]++
+		}
+		return nil
+	})
+	best, n := "", 0
+	for _, l := range []string{"java", "go", "js"} {
+		if count[l] > n {
+			best, n = l, count[l]
+		}
+	}
+	return best
+}
+
+// joernFrontend returns the language-specific Joern frontend binary for a source root, or
+// "" to use the generic joern-parse. Invoking the frontend directly (vs joern-parse) avoids
+// spawning a second JVM — what Joern recommends for large/memory-heavy codebases.
+func joernFrontend(lang string) string {
+	switch lang {
+	case "java":
+		return "javasrc2cpg"
+	case "go":
+		return "gosrc2cpg"
+	default:
+		return "" // js/ts/mixed → joern-parse autodetect
+	}
+}
+
+// frontendJVMFlags converts jvm_args (e.g. "-Xmx6g") into frontend -J flags
+// (e.g. "-J-Xmx6g"), which set the frontend JVM heap directly.
+func frontendJVMFlags(cfg Config) []string {
+	var out []string
+	for _, t := range strings.Fields(joernJVMArgs(cfg)) {
+		out = append(out, "-J"+t)
+	}
+	return out
+}
+
+// cpgBuildPlan describes how the CPG for a root will be built (for progress logging).
+func cpgBuildPlan(cfg Config, sourceRootRel string) (tool string, jflags []string) {
+	if fe := joernFrontend(rootLanguage(cfg, sourceRootRel)); fe != "" {
+		return fe, frontendJVMFlags(cfg)
+	}
+	return "joern-parse", nil
+}
+
+// execJoernParse builds a cpg.bin. For Java/Go it invokes the language frontend directly
+// (javasrc2cpg/gosrc2cpg) with -J memory flags — Joern's recommended path for big repos,
+// which avoids the extra joern-parse process. Falls back to joern-parse otherwise.
 func execJoernParse(cfg Config, sourceRootRel, outRel string) ([]byte, error) {
 	absRoot, _ := filepath.Abs(cfg.Root)
-	if bin, err := exec.LookPath("joern-parse"); err == nil {
-		cmd := exec.Command(bin, filepath.Join(absRoot, sourceRootRel), "--output", filepath.Join(absRoot, outRel))
+	frontend, jflags := cpgBuildPlan(cfg, sourceRootRel)
+
+	// Local binary path (frontend, else joern-parse).
+	localBin := frontend
+	if _, err := exec.LookPath(localBin); err != nil {
+		localBin = ""
+	}
+	if localBin == "" {
+		if _, err := exec.LookPath("joern-parse"); err == nil {
+			localBin = "joern-parse"
+			jflags = nil
+		}
+	}
+	if localBin != "" {
+		args := append([]string{}, jflags...)
+		args = append(args, filepath.Join(absRoot, sourceRootRel), "--output", filepath.Join(absRoot, outRel))
+		cmd := exec.Command(localBin, args...)
 		cmd.Dir = cfg.Root
 		return cmd.CombinedOutput()
 	}
+
 	if _, err := exec.LookPath("docker"); err != nil {
-		return nil, errors.New("joern-parse not in PATH and Docker not available")
+		return nil, errors.New("no Joern frontend in PATH and Docker not available")
 	}
-	dargs := []string{"run", "--rm", "-v", dockerMount(absRoot), "-w", "/src",
-		"-e", "_JAVA_OPTIONS=" + joernJVMArgs(cfg), joernImage(cfg),
-		"joern-parse", "/src/" + filepath.ToSlash(sourceRootRel), "--output", "/src/" + filepath.ToSlash(outRel)}
+	src := "/src/" + filepath.ToSlash(sourceRootRel)
+	out := "/src/" + filepath.ToSlash(outRel)
+	dargs := []string{"run", "--rm", "-v", dockerMount(absRoot), "-w", "/src"}
+	if frontend == "joern-parse" {
+		// joern-parse spawns the frontend as a child; pass heap via env so the child gets it.
+		dargs = append(dargs, "-e", "_JAVA_OPTIONS="+joernJVMArgs(cfg), joernImage(cfg), "joern-parse", src, "--output", out)
+	} else {
+		dargs = append(dargs, joernImage(cfg), frontend)
+		dargs = append(dargs, jflags...)
+		dargs = append(dargs, src, "--output", out)
+	}
 	cmd := exec.Command("docker", dargs...)
 	cmd.Dir = cfg.Root
 	return cmd.CombinedOutput()

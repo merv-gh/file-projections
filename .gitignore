@@ -11,3 +11,7 @@ workspace/
 # OS noise
 .DS_Store
 *.bin
+.gradle/
+.code-review-graph
+.lock
+build/

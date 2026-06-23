@@ -48,6 +48,7 @@ Each lens is one entry in `config.json` with an `analyzer` and `params`. Lenses 
 | `bookmark` | a verbatim source span — **two-way**: edits sync back to source; supports single-line drop-ins | — |
 | `flow` | generic "annotated entry reaches a sink" (config regexes); `java-post-to-save` is an alias | stdlib Java |
 | `joern-var-flow` | interprocedural var data-flow (CPG) with Java fallback | joern → stdlib |
+| `unrolled-program` | editable straight-line Java path assembled from cross-file calls; each line syncs back to its origin | stdlib Java |
 | `ast-grep` | structural pattern matches | ast-grep → docker |
 | `go-symbols` / `js-events` / `jsonl` | Go symbol map / JS event surface / generic tool adapter | stdlib |
 
@@ -123,6 +124,22 @@ Emits only the lines that shape the variable, each with a right-padded trailing 
 (`order.setShipping("express");          // <- mutates order`) so the code stays scannable.
 Set `mode: joern` to use a Joern CPG slice instead of the static fallback.
 
+### unrolled-program — editable straight-line Java path
+
+```json
+{ "name": "receipt-summary", "analyzer": "unrolled-program",
+  "source_root": "src/main/java",
+  "params": { "file": "sample/App.java", "method": "summary",
+              "inputs": "coupon=save,amount=50" } }
+```
+
+Builds one readable program from the selected Java method by inlining same-class calls and
+`new Helper().method(...)` calls, then evaluating simple branch conditions from
+`params.inputs`. The rendered lines are real source lines from their original files. Editing
+one line in the projection under `watch` writes that line back to its source origin, even when
+adjacent projection lines came from different files. If `inputs` is omitted, unknown branches
+are shown together and a fact calls out that no concrete path was selected.
+
 ### bookmark — two-way sync
 
 ```json
@@ -166,6 +183,7 @@ The path may be repo-relative or package-relative (resolved across source roots)
 <lines…>                                                # code first, file:line second column
 @@
 => <id>: <fact>                                         # only where it adds signal (e.g. bookmark sync)
+=> <id>: origin <n> src=<f>:<line> srchash=<h>           # scattered two-way analytical line
 ```
 
 ## config.json reference

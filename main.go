@@ -100,6 +100,10 @@ type ProjectionBlock struct {
 	Lines []string
 	Facts []string
 	Hash  string
+	// LineOrigins maps individual projection lines back to scattered source
+	// lines. Unlike SrcStart/SrcEnd, this supports analytical projections whose
+	// editable surface is assembled from many files.
+	LineOrigins []LineOrigin
 	// Sync/Src fields support two-way "extract" blocks. SrcHash is the hash of
 	// the source span at generation time; it lets SyncProjection detect whether
 	// the source changed independently of the projection (conflict detection).
@@ -108,6 +112,12 @@ type ProjectionBlock struct {
 	SrcStart int
 	SrcEnd   int
 	SrcHash  string
+}
+
+type LineOrigin struct {
+	SrcFile string
+	Line    int
+	SrcHash string
 }
 
 type ProjectionFact struct {
@@ -149,6 +159,7 @@ func DefaultRegistry() Registry {
 		"entry-to-exit":     AnalyzerFunc{"entry-to-exit", AnalyzeEntryToExit},
 		"data-flow":         AnalyzerFunc{"data-flow", AnalyzeDataFlow},
 		"object-flow":       AnalyzerFunc{"object-flow", AnalyzeObjectFlow},
+		"unrolled-program":  AnalyzerFunc{"unrolled-program", AnalyzeUnrolledProgram},
 		"bookmark":          AnalyzerFunc{"bookmark", AnalyzeBookmark},
 		"extract":           AnalyzerFunc{"extract", AnalyzeBookmark}, // back-compat alias
 	}
@@ -207,6 +218,8 @@ func main() {
 	targetFile := flag.String("file", "", "target source file for joern-var-flow")
 	targetLine := flag.String("line", "", "target line number for joern-var-flow")
 	targetMethod := flag.String("method", "", "target method name for joern-var-flow")
+	targetType := flag.String("type", "", "target type name for object-flow")
+	inputs := flag.String("inputs", "", "concrete branch inputs for unrolled-program, e.g. amount=50,coupon=save")
 	mode := flag.String("mode", "", "adapter mode, e.g. auto, joern, fallback")
 	flag.Parse()
 
@@ -237,6 +250,12 @@ func main() {
 		}
 		if *targetMethod != "" {
 			params["method"] = *targetMethod
+		}
+		if *targetType != "" {
+			params["type"] = *targetType
+		}
+		if *inputs != "" {
+			params["inputs"] = *inputs
 		}
 		if *mode != "" {
 			params["mode"] = *mode
@@ -273,7 +292,7 @@ USAGE
 
 COMMANDS
   menu          interactively add views (control-flow, data-flow, bookmark, …)
-  watch         regenerate on change + sync two-way bookmark edits back to source
+  watch         regenerate on change + sync two-way projection edits back to source
   build         build/refresh the cached Joern CPG (alias: refresh)
   bookmarks     expand single-line drop-in .projection files into two-way bookmarks
   perf          benchmark all-to-all entry→exit on a repo, with a wall-clock cap
@@ -282,9 +301,9 @@ COMMANDS
 
 FLAGS (run one ad-hoc lens without a config)
   -config <path>       config file (default config.json)
-  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow
+  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow|object-flow|unrolled-program
   -source-root <dir>   source root for the ad-hoc lens
-  -file -line -var -method -mode -out   lens parameters
+  -file -line -var -method -type -inputs -mode -out   lens parameters
 
 LENSES
   entrypoints    where control enters (annotations; params.patterns)
@@ -292,6 +311,8 @@ LENSES
   control-flow   all paths entry→line, one file per branch (mode=joern handles else-if/switch/loops)
   data-flow      the lines that shape a variable, as trailing comments
   entry-to-exit  all call-graph flows from entrypoints to exitpoints (joern)
+  object-flow    how target-type instances are assembled across files (joern)
+  unrolled-program editable straight-line Java path with scattered two-way sync
   bookmark       two-way verbatim span; or drop in 'pkg/Foo.java:17'
   flow           generic "annotated entry reaches a sink"
 
@@ -441,6 +462,12 @@ func projectionBody(p Projection) string {
 		b.WriteString("@@\n")
 		for _, fact := range block.Facts {
 			fmt.Fprintf(&b, "=> %s: %s\n", block.ID, fact)
+		}
+		for i, origin := range block.LineOrigins {
+			if origin.SrcFile == "" || origin.Line <= 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "=> %s: origin %d src=%s:%d srchash=%s\n", block.ID, i+1, origin.SrcFile, origin.Line, origin.SrcHash)
 		}
 		b.WriteString("\n")
 	}
@@ -1766,7 +1793,7 @@ func joernSourceRoots(cfg Config) []string {
 	roots := map[string]bool{}
 	for _, lens := range cfg.Lenses {
 		switch lens.Analyzer {
-		case "joern-var-flow", "control-flow", "data-flow", "entry-to-exit":
+		case "joern-var-flow", "control-flow", "data-flow", "entry-to-exit", "object-flow":
 			if lens.SourceRoot != "" {
 				roots[lens.SourceRoot] = true
 			}
@@ -3297,6 +3324,311 @@ func AnalyzeObjectFlow(cfg Config, lens LensConfig) (Projection, error) {
 	return p, nil
 }
 
+type unrollLine struct {
+	code string
+	file string
+	line int
+}
+
+// AnalyzeUnrolledProgram builds an editable straight-line view of the Java path
+// selected by params.inputs. It is intentionally param-driven: callers name the
+// entry file/method and may provide concrete inputs for branch selection instead
+// of relying on fixture-specific package or class names.
+func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
+	file := lens.Params["file"]
+	method := lens.Params["method"]
+	if file == "" {
+		return Projection{}, errors.New("unrolled-program: params.file is required")
+	}
+	if method == "" {
+		return Projection{}, errors.New("unrolled-program: params.method is required")
+	}
+	u := javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"])}
+	lines, err := u.unrollMethod(file, method, 0)
+	if err != nil {
+		return Projection{}, err
+	}
+	var body []string
+	var origins []LineOrigin
+	for _, line := range lines {
+		body = append(body, line.code)
+		src := filepath.ToSlash(filepath.Join(lens.SourceRoot, line.file))
+		origins = append(origins, LineOrigin{SrcFile: src, Line: line.line, SrcHash: hash(line.code + "\n")})
+	}
+	if len(body) == 0 {
+		body = append(body, "// no executable path found")
+	}
+	p := Projection{Sync: "two-way"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{
+		ID:          method,
+		File:        file,
+		Mode:        "unrolled",
+		Tool:        "unrolled-program",
+		Lines:       body,
+		LineOrigins: origins,
+		Sync:        "two-way",
+	})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "editable straight-line Java path; each line syncs back to its original source line"})
+	if lens.Params["inputs"] == "" {
+		p.Facts = append(p.Facts, ProjectionFact{ID: "branching", Tool: "unrolled-program", Text: "no params.inputs supplied; unknown conditions include both branches"})
+	}
+	return p, nil
+}
+
+type javaUnroller struct {
+	cfg  Config
+	lens LensConfig
+	env  map[string]string
+}
+
+func (u javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine, error) {
+	if depth > 8 {
+		return nil, fmt.Errorf("unrolled-program: recursion limit while inlining %s.%s", file, method)
+	}
+	lines, methods, err := u.readJavaMethods(file)
+	if err != nil {
+		return nil, err
+	}
+	var m JavaMethod
+	found := false
+	for _, cand := range methods {
+		if cand.Name == method {
+			m, found = cand, true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("unrolled-program: method %q not found in %s", method, file)
+	}
+	open := firstBraceLine(lines, m.Start-1)
+	close, err := findClosingBrace(lines, open)
+	if err != nil {
+		return nil, err
+	}
+	return u.unrollRange(file, lines, open+1, close-1, depth)
+}
+
+func (u javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int) ([]unrollLine, error) {
+	var out []unrollLine
+	for i := lo; i <= hi && i < len(lines); i++ {
+		raw := lines[i]
+		trim := strings.TrimSpace(stripLineComment(raw))
+		if trim == "" || trim == "{" || trim == "}" || strings.HasPrefix(trim, "//") {
+			continue
+		}
+		if depth > 0 && regexp.MustCompile(`^return\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*$`).MatchString(trim) {
+			continue
+		}
+		if isIfHeader(trim) {
+			braceLine := firstBraceLine(lines, i)
+			closeLine, err := findClosingBrace(lines, braceLine)
+			if err != nil {
+				return nil, err
+			}
+			hasElse, elseIf, elseBrace, elseClose := detectElse(lines, closeLine, hi)
+			cond := extractCond(lines, i, braceLine)
+			decision, known := evalJavaCond(cond, u.env)
+			switch {
+			case known && decision:
+				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, part...)
+			case known && !decision && hasElse && !elseIf:
+				part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, part...)
+			case !known:
+				out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
+				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, part...)
+				if hasElse && !elseIf {
+					part, err = u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, part...)
+				}
+			}
+			if hasElse {
+				i = elseClose
+			} else {
+				i = closeLine
+			}
+			continue
+		}
+		if inlined, ok, err := u.inlineCall(file, trim, depth); err != nil {
+			return nil, err
+		} else if ok {
+			out = append(out, inlined...)
+			continue
+		}
+		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
+	}
+	return out, nil
+}
+
+func (u javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, bool, error) {
+	if m := regexp.MustCompile(`new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
+		calleeFile := filepath.ToSlash(filepath.Join(filepath.Dir(file), m[1]+".java"))
+		next := u
+		next.bindArgs(calleeFile, m[2], splitArgs(m[3]))
+		lines, err := next.unrollMethod(calleeFile, m[2], depth+1)
+		return lines, true, err
+	}
+	if m := regexp.MustCompile(`=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
+		if _, methods, err := u.readJavaMethods(file); err == nil {
+			for _, method := range methods {
+				if method.Name == m[1] {
+					next := u
+					next.bindArgs(file, m[1], splitArgs(m[2]))
+					lines, err := next.unrollMethod(file, m[1], depth+1)
+					return lines, true, err
+				}
+			}
+		}
+	}
+	return nil, false, nil
+}
+
+func (u *javaUnroller) bindArgs(file, method string, args []string) {
+	_, methods, err := u.readJavaMethods(file)
+	if err != nil {
+		return
+	}
+	for _, m := range methods {
+		if m.Name != method {
+			continue
+		}
+		params := javaParamNames(m.Lines[0])
+		for i, p := range params {
+			if i >= len(args) {
+				continue
+			}
+			arg := strings.TrimSpace(args[i])
+			if v, ok := u.env[arg]; ok {
+				u.env[p] = v
+			} else {
+				u.env[p] = strings.Trim(arg, `"`)
+			}
+		}
+		return
+	}
+}
+
+func (u javaUnroller) readJavaMethods(file string) ([]string, []JavaMethod, error) {
+	path := filepath.Join(u.cfg.Root, u.lens.SourceRoot, filepath.FromSlash(file))
+	lines, err := readLines(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	methods, err := parseJavaMethods(lines)
+	if err != nil {
+		return nil, nil, err
+	}
+	return lines, methods, nil
+}
+
+func parseUnrollInputs(s string) map[string]string {
+	env := map[string]string{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		env[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"`)
+	}
+	return env
+}
+
+func javaParamNames(sig string) []string {
+	open := strings.IndexByte(sig, '(')
+	if open < 0 {
+		return nil
+	}
+	close := matchParen(sig, open)
+	if close < 0 {
+		return nil
+	}
+	var out []string
+	for _, p := range splitArgs(sig[open+1 : close]) {
+		parts := strings.Fields(strings.TrimSpace(p))
+		if len(parts) > 0 {
+			out = append(out, strings.Trim(parts[len(parts)-1], "[]..."))
+		}
+	}
+	return out
+}
+
+func splitArgs(s string) []string {
+	var out []string
+	depth := 0
+	start := 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if strings.TrimSpace(s[start:]) != "" {
+		out = append(out, strings.TrimSpace(s[start:]))
+	}
+	return out
+}
+
+func evalJavaCond(cond string, env map[string]string) (bool, bool) {
+	c := strings.TrimSpace(cond)
+	re := regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|==|!=|>|<)\s*(-?\d+)$`)
+	if m := re.FindStringSubmatch(c); m != nil {
+		left, ok := env[m[1]]
+		if !ok {
+			return false, false
+		}
+		l, err1 := strconv.Atoi(left)
+		r, err2 := strconv.Atoi(m[3])
+		if err1 != nil || err2 != nil {
+			return false, false
+		}
+		switch m[2] {
+		case ">=":
+			return l >= r, true
+		case "<=":
+			return l <= r, true
+		case ">":
+			return l > r, true
+		case "<":
+			return l < r, true
+		case "==":
+			return l == r, true
+		case "!=":
+			return l != r, true
+		}
+	}
+	re = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.equals\("([^"]*)"\)$`)
+	if m := re.FindStringSubmatch(c); m != nil {
+		v, ok := env[m[1]]
+		return ok && v == m[2], ok
+	}
+	return false, false
+}
+
 func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
 	file := lens.Params["file"]
 	method := lens.Params["method"]
@@ -3900,9 +4232,11 @@ type ParsedBlock struct {
 	SrcEnd   int
 	SrcHash  string
 	Lines    []string
+	Origins  []LineOrigin
 }
 
 var anchorRE = regexp.MustCompile(`^@@ (.+?)#(.+?) \[([^.]+)\.([^ \]]+) hash=([0-9a-f]+)(?: sync=two-way src=(.+?):(\d+)-(\d+) srchash=([0-9a-f]+))?\]$`)
+var originFactRE = regexp.MustCompile(`^=> (.+?): origin (\d+) src=(.+):(\d+) srchash=([0-9a-f]+)$`)
 
 // parseProjectionFile recovers blocks (with anchor metadata) from a rendered
 // projection so the sync engine can detect edits and map them back to source.
@@ -3930,6 +4264,27 @@ func parseProjectionFile(path string) ([]ParsedBlock, error) {
 			blk.Lines = append(blk.Lines, lines[j])
 			j++
 		}
+		for k := j + 1; k < len(lines); k++ {
+			if strings.HasPrefix(lines[k], "@@ ") {
+				break
+			}
+			mm := originFactRE.FindStringSubmatch(lines[k])
+			if mm == nil || mm[1] != blk.ID {
+				if strings.TrimSpace(lines[k]) == "" {
+					continue
+				}
+				continue
+			}
+			idx := atoi(mm[2])
+			if idx <= 0 {
+				continue
+			}
+			for len(blk.Origins) < idx {
+				blk.Origins = append(blk.Origins, LineOrigin{})
+			}
+			blk.Origins[idx-1] = LineOrigin{SrcFile: mm[3], Line: atoi(mm[4]), SrcHash: mm[5]}
+			blk.Sync = "two-way"
+		}
 		blocks = append(blocks, blk)
 		i = j
 	}
@@ -3954,6 +4309,16 @@ func SyncProjection(cfg Config, projPath string) (SyncResult, error) {
 	}
 	// Group edits to source per file; apply with running offset for line-count drift.
 	for _, blk := range blocks {
+		if len(blk.Origins) > 0 {
+			r, err := syncScatteredBlock(cfg, blk)
+			if err != nil {
+				return res, err
+			}
+			res.ToProjection += r.ToProjection
+			res.ToSource += r.ToSource
+			res.Conflicts = append(res.Conflicts, r.Conflicts...)
+			continue
+		}
 		if blk.Sync != "two-way" || blk.SrcFile == "" {
 			continue
 		}
@@ -4008,6 +4373,64 @@ func SyncProjection(cfg Config, projPath string) (SyncResult, error) {
 	return res, nil
 }
 
+func syncScatteredBlock(cfg Config, blk ParsedBlock) (SyncResult, error) {
+	var res SyncResult
+	if len(blk.Origins) != len(blk.Lines) {
+		res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s#%s: projection line count changed; scattered sync only supports one edited line per origin", blk.File, blk.ID))
+		return res, nil
+	}
+	type change struct {
+		line int
+		text string
+	}
+	changes := map[string][]change{}
+	for i, origin := range blk.Origins {
+		if origin.SrcFile == "" || origin.Line <= 0 {
+			res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s#%s line %d: missing origin", blk.File, blk.ID, i+1))
+			continue
+		}
+		srcPath := filepath.Join(cfg.Root, filepath.FromSlash(origin.SrcFile))
+		srcLines, err := readLines(srcPath)
+		if err != nil {
+			return res, err
+		}
+		if origin.Line > len(srcLines) {
+			res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s:%d: stale origin", origin.SrcFile, origin.Line))
+			continue
+		}
+		liveHash := hash(srcLines[origin.Line-1] + "\n")
+		projHash := hash(blk.Lines[i] + "\n")
+		projEdited := projHash != origin.SrcHash
+		srcChanged := liveHash != origin.SrcHash
+		switch {
+		case projEdited && srcChanged:
+			res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s:%d: both source and projection changed", origin.SrcFile, origin.Line))
+		case projEdited && !srcChanged:
+			changes[srcPath] = append(changes[srcPath], change{line: origin.Line, text: blk.Lines[i]})
+		case !projEdited && srcChanged:
+			res.ToProjection++
+		}
+	}
+	for srcPath, cs := range changes {
+		srcLines, err := readLines(srcPath)
+		if err != nil {
+			return res, err
+		}
+		for _, c := range cs {
+			if c.line < 1 || c.line > len(srcLines) {
+				res.Conflicts = append(res.Conflicts, fmt.Sprintf("%s:%d: stale origin", srcPath, c.line))
+				continue
+			}
+			srcLines[c.line-1] = c.text
+			res.ToSource++
+		}
+		if err := writeLines(srcPath, srcLines); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
+
 // refreshTwoWayProjection re-reads the source span of every two-way block in a projection
 // and rewrites the file with consistent anchors. View-only blocks are preserved verbatim.
 // Lens-independent, so it serves configured bookmark lenses and drop-in bookmarks alike.
@@ -4019,8 +4442,26 @@ func refreshTwoWayProjection(cfg Config, projPath string) error {
 	}
 	p := Projection{Sync: coalesce(sync, "two-way"), Lens: LensConfig{Name: name, Analyzer: coalesce(analyzer, "bookmark")}}
 	for _, blk := range blocks {
-		nb := ProjectionBlock{ID: blk.ID, File: blk.File, Tool: blk.Tool, Mode: blk.Mode, Lines: blk.Lines}
-		if blk.Sync == "two-way" && blk.SrcFile != "" {
+		nb := ProjectionBlock{ID: blk.ID, File: blk.File, Tool: blk.Tool, Mode: blk.Mode, Lines: blk.Lines, Sync: blk.Sync}
+		if len(blk.Origins) > 0 {
+			nb.LineOrigins = make([]LineOrigin, 0, len(blk.Origins))
+			nb.Lines = nb.Lines[:0]
+			for _, origin := range blk.Origins {
+				srcLines, err := readLines(filepath.Join(cfg.Root, filepath.FromSlash(origin.SrcFile)))
+				if err != nil {
+					return err
+				}
+				if origin.Line < 1 || origin.Line > len(srcLines) {
+					nb.Lines = append(nb.Lines, "")
+					nb.LineOrigins = append(nb.LineOrigins, origin)
+					continue
+				}
+				line := srcLines[origin.Line-1]
+				nb.Lines = append(nb.Lines, line)
+				nb.LineOrigins = append(nb.LineOrigins, LineOrigin{SrcFile: origin.SrcFile, Line: origin.Line, SrcHash: hash(line + "\n")})
+			}
+			nb.Sync = "two-way"
+		} else if blk.Sync == "two-way" && blk.SrcFile != "" {
 			// The header (display file + ID range) is authoritative, so editing it retargets
 			// the view. Fall back to the anchor's src= span when the header is unchanged.
 			wantFile, wantA, wantB := bookmarkTarget(cfg, blk)
@@ -4561,7 +5002,7 @@ func RunWatch(cfg Config) error {
 }
 
 // RunWatchUntil regenerates projections when source files change and syncs two-way
-// bookmark projections back to source when they are edited. It polls mtimes (stdlib)
+// projection edits back to source when they are edited. It polls mtimes (stdlib)
 // until stop is closed; pass nil to run forever. Used both by the CLI and the menu's
 // background watch toggle.
 func RunWatchUntil(cfg Config, out io.Writer, stop <-chan struct{}) error {

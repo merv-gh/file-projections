@@ -15,6 +15,8 @@ relevant slices. Cheaper to read than raw files. Build: `make build` -> `bin/fil
 - `control-flow` — `params.file,line` -> all paths entry→line, **one file per branch** + index.
   Add `params.mode=joern` for real CPG (else-if/switch/loops); `build` caches the cpg.bin first.
 - `data-flow` — `params.file,line,var` -> contributing lines w/ trailing `// <-` comments.
+- `unrolled-program` — `params.file,method,inputs` -> editable straight-line Java path; each
+  projection line syncs back to its scattered source origin under `watch`.
 - `entry-to-exit` — `params.entry,exit` regexes -> all call-graph flows entrypoints→exitpoints
   (all-to-all; narrow with `entry_name`/`exit_file`). joern.
 - `bookmark` — `params.file,lines=a-b` -> verbatim span, **two-way** (edits sync to source).
@@ -33,6 +35,7 @@ No domain patterns are built in — all project specifics live in config.
 # ad-hoc (no config):
 ./bin/file-projections -analyzer control-flow -source-root SRC -file F.java -line N -out o.projection
 ./bin/file-projections -analyzer data-flow -mode fallback -source-root SRC -file F.java -line N -var V -out o.projection
+./bin/file-projections -analyzer unrolled-program -source-root SRC -file F.java -method M -inputs a=1,b=x -out o.projection
 ./bin/file-projections -analyzer entrypoints -source-root SRC -out o.projection   # needs config patterns
 ```
 
@@ -44,6 +47,7 @@ No domain patterns are built in — all project specifics live in config.
 <code>                              <file>:<line>   # code first, file:line padded 2nd column
 @@
 => <id>: <fact>                               # only where it adds signal (e.g. bookmark sync)
+=> <id>: origin N src=f:line srchash=h        # scattered two-way analytical line
 ```
 
 - entrypoints/exitpoints: matched code first, `file:line` second; no regexp label or counts.
@@ -51,6 +55,7 @@ No domain patterns are built in — all project specifics live in config.
   entry signature → active conditions (negated `!(…)` on the not-taken branch) → exitpoint.
 - entry-to-exit: entrypoint signature → exitpoint side-effect, code first.
 - data-flow: only contributing lines, `// <-` notes; non-contributing omitted.
+- unrolled-program: read/edit the straight-line path; origin metadata maps each line back.
 - bookmark: edit the block; `watch`/SyncProjection writes it back (conflicts detected, not clobbered).
 
 ## Writing tests (two-way spike)

@@ -663,6 +663,126 @@ func TestGenericJSONLLensUsesSharedRenderer(t *testing.T) {
 	}
 }
 
+func TestUnrolledProgramScatteredSyncWritesBackToOriginLine(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src/main/java/sample")
+	write(t, filepath.Join(src, "App.java"), `package sample;
+
+public class App {
+    public Receipt build(String coupon, int amount) {
+        Receipt r = new Receipt();
+        new CodeStage().apply(r, coupon);
+        if (amount >= 100) {
+            new GoldLabelStage().apply(r, amount);
+        } else {
+            new LabelStage().apply(r, amount);
+        }
+        new TierStage().apply(r, amount);
+        return r;
+    }
+
+    public String summary(String coupon, int amount) {
+        Receipt r = build(coupon, amount);
+        return r.getCode() + "/" + r.getLabel() + "/" + r.getTier();
+    }
+}
+`)
+	write(t, filepath.Join(src, "Receipt.java"), `package sample;
+
+public class Receipt {
+    public void setCode(String c) { }
+    public void setLabel(String l) { }
+    public void setTier(String t) { }
+}
+`)
+	write(t, filepath.Join(src, "CodeStage.java"), `package sample;
+
+public class CodeStage {
+    public void apply(Receipt r, String coupon) {
+        r.setCode(coupon.toUpperCase());
+    }
+}
+`)
+	write(t, filepath.Join(src, "GoldLabelStage.java"), `package sample;
+
+public class GoldLabelStage {
+    public void apply(Receipt r, int amount) {
+        r.setLabel("$gold");
+    }
+}
+`)
+	write(t, filepath.Join(src, "LabelStage.java"), `package sample;
+
+public class LabelStage {
+    public void apply(Receipt r, int amount) {
+        int net = amount - amount / 10;
+        r.setLabel("$" + amount);
+    }
+}
+`)
+	write(t, filepath.Join(src, "TierStage.java"), `package sample;
+
+public class TierStage {
+    public void apply(Receipt r, int amount) {
+        String t = amount >= 100 ? "GOLD" : "SILVER";
+        r.setLabel(t);
+    }
+}
+`)
+
+	projPath := filepath.Join(dir, ".projections/unrolled.projection")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", Lenses: []LensConfig{{
+		Name:       "unrolled",
+		Out:        ".projections/unrolled.projection",
+		Analyzer:   "unrolled-program",
+		SourceRoot: "src/main/java",
+		Params: map[string]string{
+			"file":   "sample/App.java",
+			"method": "summary",
+			"inputs": "coupon=save,amount=50",
+		},
+	}}}
+	if _, err := Run(cfg, DefaultRegistry()); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, projPath)
+	for _, want := range []string{
+		"# sync: two-way",
+		"r.setCode(coupon.toUpperCase());",
+		"int net = amount - amount / 10;",
+		"r.setLabel(\"$\" + amount);",
+		"r.setLabel(t);",
+		"=> summary: origin ",
+		"src=src/main/java/sample/TierStage.java:5",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "$gold") {
+		t.Fatalf("selected amount=50 path should not include gold branch:\n%s", got)
+	}
+
+	edited := strings.Replace(got, "        r.setLabel(t);", "        r.setTier(t);", 1)
+	if edited == got {
+		t.Fatal("test did not edit projection")
+	}
+	if err := os.WriteFile(projPath, []byte(edited), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := SyncProjection(cfg, projPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ToSource != 1 || len(res.Conflicts) != 0 {
+		t.Fatalf("sync result = %#v", res)
+	}
+	tier := read(t, filepath.Join(src, "TierStage.java"))
+	if !strings.Contains(tier, "r.setTier(t);") {
+		t.Fatalf("TierStage was not updated:\n%s", tier)
+	}
+}
+
 func TestGoSymbolsSelfLensIsGeneric(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{

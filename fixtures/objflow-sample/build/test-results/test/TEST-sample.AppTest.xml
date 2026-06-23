@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="sample.AppTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-06-23T17:03:46" hostname="4e32f4a8a53f" time="0.066">
+<testsuite name="sample.AppTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-06-23T20:28:49" hostname="98cbaef74a49" time="0.077">
   <properties/>
-  <testcase name="summaryAssemblesReceiptAcrossStages()" classname="sample.AppTest" time="0.066">
+  <testcase name="summaryAssemblesReceiptAcrossStages()" classname="sample.AppTest" time="0.077">
     <failure message="org.opentest4j.AssertionFailedError: expected: &lt;SAVE/$45/SILVER&gt; but was: &lt;SAVE/SILVER/null&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;SAVE/$45/SILVER&gt; but was: &lt;SAVE/SILVER/null&gt;
 	at app//org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
 	at app//org.junit.jupiter.api.AssertionFailureBuilder.buildAndThrow(AssertionFailureBuilder.java:132)

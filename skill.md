@@ -41,12 +41,15 @@ No domain patterns are built in — all project specifics live in config.
 ```
 # sync: view-only | two-way
 @@ <file>#<id> [<tool>.<mode> hash=<h>]      # two-way bookmarks add: sync=two-way src=f:a-b srchash=h
-<slice>
+<code>                              <file>:<line>   # code first, file:line padded 2nd column
 @@
-=> <id>: <fact>                               # guards, sinks, contributors, counts
+=> <id>: <fact>                               # only where it adds signal (e.g. bookmark sync)
 ```
 
-- control-flow: read the index, then the `…branch-k.projection` you care about.
+- entrypoints/exitpoints: matched code first, `file:line` second; no regexp label or counts.
+- control-flow: read the index, then the `…branch-k.projection` you care about — each is
+  entry signature → active conditions (negated `!(…)` on the not-taken branch) → exitpoint.
+- entry-to-exit: entrypoint signature → exitpoint side-effect, code first.
 - data-flow: only contributing lines, `// <-` notes; non-contributing omitted.
 - bookmark: edit the block; `watch`/SyncProjection writes it back (conflicts detected, not clobbered).
 

@@ -67,7 +67,16 @@ in config:
 - `exitpoints` requires `params.sinks`, a comma list of glob-ish patterns (`*` = identifier/dot
   run, `.` literal). Matching is **case-insensitive** (real beans are camelCase).
 
-Each emits one sorted map block (`file:line :: label :: code`) plus per-label counts.
+Each emits one sorted map block. Layout is **code first**, then the `file:line` locator in
+a padded second column (meaning first, direction second) — no regexp label, no count
+summaries:
+
+```
+@KafkaListener(topics = "orders.incoming")                          OrderEventService.java:20
+this.orderRepository.save(order);                                   OrderEventService.java:23
+```
+
+Set `params.line_format` (`{file}/{line}/{label}/{code}`) to override.
 
 ### control-flow — "ways from entry to a line", branch per file
 
@@ -81,17 +90,26 @@ The lens finds the enclosing method and enumerates every distinct path from its 
 the target line. Each `if`/`else` fork that both sides can pass through doubles the
 branch count; an early-return guard is forced to its non-exiting side. It writes:
 
-- the main file: a **branch index** (`branch k: guardA=true & guardB=false -> …branch-k.projection`)
-- one `…branch-k.projection` per path: the straight-line slice with `// guard:` decisions
-  and the target line marked `// <== target`.
+- the main file: a **branch index** (`branch k -> …branch-k.projection`)
+- one `…branch-k.projection` per path: **entry signature → the active conditions → the
+  exitpoint** (target line). Code first, `file:line` in a padded second column. A
+  condition is shown as written when its branch is taken, negated `!(…)` when not — only
+  full, active conditions, no intermediate statements or summaries:
+
+```
+public String checkout(@RequestBody Order order, ...)              OrderController.java:21
+!(result.hasErrors())                                              OrderController.java:22
+order.isExpress()                                                  OrderController.java:25
+this.orderRepository.save(order);                                  OrderController.java:35
+```
 
 Two engines:
 
 - **default (lexical)** — stdlib, no setup; models `if`/`else` + nesting + early-return
   guards. No `else-if` chains, `switch`, or loops.
 - **`params.mode: "joern"`** — real CPG via Joern. Handles **else-if chains, switch/case,
-  and loops** (acyclic CFG path enumeration), with `entered`/`true`/`false` branch labels
-  per guard. Needs the Joern binary or `tools.joern.image` + Docker. See *Joern* below.
+  and loops** (acyclic CFG path enumeration). Needs the Joern binary or `tools.joern.image`
+  + Docker. See *Joern* below.
 
 ### data-flow — contributing lines with trailing comments
 
@@ -145,9 +163,9 @@ The path may be repo-relative or package-relative (resolved across source roots)
 
 @@ <file>#<id> [<tool>.<mode> hash=<h>]                 # view-only block
 @@ <file>#<id> [<tool>.<mode> hash=<h> sync=two-way src=<f>:a-b srchash=<h>]  # bookmark
-<lines…>
+<lines…>                                                # code first, file:line second column
 @@
-=> <id>: <fact>
+=> <id>: <fact>                                         # only where it adds signal (e.g. bookmark sync)
 ```
 
 ## config.json reference

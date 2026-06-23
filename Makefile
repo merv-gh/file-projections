@@ -79,13 +79,21 @@ cross:
 clean:
 	rm -rf $(BINDIR)
 
-# bump <part>: read VERSION, increment major/minor/patch, write it back, then commit and
-# tag. Runs tests first and requires a clean tree. Pushing (which fires the release
-# workflow) is left as an explicit follow-up so the outward-facing step stays deliberate.
-define bump
-	@test -z "$$(git status --porcelain)" || { echo "working tree not clean — commit or stash first"; exit 1; }
+# The release message is the trailing word(s) after the target, e.g.
+#   make release-minor "better format"
+# Make sees those words as extra goals; we filter them back out into RELEASE_MSG and the
+# catch-all `%:` rule below turns them into no-ops so make doesn't error on them.
+RELEASE_MSG := $(strip $(filter-out release-patch release-minor release-major,$(MAKECMDGOALS)))
+
+# release <part>: test, bump major/minor/patch, write the message as the entire release
+# notes, stage everything, commit with exactly the message, tag, and push the branch and
+# tags (`--tags` because `--follow-tags` does not reliably push the new tag here). The tag
+# push fires the GitHub release workflow.
+define release
 	@go test ./... >/dev/null
-	@old=$$(cat $(VERSION_FILE)); \
+	@msg='$(RELEASE_MSG)'; \
+	test -n "$$msg" || { echo 'usage: make release-$(1) "message"'; exit 1; }; \
+	old=$$(cat $(VERSION_FILE)); \
 	maj=$$(echo $$old | cut -d. -f1); min=$$(echo $$old | cut -d. -f2); pat=$$(echo $$old | cut -d. -f3); \
 	case "$(1)" in \
 	  major) maj=$$((maj+1)); min=0; pat=0;; \
@@ -94,20 +102,28 @@ define bump
 	esac; \
 	new=$$maj.$$min.$$pat; \
 	echo $$new > $(VERSION_FILE); \
-	git add $(VERSION_FILE); \
-	git commit -m "release v$$new" >/dev/null; \
+	printf '%s\n' "$$msg" > RELEASE_NOTES.md; \
+	git add -A; \
+	git commit -m "$$msg" >/dev/null; \
 	git tag "v$$new"; \
-	echo "bumped $$old -> v$$new and tagged. Publish with: git push --follow-tags"
+	git push origin HEAD; \
+	git push origin --tags; \
+	echo "released v$$old -> v$$new: $$msg"
 endef
 
-## release-patch: bump x.y.Z, commit, tag (then `git push --follow-tags` to release)
+## release-patch: stage all, bump x.y.Z, commit+tag with MSG, push (make release-patch "msg")
 release-patch:
-	$(call bump,patch)
+	$(call release,patch)
 
-## release-minor: bump x.Y.0, commit, tag (then `git push --follow-tags` to release)
+## release-minor: stage all, bump x.Y.0, commit+tag with MSG, push (make release-minor "msg")
 release-minor:
-	$(call bump,minor)
+	$(call release,minor)
 
-## release-major: bump X.0.0, commit, tag (then `git push --follow-tags` to release)
+## release-major: stage all, bump X.0.0, commit+tag with MSG, push (make release-major "msg")
 release-major:
-	$(call bump,major)
+	$(call release,major)
+
+# Swallow the free-text release message words (e.g. "better", "format") as no-op goals so
+# `make release-minor "better format"` doesn't fail with "No rule to make target".
+%:
+	@:

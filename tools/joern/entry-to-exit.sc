@@ -103,18 +103,15 @@ import io.shiftleft.codepropertygraph.generated.nodes.Method
       reaching.foreach { e =>
         if (pairs < cap) {
           pairs += 1
-          val path = chain(e, exitMethod.id)
+          // Path = entrypoint signature, then the side-effect call (the exitpoint). Each line
+          // is "<srcLine>\t<code>"; the Go renderer pads code into a column with file:line.
+          val entrySig = e.code.linesIterator.find(_.trim.nonEmpty).getOrElse(e.name).trim.take(160)
+          val entryLine = e.lineNumber.map(_.toInt).getOrElse(0)
           val lines = Seq(
-            s"entry  ${e.name}  ${e.filename}:${e.lineNumber.map(_.toString).getOrElse("?")}",
-            s"chain  ${path.mkString(" -> ")}",
-            s"exit   ${call.code.linesIterator.next().take(140)}  ${exitFileName}:${exitLine}"
+            s"${entryLine}\t${entrySig}",
+            s"${exitLine}\t${call.code.linesIterator.next().take(160).trim}"
           )
-          val facts = Seq(
-            s"entrypoint: ${e.name}",
-            s"exitpoint: ${call.code.linesIterator.next().take(140)}",
-            s"hops: ${path.size - 1}"
-          )
-          rows += s"""{"kind":"block","id":${jstr(s"${e.name}->${exitMethod.name}@${exitLine}")},"file":${jstr(exitFileName)},"mode":"entry-to-exit","tool":"joern","lines":${jarr(lines)},"facts":${jarr(facts)}}"""
+          rows += s"""{"kind":"block","id":${jstr(s"${e.name}->${exitMethod.name}@${exitLine}")},"file":${jstr(exitFileName)},"mode":"entry-to-exit","tool":"joern","lines":${jarr(lines)},"facts":[]}"""
         }
       }
     }

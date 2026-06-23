@@ -29,15 +29,18 @@ func TestEntrypointsLensFindsKafkaScheduledAndMappings(t *testing.T) {
 	got := read(t, filepath.Join(dir, "ep.projection"))
 	for _, want := range []string{
 		"# sync: view-only",
-		":: kafka-listener :: @KafkaListener",
-		":: scheduled :: @Scheduled",
-		":: event-listener :: @EventListener",
-		":: http-mapping :: @PostMapping",
-		"=> entrypoints.engine:",
+		"@KafkaListener",
+		"@Scheduled",
+		"@EventListener",
+		"@PostMapping",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("entrypoints missing %q\n%s", want, got)
 		}
+	}
+	// Code-first layout: the matched code precedes the file:line locator; no regexp label.
+	if strings.Contains(got, " :: ") {
+		t.Fatalf("entrypoints should not carry the old :: label layout\n%s", got)
 	}
 }
 
@@ -52,8 +55,8 @@ func TestExitpointsLensFindsRepositorySaveAndKafkaSend(t *testing.T) {
 	}
 	got := read(t, filepath.Join(dir, "xp.projection"))
 	for _, want := range []string{
-		":: *repository*.save :: this.orderRepository.save(order);",
-		":: *kafka*.send :: this.kafkaTemplate.send(",
+		"this.orderRepository.save(order);",
+		"this.kafkaTemplate.send(",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("exitpoints missing %q\n%s", want, got)
@@ -81,23 +84,36 @@ func TestControlFlowEmitsBranchPerPath(t *testing.T) {
 			t.Fatalf("missing branch file %s", p)
 		}
 	}
-	b1 := read(t, filepath.Join(dir, "cf.branch-1.projection"))
-	b4 := read(t, filepath.Join(dir, "cf.branch-4.projection"))
-	if !strings.Contains(b1, "guard: order.isExpress() == true") || !strings.Contains(b1, `order.setShipping("express");`) {
-		t.Fatalf("branch-1 should take express path:\n%s", b1)
+	// New format: entry signature, the active conditions (negated on the false branch),
+	// then the exitpoint — code first, file:line in the second column. Intermediate
+	// statements and guard/summary chatter are dropped. Find the express vs standard
+	// branch by their condition rather than by index (enumeration order is incidental).
+	var express, standard string
+	for i := 1; i <= 4; i++ {
+		b := read(t, filepath.Join(dir, "cf.branch-"+itoa(i)+".projection"))
+		if strings.Contains(b, "!(order.isExpress())") {
+			standard = b
+		} else if strings.Contains(b, "order.isExpress()") {
+			express = b
+		}
 	}
-	if strings.Contains(b1, `order.setShipping("standard");`) {
-		t.Fatalf("branch-1 leaked the else branch:\n%s", b1)
+	if express == "" || standard == "" {
+		t.Fatalf("expected one express and one standard branch")
 	}
-	if !strings.Contains(b4, "guard: order.isExpress() == false") || !strings.Contains(b4, `order.setShipping("standard");`) {
-		t.Fatalf("branch-4 should take standard path:\n%s", b4)
+	// Every reaching path guards out the early validation-error return.
+	if !strings.Contains(express, "!(result.hasErrors())") {
+		t.Fatalf("express branch missing the hasErrors guard:\n%s", express)
 	}
-	if !strings.Contains(b4, "this.orderRepository.save(order);   // <== target") {
-		t.Fatalf("branch-4 should reach the save target:\n%s", b4)
+	// The exitpoint (target line) is present; intermediate setShipping is not.
+	if !strings.Contains(express, "this.orderRepository.save(order);") {
+		t.Fatalf("express branch should reach the save target:\n%s", express)
 	}
-	idx := read(t, filepath.Join(dir, "cf.projection"))
-	if !strings.Contains(idx, "=> control-flow.branches: 4 distinct path(s)") {
-		t.Fatalf("index missing branch count:\n%s", idx)
+	if strings.Contains(express, "setShipping") {
+		t.Fatalf("intermediate statements should be dropped:\n%s", express)
+	}
+	// Code precedes the locator: the signature row carries the file:line in column 2.
+	if !strings.Contains(express, "OrderController.java:21") {
+		t.Fatalf("express branch missing entry locator:\n%s", express)
 	}
 }
 
@@ -528,7 +544,7 @@ func TestMenuAddsLensAndPersistsConfig(t *testing.T) {
 		t.Fatalf("menu did not persist the lens: %+v", saved.Lenses)
 	}
 	got := read(t, filepath.Join(dir, "proj", "sample-eps.projection"))
-	if !strings.Contains(got, "kafka-listener") {
+	if !strings.Contains(got, "@KafkaListener") {
 		t.Fatalf("generated projection missing entrypoints:\n%s", got)
 	}
 }

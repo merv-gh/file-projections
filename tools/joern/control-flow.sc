@@ -51,14 +51,20 @@ import io.shiftleft.codepropertygraph.generated.nodes.{StoredNode, CfgNode}
   } else {
     val method = methods.head
     val targetIds = method.ast.isCfgNode.lineNumber(line).id.toSet
-    // Precompute the method's control structures: condition line + true/false branch lines.
-    // whenTrue/whenFalse cleanly separate then vs else for IFs (empty for other kinds).
-    val controls = method.controlStructure.l.map { cs =>
-      val condLines = cs.condition.lineNumber.l.map(_.toInt).toSet
-      val trueLines = cs.whenTrue.ast.lineNumber.l.map(_.toInt).toSet -- condLines
-      val falseLines = cs.whenFalse.ast.lineNumber.l.map(_.toInt).toSet -- condLines
-      (cs.lineNumber.map(_.toString).getOrElse("?"), cs.code.linesIterator.next().take(120), condLines, trueLines, falseLines)
-    }
+    // Method signature: first non-blank line of the method source (the declaration).
+    val sigLine = method.lineNumber.map(_.toInt).getOrElse(0)
+    val sig = method.code.linesIterator.find(_.trim.nonEmpty).getOrElse(method.name).trim
+    // Real conditions only (IF / SWITCH): condition line, full condition code, and the
+    // lines reached when the branch is taken — so we can render the *active* condition.
+    val controls = method.controlStructure
+      .filter(cs => Set("IF", "SWITCH").contains(cs.controlStructureType)).l
+      .flatMap { cs =>
+        cs.lineNumber.map { ln =>
+          val condCode = cs.condition.code.l.headOption.getOrElse(cs.code.linesIterator.next()).trim
+          val trueLines = cs.whenTrue.ast.lineNumber.l.map(_.toInt).toSet - ln.toInt
+          (ln.toInt, condCode.take(160), trueLines)
+        }
+      }
     val paths = scala.collection.mutable.ArrayBuffer[List[CfgNode]]()
 
     def dfs(node: CfgNode, path: List[CfgNode], visited: Set[Long]): Unit = {
@@ -76,32 +82,28 @@ import io.shiftleft.codepropertygraph.generated.nodes.{StoredNode, CfgNode}
       rows += s"""{"kind":"fact","id":"no-path","tool":"joern","text":${jstr(s"no CFG path to ${targetFile}:${line} in ${method.name}")}}"""
     }
 
+    // Longest code fragment on the target line is the active statement (the exitpoint),
+    // not a sub-expression node — avoids the deceptive "kind / 1 / kind == 1" triples.
+    val exitCode = method.ast.lineNumber(line).code.l
+      .map(_.linesIterator.next()).filter(_.trim.nonEmpty)
+      .sortBy(-_.length).headOption.getOrElse("").trim.take(160)
+
     paths.zipWithIndex.foreach { case (p, idx) =>
-      // Collapse to one entry per source line for readability.
-      val lines = p.flatMap { n =>
-        n.lineNumber.map(ln => s"${ln} :: ${n.code.linesIterator.next().take(160)}")
-      }.foldLeft(List.empty[String]) { (acc, cur) => if (acc.headOption.contains(cur)) acc else cur :: acc }.reverse
-
-      // Guards on this path: a control structure is relevant when its condition line is
-      // on the path; "entered" if the path also visits its guarded body, else "skipped".
       val pathLines = p.flatMap(_.lineNumber.map(_.toInt)).toSet
-      val guards = controls.flatMap { case (ln, code, condLines, trueLines, falseLines) =>
-        if (condLines.exists(pathLines.contains)) {
-          val decision =
-            if (trueLines.exists(pathLines.contains)) "true"
-            else if (falseLines.exists(pathLines.contains)) "false"
-            else "false (no else)"
-          Some(s"@${ln} ${decision}: ${code}")
-        } else None
-      }.distinct
+      // Active conditions on this path, in source order. A condition reads as written when
+      // its true-branch is taken, else negated — the real predicate that held on this path.
+      val conds = controls.collect {
+        case (ln, code, trueLines) if pathLines.contains(ln) =>
+          val active = if (trueLines.exists(pathLines.contains)) code else s"!(${code})"
+          (ln, active)
+      }.distinct.sortBy(_._1)
 
-      val facts = Seq(
-        s"target: ${targetFile}:${line} in ${method.name}",
-        s"path index: ${idx}",
-        s"guards on path: ${guards.size}"
-      ) ++ guards.map("guard: " + _)
+      // Path = entry signature, the active conditions, then the exitpoint. Each line is
+      // "<srcLine>\t<code>"; the Go renderer pads code into a column with file:line.
+      val rowLines = (Seq((sigLine, sig)) ++ conds ++ Seq((line, exitCode)))
+        .map { case (ln, code) => s"${ln}\t${code}" }
 
-      rows += s"""{"kind":"block","id":${jstr(s"${method.name}.path-${idx}")},"file":${jstr(targetFile)},"mode":"cfg-path","tool":"joern","lines":${jarr(lines)},"facts":${jarr(facts)}}"""
+      rows += s"""{"kind":"block","id":${jstr(s"${method.name}.path-${idx}")},"file":${jstr(targetFile)},"mode":"cfg-path","tool":"joern","lines":${jarr(rowLines)},"facts":[]}"""
     }
   }
 

@@ -2965,7 +2965,6 @@ func searchMapProjection(cfg Config, lens LensConfig, patterns []labeledPattern,
 		text  string
 	}
 	var rows []row
-	counts := map[string]int{}
 	for _, lp := range patterns {
 		hits, err := ripgrep(cfg, lp.Regex, root)
 		if err != nil {
@@ -2973,7 +2972,6 @@ func searchMapProjection(cfg Config, lens LensConfig, patterns []labeledPattern,
 		}
 		for _, h := range hits {
 			rows = append(rows, row{h.File, h.Line, lp.Label, h.Text})
-			counts[lp.Label]++
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -2982,33 +2980,23 @@ func searchMapProjection(cfg Config, lens LensConfig, patterns []labeledPattern,
 		}
 		return rows[i].line < rows[j].line
 	})
-	// Configurable formatter: params.line_format with {file} {line} {label} {code}
-	// placeholders, so output shape lives in config too. Defaults to the :: layout.
-	tmpl := coalesce(lens.Params["line_format"], "{file}:{line} :: {label} :: {code}")
+	// Default layout: exact code first, then the file:line locator in a padded second
+	// column (meaning first, direction second). params.line_format overrides with
+	// {file}/{line}/{label}/{code} placeholders for callers who want the regexp/label.
+	tmpl := lens.Params["line_format"]
 	var lines []string
 	for _, r := range rows {
-		lines = append(lines, formatRow(tmpl, r.file, r.line, r.label, r.text))
+		if tmpl == "" {
+			lines = append(lines, codeLoc(r.text, r.file, r.line))
+		} else {
+			lines = append(lines, formatRow(tmpl, r.file, r.line, r.label, r.text))
+		}
 	}
 	if len(lines) == 0 {
 		lines = append(lines, "// no matches under "+root)
 	}
-	var facts []string
-	var labels []string
-	for k := range counts {
-		labels = append(labels, k)
-	}
-	sort.Strings(labels)
-	for _, k := range labels {
-		facts = append(facts, fmt.Sprintf("%s: %d", k, counts[k]))
-	}
-	facts = append(facts, fmt.Sprintf("total: %d across %s", len(rows), root))
-	usedRg := true
-	if _, err := exec.LookPath("rg"); err != nil {
-		usedRg = false
-	}
 	p := Projection{Sync: "view-only"}
-	p.Blocks = append(p.Blocks, ProjectionBlock{ID: mode, File: "model", Mode: mode, Tool: tool, Lines: lines, Facts: facts})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "engine", Tool: tool, Text: coalesce(map[bool]string{true: "ripgrep", false: "stdlib-scan-fallback"}[usedRg], "stdlib-scan-fallback")})
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: mode, File: "model", Mode: mode, Tool: tool, Lines: lines})
 	return p, nil
 }
 
@@ -3042,14 +3030,20 @@ func AnalyzeAstGrep(cfg Config, lens LensConfig) (Projection, error) {
 		}
 	}
 	label := coalesce(lens.Params["label"], "match")
-	tmpl := coalesce(lens.Params["line_format"], "{file}:{line} :: {label} :: {code}")
+	tmpl := lens.Params["line_format"]
 	var lines []string
 	for _, m := range matches {
 		first := m.Text
 		if i := strings.IndexByte(first, '\n'); i >= 0 {
 			first = first[:i]
 		}
-		lines = append(lines, formatRow(tmpl, filepath.ToSlash(m.File), m.Range.Start.Line+1, label, strings.TrimSpace(first)))
+		file := filepath.ToSlash(m.File)
+		ln := m.Range.Start.Line + 1
+		if tmpl == "" {
+			lines = append(lines, codeLoc(strings.TrimSpace(first), file, ln))
+		} else {
+			lines = append(lines, formatRow(tmpl, file, ln, label, strings.TrimSpace(first)))
+		}
 	}
 	sort.Strings(lines)
 	if len(lines) == 0 {
@@ -3057,7 +3051,6 @@ func AnalyzeAstGrep(cfg Config, lens LensConfig) (Projection, error) {
 	}
 	p := Projection{Sync: "view-only"}
 	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "ast-grep", File: "model", Mode: "ast-grep", Tool: "ast-grep", Lines: lines})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "matches", Tool: "ast-grep", Text: fmt.Sprintf("%d match(es) for %q (%s)", len(matches), lens.Params["pattern"], lens.Params["lang"])})
 	return p, nil
 }
 
@@ -3099,6 +3092,35 @@ func truncate(s string, n int) string {
 		return s[:n] + "…"
 	}
 	return s
+}
+
+// locCol is the column where the file:line locator sits, so code reads first (meaning)
+// and the location lines up as a second column (direction).
+const locCol = 140
+
+// codeLoc lays out a row as the exact code left-aligned, padded to locCol, then the
+// "<filename>:<line>" locator. Long code just gets a two-space gap.
+func codeLoc(code, file string, line int) string {
+	code = strings.TrimRight(code, " \t")
+	loc := fmt.Sprintf("%s:%d", filepath.Base(file), line)
+	if len(code) >= locCol {
+		return code + "  " + loc
+	}
+	return code + strings.Repeat(" ", locCol-len(code)) + loc
+}
+
+// reLocLines reformats the joern scripts' "<line>\t<code>" rows into the code-first /
+// file:line layout. Rows without a tab pass through unchanged.
+func reLocLines(in []string, file string) []string {
+	out := make([]string, 0, len(in))
+	for _, ln := range in {
+		if tab := strings.IndexByte(ln, '\t'); tab >= 0 {
+			out = append(out, codeLoc(ln[tab+1:], file, atoi(ln[:tab])))
+		} else {
+			out = append(out, ln)
+		}
+	}
+	return out
 }
 
 // formatRow substitutes {file}/{line}/{label}/{code} placeholders in a line template.
@@ -3189,11 +3211,11 @@ func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, met
 	for _, blk := range flat.Blocks {
 		branchNo++
 		rel := filepath.Base(stem) + fmt.Sprintf(".branch-%d.projection", branchNo)
-		indexLines = append(indexLines, fmt.Sprintf("branch %d: %s -> %s", branchNo, joernGuardSummary(blk.Facts), rel))
+		indexLines = append(indexLines, fmt.Sprintf("branch %d -> %s", branchNo, rel))
 		branch := Projection{Sync: "view-only"}
 		branch.Blocks = append(branch.Blocks, ProjectionBlock{
 			ID: fmt.Sprintf("branch-%d", branchNo), File: file, Mode: "cfg-path", Tool: "control-flow:joern",
-			Lines: blk.Lines, Facts: blk.Facts,
+			Lines: reLocLines(blk.Lines, file),
 		})
 		p.Extra = append(p.Extra, ExtraFile{Path: fmt.Sprintf("%s.branch-%d.projection", stem, branchNo), Proj: branch})
 	}
@@ -3204,9 +3226,6 @@ func RunJoernControlFlow(cfg Config, lens LensConfig, file string, line int, met
 		}
 	}
 	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "control-flow", File: file, Mode: "index", Tool: "control-flow:joern", Lines: indexLines})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "target", Tool: "control-flow", Text: fmt.Sprintf("%s:%d", file, line)})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "branches", Tool: "control-flow", Text: fmt.Sprintf("%d CFG path(s) via joern (%s)", branchNo, joernEngine(cfg))})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "engine", Tool: "control-flow", Text: "real CPG: handles else-if, switch, loops (acyclic path enumeration)"})
 	return p, nil
 }
 
@@ -3241,24 +3260,12 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 		return Projection{}, err
 	}
 	p.Sync = "view-only"
-	p.Facts = append(p.Facts, ProjectionFact{ID: "engine", Tool: "entry-to-exit", Text: "call-graph reachability via joern (" + joernEngine(cfg) + ")"})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "flows", Tool: "entry-to-exit", Text: fmt.Sprintf("%d entrypoint->exitpoint control flow(s)", len(p.Blocks))})
+	for i := range p.Blocks {
+		p.Blocks[i].Lines = reLocLines(p.Blocks[i].Lines, p.Blocks[i].File)
+	}
 	return p, nil
 }
 
-// joernGuardSummary distills a path block's guard facts into a one-line index summary.
-func joernGuardSummary(facts []string) string {
-	var g []string
-	for _, f := range facts {
-		if strings.HasPrefix(f, "guard: ") {
-			g = append(g, strings.TrimPrefix(f, "guard: "))
-		}
-	}
-	if len(g) == 0 {
-		return "(unconditional)"
-	}
-	return strings.Join(g, " & ")
-}
 
 func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
 	file := lens.Params["file"]
@@ -3288,13 +3295,15 @@ func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
 	paths := enumeratePaths(nodes, target.Line)
 
 	maxBranches := atoiDefault(lens.Params["max_branches"], 16)
-	truncated := false
 	if len(paths) > maxBranches {
 		paths = paths[:maxBranches]
-		truncated = true
 	}
 
 	sig := strings.TrimSpace(m.Lines[0])
+	exitCode := ""
+	if target.Line >= 1 && target.Line <= len(lines) {
+		exitCode = strings.TrimSpace(lines[target.Line-1])
+	}
 	stem := strings.TrimSuffix(LensOut(cfg, lens), ".projection")
 
 	p := Projection{Sync: "view-only"}
@@ -3304,55 +3313,32 @@ func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
 	}
 	for k, path := range paths {
 		branchNo := k + 1
-		summary := branchSummary(path)
 		rel := filepath.Base(stem) + fmt.Sprintf(".branch-%d.projection", branchNo)
-		indexLines = append(indexLines, fmt.Sprintf("branch %d: %s -> %s", branchNo, summary, rel))
+		indexLines = append(indexLines, fmt.Sprintf("branch %d -> %s", branchNo, rel))
 
+		// Path = entry signature, the active conditions (negated when the false branch is
+		// taken), then the exitpoint. Code first, file:line in the padded second column.
 		var bl []string
-		var bf []string
-		bl = append(bl, fmt.Sprintf("// branch %d of %d: %s entry -> %s:%d", branchNo, len(paths), m.Name, file, target.Line))
-		bl = append(bl, sig)
+		bl = append(bl, codeLoc(sig, file, m.Start))
 		for _, ev := range path.events {
 			if ev.kind == "guard" {
-				bl = append(bl, fmt.Sprintf("    // guard: %s == %v", ev.cond, ev.truth))
-				bf = append(bf, fmt.Sprintf("guard: %s == %v", ev.cond, ev.truth))
-			} else {
-				marker := ""
-				if ev.line == target.Line {
-					marker = "   // <== target"
+				cond := ev.cond
+				if !ev.truth {
+					cond = "!(" + cond + ")"
 				}
-				bl = append(bl, strings.TrimRight(ev.text, "\n")+marker)
+				bl = append(bl, codeLoc(cond, file, ev.line))
 			}
 		}
-		bf = append(bf, fmt.Sprintf("reaches: %s:%d", file, target.Line))
+		bl = append(bl, codeLoc(exitCode, file, target.Line))
 		branch := Projection{Sync: "view-only"}
 		branch.Blocks = append(branch.Blocks, ProjectionBlock{
-			ID: fmt.Sprintf("%s.branch-%d", m.Name, branchNo), File: file, Mode: "branch", Tool: "control-flow", Lines: bl, Facts: bf,
+			ID: fmt.Sprintf("%s.branch-%d", m.Name, branchNo), File: file, Mode: "cfg-path", Tool: "control-flow", Lines: bl,
 		})
 		p.Extra = append(p.Extra, ExtraFile{Path: fmt.Sprintf("%s.branch-%d.projection", stem, branchNo), Proj: branch})
 	}
 
 	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "control-flow", File: file, Mode: "index", Tool: "control-flow", Lines: indexLines})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "target", Tool: "control-flow", Text: fmt.Sprintf("%s %s:%d", m.Name, file, target.Line)})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "branches", Tool: "control-flow", Text: fmt.Sprintf("%d distinct path(s) reach the target line", len(paths))})
-	if truncated {
-		p.Facts = append(p.Facts, ProjectionFact{ID: "truncated", Tool: "control-flow", Text: fmt.Sprintf("more than max_branches=%d paths; showing first %d", maxBranches, maxBranches)})
-	}
-	p.Facts = append(p.Facts, ProjectionFact{ID: "limits", Tool: "control-flow", Text: "lexical intraprocedural CFG; models if/else + nesting + early-return guards (no else-if chains, switch, loops)"})
 	return p, nil
-}
-
-func branchSummary(path cfgPath) string {
-	var guards []string
-	for _, ev := range path.events {
-		if ev.kind == "guard" {
-			guards = append(guards, fmt.Sprintf("%s=%v", ev.cond, ev.truth))
-		}
-	}
-	if len(guards) == 0 {
-		return "(unconditional)"
-	}
-	return strings.Join(guards, " & ")
 }
 
 // parseCFG builds a shallow control-flow tree for the body lines in [lo,hi]

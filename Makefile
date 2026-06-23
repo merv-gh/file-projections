@@ -43,8 +43,10 @@ menu: build
 watch: build
 	./$(BINDIR)/$(BIN) watch -config $(CONFIG)
 
-## test: run the test suite (lens output, control-flow branches, round-trip sync)
+## test: gofmt + vet + the test suite (lens output, control-flow branches, round-trip sync)
 test:
+	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+	go vet ./...
 	go test ./...
 
 ## eval: compare a standard task WITH vs WITHOUT the skill on a local Ollama model
@@ -90,6 +92,8 @@ RELEASE_MSG := $(strip $(filter-out release-patch release-minor release-major,$(
 # tags (`--tags` because `--follow-tags` does not reliably push the new tag here). The tag
 # push fires the GitHub release workflow.
 define release
+	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+	@go vet ./...
 	@go test ./... >/dev/null
 	@msg='$(RELEASE_MSG)'; \
 	test -n "$$msg" || { echo 'usage: make release-$(1) "message"'; exit 1; }; \

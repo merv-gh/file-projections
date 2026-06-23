@@ -3266,7 +3266,6 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 	return p, nil
 }
 
-
 func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
 	file := lens.Params["file"]
 	method := lens.Params["method"]

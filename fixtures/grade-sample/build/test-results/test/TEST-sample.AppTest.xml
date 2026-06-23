@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="sample.AppTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-06-23T11:34:58" hostname="e2cbbd50323e" time="0.055">
+  <properties/>
+  <testcase name="summaryCombinesDaypartAndGrade()" classname="sample.AppTest" time="0.055"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

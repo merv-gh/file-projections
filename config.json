@@ -14,6 +14,13 @@
       "include": ["main.go"]
     },
     {
+      "name": "self-helpers-bookmark",
+      "out": ".projections/self-helpers-bookmark.projection",
+      "analyzer": "bookmark",
+      "source_root": ".",
+      "params": { "file": "main.go", "lines": "1227-1232" }
+    },
+    {
       "name": "js-sample-event-surface",
       "out": ".projections/js-sample-event-surface.projection",
       "analyzer": "js-events",

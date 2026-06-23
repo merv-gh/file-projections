@@ -10,3 +10,4 @@ workspace/
 
 # OS noise
 .DS_Store
+*.bin

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="sample.AppTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-06-23T17:03:46" hostname="4e32f4a8a53f" time="0.066">
+  <properties/>
+  <testcase name="summaryAssemblesReceiptAcrossStages()" classname="sample.AppTest" time="0.066">
+    <failure message="org.opentest4j.AssertionFailedError: expected: &lt;SAVE/$45/SILVER&gt; but was: &lt;SAVE/SILVER/null&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;SAVE/$45/SILVER&gt; but was: &lt;SAVE/SILVER/null&gt;
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.buildAndThrow(AssertionFailureBuilder.java:132)
+	at app//org.junit.jupiter.api.AssertEquals.failNotEqual(AssertEquals.java:197)
+	at app//org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:182)
+	at app//org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:177)
+	at app//org.junit.jupiter.api.Assertions.assertEquals(Assertions.java:1141)
+	at app//sample.AppTest.summaryAssemblesReceiptAcrossStages(AppTest.java:10)
+	at java.base@17.0.10/java.lang.reflect.Method.invoke(Method.java:568)
+	at java.base@17.0.10/java.util.ArrayList.forEach(ArrayList.java:1511)
+	at java.base@17.0.10/java.util.ArrayList.forEach(ArrayList.java:1511)
+</failure>
+  </testcase>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

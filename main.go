@@ -148,6 +148,7 @@ func DefaultRegistry() Registry {
 		"control-flow":      AnalyzerFunc{"control-flow", AnalyzeControlFlow},
 		"entry-to-exit":     AnalyzerFunc{"entry-to-exit", AnalyzeEntryToExit},
 		"data-flow":         AnalyzerFunc{"data-flow", AnalyzeDataFlow},
+		"object-flow":       AnalyzerFunc{"object-flow", AnalyzeObjectFlow},
 		"bookmark":          AnalyzerFunc{"bookmark", AnalyzeBookmark},
 		"extract":           AnalyzerFunc{"extract", AnalyzeBookmark}, // back-compat alias
 	}
@@ -3263,6 +3264,36 @@ func AnalyzeEntryToExit(cfg Config, lens LensConfig) (Projection, error) {
 	for i := range p.Blocks {
 		p.Blocks[i].Lines = reLocLines(p.Blocks[i].Lines, p.Blocks[i].File)
 	}
+	return p, nil
+}
+
+// AnalyzeObjectFlow runs object-flow.sc over the real CPG (joern, local or farm) to list
+// every transformation of a target type's instances across the codebase: the constructor,
+// each field's setter call sites (in any file), and the final reads. One block per field
+// makes a never-set field (ends null) or a wrong-place mutation obvious. params.type (or
+// params.var ad-hoc) is the class name. Joern-only: no lexical fallback.
+func AnalyzeObjectFlow(cfg Config, lens LensConfig) (Projection, error) {
+	typeName := coalesce(lens.Params["type"], lens.Params["var"])
+	if typeName == "" {
+		return Projection{}, errors.New("object-flow: params.type (the class name) is required")
+	}
+	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-object-flow.jsonl"))
+	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
+		return Projection{}, err
+	}
+	kv := map[string]string{"root": lens.SourceRoot, "typeName": typeName, "out": outRel,
+		"field": coalesce(lens.Params["field"], lens.Params["method"])}
+	if err := runJoernQuery(cfg, lens, "object-flow.sc", outRel, kv, os.Stderr); err != nil {
+		return Projection{}, fmt.Errorf("object-flow: %w", err)
+	}
+	jsonLens := lens
+	jsonLens.Input = outRel
+	jsonLens.Analyzer = "jsonl"
+	p, err := AnalyzeJSONL(cfg, jsonLens)
+	if err != nil {
+		return Projection{}, err
+	}
+	p.Sync = "view-only"
 	return p, nil
 }
 

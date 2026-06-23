@@ -53,6 +53,21 @@ No domain patterns are built in — all project specifics live in config.
 - data-flow: only contributing lines, `// <-` notes; non-contributing omitted.
 - bookmark: edit the block; `watch`/SyncProjection writes it back (conflicts detected, not clobbered).
 
+## Writing tests (two-way spike)
+
+Two-way bookmarks author code back into any file, including `*_test.go` — use them to write
+tests through a projection instead of editing the test file directly:
+
+1. Put a sentinel line at the tail of the test file, e.g. `// add tests below`.
+2. `bookmark` that one line: `params.file=foo_test.go, lines=N-N` (or drop in `foo_test.go:N`).
+3. Edit the projection block — keep the sentinel, append `func TestX(t *testing.T){…}` after it.
+4. `watch` / SyncProjection writes the grown block back; the test file gains the test
+   (existing tests preserved; both-sides-edited is reported as a conflict, not clobbered).
+
+The block may grow to any length, so one bookmark drafts many tests. Token-cheap context for
+the model: pair this with a `go-symbols` index + a `control-flow`/bookmark slice of the
+function under test (see the dogfood lenses in config.json).
+
 ## Notes
 
 - Engines `rg`/`ast-grep`/`joern` used if installed, else Docker image (`tools.<name>.image`) or

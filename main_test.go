@@ -496,6 +496,51 @@ func TestBookmarkRoundTripIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestTwoWaySyncWritesNewTests is the "two-way for test writing" spike: a bookmark over a
+// sentinel line in a *_test.go file is grown — the projection block is edited to append a
+// new test function — and sync writes the expanded block back, so the test file gains a
+// test. This is the round-trip an agent uses to author tests through a projection.
+func TestTwoWaySyncWritesNewTests(t *testing.T) {
+	dir := t.TempDir()
+	srcRel := "pkg/widget_test.go"
+	srcAbs := filepath.Join(dir, "src", srcRel)
+	write(t, srcAbs, "package widget\n\nimport \"testing\"\n\nfunc TestExisting(t *testing.T) {}\n// add tests below\n")
+	projPath := filepath.Join(dir, "out", "tests.projection")
+
+	cfg := Config{Root: dir, Lenses: []LensConfig{{
+		Name: "tw", Out: projPath, Analyzer: "bookmark", SourceRoot: "src",
+		Params: map[string]string{"file": srcRel, "lines": "6-6"}, // the sentinel line
+	}}}
+	if _, err := Run(cfg, DefaultRegistry()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Author a new test inside the projection block (the block grows from 1 to 4 lines).
+	proj := read(t, projPath)
+	edited := strings.Replace(proj,
+		"// add tests below\n",
+		"// add tests below\nfunc TestGenerated(t *testing.T) {\n\t_ = TestExisting\n}\n", 1)
+	if edited == proj {
+		t.Fatal("test setup: sentinel line not found in projection block")
+	}
+	write(t, projPath, edited)
+
+	res, err := SyncProjection(cfg, projPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ToSource != 1 || len(res.Conflicts) != 0 {
+		t.Fatalf("expected 1 source write, no conflicts; got %+v", res)
+	}
+	src := read(t, srcAbs)
+	if !strings.Contains(src, "func TestGenerated(t *testing.T) {") {
+		t.Fatalf("generated test not synced into the test file:\n%s", src)
+	}
+	if !strings.Contains(src, "func TestExisting(t *testing.T) {}") {
+		t.Fatalf("existing test should be preserved:\n%s", src)
+	}
+}
+
 func TestExtractSyncDetectsConflict(t *testing.T) {
 	dir := t.TempDir()
 	srcRel := "shop/Sample.java"

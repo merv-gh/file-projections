@@ -5850,12 +5850,24 @@ func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
 // real SyncProjection (scattered two-way), then returns the refreshed program. Exactly the CLI
 // path: render projection -> edit the block line -> sync -> re-render.
 func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
+	type uiEdit struct {
+		Line    int
+		NewCode string
+	}
 	var req struct {
 		SourceRoot, File, Method, Inputs, Branches, NewCode string
 		Line                                                int
+		Edits                                               []uiEdit
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(req.Edits) == 0 && req.Line > 0 {
+		req.Edits = []uiEdit{{Line: req.Line, NewCode: req.NewCode}}
+	}
+	if len(req.Edits) == 0 {
+		writeJSON(w, 400, map[string]string{"error": "no edits supplied"})
 		return
 	}
 	p, cfg, reg, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches)
@@ -5864,11 +5876,19 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lines := unrollViewLines(p)
-	if req.Line < 1 || req.Line > len(lines) {
-		writeJSON(w, 200, map[string]any{"error": fmt.Sprintf("line must be 1..%d", len(lines))})
-		return
+	seen := map[int]bool{}
+	for _, edit := range req.Edits {
+		if edit.Line < 1 || edit.Line > len(lines) {
+			writeJSON(w, 200, map[string]any{"error": fmt.Sprintf("line must be 1..%d", len(lines))})
+			return
+		}
+		if seen[edit.Line] {
+			writeJSON(w, 200, map[string]any{"error": fmt.Sprintf("duplicate edit for line %d", edit.Line)})
+			return
+		}
+		seen[edit.Line] = true
 	}
-	// Render to a temp projection, replace the line (preserving indent), then sync back.
+	// Render to a temp projection, replace the edited mapped lines exactly, then sync back.
 	projPath := filepath.Join(cfg.Root, cfg.ProjectionsDir, "ui-unroll.projection")
 	if err := RenderProjection(projPath, p); err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
@@ -5890,9 +5910,9 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"error": "no block in projection"})
 		return
 	}
-	orig := raw[bi+req.Line]
-	indent := orig[:len(orig)-len(strings.TrimLeft(orig, " \t"))]
-	raw[bi+req.Line] = indent + strings.TrimSpace(req.NewCode)
+	for _, edit := range req.Edits {
+		raw[bi+edit.Line] = strings.TrimRight(edit.NewCode, "\r\n")
+	}
 	if err := writeLines(projPath, raw); err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
@@ -5908,14 +5928,22 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
 	}
-	origin := lines[req.Line-1].Origin
+	origin := lines[req.Edits[0].Line-1].Origin
+	unresolved := false
+	for _, l := range unrollViewLines(p2) {
+		if l.Branch {
+			unresolved = true
+		}
+	}
 	writeJSON(w, 200, map[string]any{
-		"lines":     unrollViewLines(p2),
-		"decisions": unrollDecisionFacts(p2),
-		"choices":   unrollChoices(p2),
-		"synced":    fmt.Sprintf("%d → source, %d conflicts", res.ToSource, len(res.Conflicts)),
-		"conflicts": res.Conflicts,
-		"origin":    origin,
+		"lines":      unrollViewLines(p2),
+		"unresolved": unresolved,
+		"inputs":     req.Inputs,
+		"decisions":  unrollDecisionFacts(p2),
+		"choices":    unrollChoices(p2),
+		"synced":     fmt.Sprintf("%d → source, %d conflicts", res.ToSource, len(res.Conflicts)),
+		"conflicts":  res.Conflicts,
+		"origin":     origin,
 	})
 }
 
@@ -5998,7 +6026,7 @@ func collectSymbols(cfg Config, root, q string, limit int) ([]uiSymbol, error) {
 const uiHTML = `<!doctype html><html><head><meta charset=utf-8>
 <title>file-projections · lens studio</title>
 <style>
-:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a7;--accent:#6ea8fe;--ok:#4ade80;--bad:#f87171}
+:root{--bg:#ebe7dd;--panel:#f4f0e8;--soft:#e2ddd2;--line:#cec6b8;--fg:#25231f;--mut:#746b5d;--accent:#3f6f9f;--ok:#24784f;--bad:#b54848}
 *{box-sizing:border-box}body{margin:0;font:13px/1.5 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
 header{padding:.7rem 1rem;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:.6rem}
 header b{font-size:1.05rem}header span{color:var(--mut);font-size:.8rem}
@@ -6008,35 +6036,35 @@ header b{font-size:1.05rem}header span{color:var(--mut);font-size:.8rem}
 h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:1.2rem 0 .5rem}
 h2:first-child{margin-top:0}
 label{display:block;color:var(--mut);font-size:.72rem;margin:.5rem 0 .15rem}
-input,select,textarea{width:100%;background:#0c0e13;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:.4rem .5rem;font:inherit}
+input,select,textarea{width:100%;background:#fbf8f0;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:.4rem .5rem;font:inherit}
 textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical}
-button{background:var(--accent);color:#06121f;border:0;border-radius:6px;padding:.45rem .8rem;font-weight:600;cursor:pointer}
-button.ghost{background:#222836;color:var(--fg);border:1px solid var(--line)}
+button{background:var(--accent);color:#f9fbff;border:0;border-radius:6px;padding:.45rem .8rem;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:#e7e1d6;color:var(--fg);border:1px solid var(--line)}
 button.icon{width:2rem;height:2rem;padding:0;display:inline-grid;place-items:center;font-size:1rem}
 .row{display:flex;gap:.4rem;align-items:center}.row input{flex:1}
 .kv{display:grid;grid-template-columns:1fr 1.4fr auto;gap:.3rem;margin:.2rem 0}
 .entrygrid{display:grid;grid-template-columns:1.5fr 1fr;gap:.4rem}.field{position:relative}
-.ac{display:none;position:absolute;z-index:5;left:0;right:0;top:calc(100% + 3px);max-height:16rem;overflow:auto;background:#0c0e13;border:1px solid var(--line);border-radius:6px;box-shadow:0 10px 24px rgba(0,0,0,.32)}
-.acitem{padding:.36rem .5rem;border-bottom:1px solid #20242e;cursor:pointer}.acitem:last-child{border-bottom:0}.acitem:hover,.acitem.on{background:#1d2230}.acitem b{color:var(--fg);font-weight:600}.acitem span{display:block;color:var(--mut);font-size:.72rem}
-pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7rem;overflow:auto;white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:60vh}
+.ac{display:none;position:absolute;z-index:5;left:0;right:0;top:calc(100% + 3px);max-height:16rem;overflow:auto;background:#fbf8f0;border:1px solid var(--line);border-radius:6px;box-shadow:0 10px 24px rgba(73,62,43,.18)}
+.acitem{padding:.36rem .5rem;border-bottom:1px solid var(--soft);cursor:pointer}.acitem:last-child{border-bottom:0}.acitem:hover,.acitem.on{background:#ece5d8}.acitem b{color:var(--fg);font-weight:600}.acitem span{display:block;color:var(--mut);font-size:.72rem}
+pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7rem;overflow:auto;white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:60vh}
 .sym{padding:.3rem .45rem;border-bottom:1px solid var(--line);cursor:pointer;display:flex;justify-content:space-between;gap:.5rem}
-.sym:hover{background:#1d2230}.sym .k{color:var(--accent);font-size:.7rem}.sym .f{color:var(--mut);font-size:.72rem}
+.sym:hover{background:#ece5d8}.sym .k{color:var(--accent);font-size:.7rem}.sym .f{color:var(--mut);font-size:.72rem}
 .note{color:var(--mut);font-size:.74rem;margin:.3rem 0}.err{color:var(--bad)}.ok{color:var(--ok)}
-.tabs{display:flex;gap:.3rem;margin-bottom:.6rem}.tabs button{background:#222836;color:var(--fg);border:1px solid var(--line);font-weight:500}
-.tabs button.on{background:var(--accent);color:#06121f}
-.banner{margin:.6rem 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;background:#3a2d12;color:#f0c674;border:1px solid #5a4a1e}
-.banner.ok{background:#12331c;color:#7bd88f;border-color:#1e5a30}
-.branchbar{position:sticky;top:-1rem;z-index:2;margin:.6rem -1rem 0;padding:.5rem 1rem;background:rgba(15,17,21,.96);border-top:1px solid var(--line);border-bottom:1px solid var(--line);display:none;gap:.45rem;align-items:center;overflow-x:auto}
-.branchbar.show{display:flex}.branchbar .title{color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;white-space:nowrap}.btab{display:flex;align-items:center;gap:.35rem;white-space:nowrap;border:1px solid var(--line);border-radius:7px;padding:.25rem;background:#151922}.btab .where{color:var(--mut);font-size:.72rem}.btab button{padding:.25rem .45rem;background:#222836;color:var(--fg);border:1px solid var(--line);font-weight:600}.btab button.on{background:var(--accent);color:#06121f;border-color:var(--accent)}
-.prog{margin:.6rem 0;border:1px solid var(--line);border-radius:8px;overflow:hidden;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
-.pl{display:grid;grid-template-columns:2.2rem 1fr auto;gap:.4rem;align-items:center;padding:.28rem .6rem;border-bottom:1px solid #20242e;cursor:pointer}
-.pl:last-child{border-bottom:0}.pl:hover{background:#1d2230}.pl .ln{color:#5b6675;text-align:right}
-.pl .code{white-space:pre;overflow-x:auto}.pl .org{color:#5b6675;font-size:.74rem;white-space:nowrap}
-.pl.branch{background:#2a2410}.pl.branch .ln{color:#f0c674}
-.pl.editing{background:#11202e}.pl.flash{animation:flash 1.1s ease-out}
-@keyframes flash{from{background:#1e5a30}to{background:transparent}}
-.pl .edit{grid-column:2/4;display:flex;gap:.4rem;margin-top:.2rem}
-.pl .edit input{flex:1;font-family:inherit;font-size:12.5px}
+.tabs{display:flex;gap:.3rem;margin-bottom:.6rem}.tabs button{background:#e7e1d6;color:var(--fg);border:1px solid var(--line);font-weight:500}
+.tabs button.on{background:var(--accent);color:#f9fbff}
+.banner{margin:.6rem 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;background:#fff3cd;color:#6a5118;border:1px solid #dfc46c}
+.banner.ok{background:#dfeddf;color:#265f3f;border-color:#9cc8a6}
+.unrollbody{display:grid;grid-template-columns:minmax(10rem,15rem) minmax(0,1fr);gap:.7rem;align-items:start}.unrollbody.no-choices{grid-template-columns:1fr}.unrollbody.no-choices .branchbar{display:none}
+.branchbar{position:sticky;top:.2rem;z-index:2;display:block;background:#f5efe3;border:1px solid var(--line);border-radius:8px;padding:.55rem;max-height:calc(100vh - 12rem);overflow:auto}
+.branchbar .title{display:block;color:var(--mut);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem}.btab{border-top:1px solid var(--soft);padding:.45rem 0}.btab:first-of-type{border-top:0}.btab .where{display:block;color:var(--fg);font-size:.78rem;line-height:1.3;margin-bottom:.3rem}.bswitch{display:inline-flex;gap:.2rem;background:#e5ded1;border:1px solid var(--line);border-radius:999px;padding:.16rem}.bswitch button{padding:.16rem .45rem;border-radius:999px;background:transparent;color:var(--mut);border:0;font-size:.72rem}.bswitch button.on{background:var(--accent);color:#f9fbff}
+.prog{margin:0;border:1px solid var(--line);border-radius:8px;overflow:auto;background:#fbf8f0;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+.pl{display:block;min-height:1.75rem;padding:.22rem .65rem;border-bottom:1px solid var(--soft)}
+.pl:last-child{border-bottom:0}.pl:hover{background:#f3ede2}
+.pl .code{display:block;white-space:pre;outline:0;tab-size:4;min-height:1.25rem}
+.pl .code:focus{background:#fffaf0;box-shadow:inset 2px 0 0 var(--accent)}
+.pl.dirty{background:#fff6dc}.pl.flash{animation:flash 1.1s ease-out}
+@keyframes flash{from{background:#d9eddc}to{background:transparent}}
 </style></head><body>
 <header><button class="ghost icon" id=toggleLeft title="Toggle tools">☰</button><b>file-projections</b><span id=cfgpath></span><span style=margin-left:auto id=msg></span></header>
 <div class=wrap id=wrap>
@@ -6064,10 +6092,13 @@ pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7
     <button id=udiscover>① Discover branches</button>
     <input id=uinputs placeholder="② inputs e.g. coupon=save,amount=50" style=flex:1>
     <button class=ghost id=uapply>Apply inputs</button>
+    <button class=ghost id=usync disabled>Sync changes</button>
    </div>
-   <div id=branchbar class=branchbar></div>
    <div id=ubanner class=banner style=display:none></div>
-   <div id=uprog class=prog></div>
+   <div id=unrollbody class="unrollbody no-choices">
+    <div id=branchbar class=branchbar></div>
+    <div id=uprog class=prog></div>
+   </div>
    <div class=note id=ustatus></div>
   </div>
   <div id=prevpane style=display:none><pre id=out>Pick an analyzer + source_root, then Preview.</pre><div id=extra></div></div>
@@ -6192,34 +6223,59 @@ el("tunroll").onclick=function(){tab("unroll")};el("tprev").onclick=function(){t
 
 // ---- Fix (unroll): discover branches -> choose inputs -> edit (two-way sync) ----
 var branchState={};
+var originalLines={},dirtyLines={};
 function branchString(){var out=[];Object.keys(branchState).sort().forEach(function(k){if(branchState[k])out.push(k+"="+branchState[k])});return out.join(",");}
 function parseBranchString(s){branchState={};(s||"").split(",").forEach(function(p){var i=p.indexOf("=");if(i>0)branchState[p.slice(0,i)]=p.slice(i+1);});}
 function ufields(){return {SourceRoot:el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value,Branches:branchString()};}
+function sideLabel(side){return side==="then"?"true":"false";}
+function sideTitle(side){return side==="then"?"show true branch":"show false branch";}
 function renderBranches(d){
- var choices=d.choices||[],bar=el("branchbar");bar.innerHTML="";
- if(!choices.length){bar.className="branchbar";return;}
- bar.className="branchbar show";bar.innerHTML="<span class=title>branches</span>";
+ var choices=d.choices||[],bar=el("branchbar"),body=el("unrollbody");bar.innerHTML="";
+ body.classList.toggle("no-choices",!choices.length);
+ if(!choices.length)return;
+ bar.innerHTML="<span class=title>assumptions</span>";
  choices.forEach(function(c,idx){
   if(!branchState[c.id])branchState[c.id]=c.side;
   var tab=document.createElement("div");tab.className="btab";
-  var where=(c.origin||c.id).split("/").pop();
-  var label=document.createElement("span");label.className="where";label.title=c.cond||"";label.textContent=(idx+1)+". "+where;tab.appendChild(label);
+  var label=document.createElement("span");label.className="where";label.textContent=c.cond||("branch "+(idx+1));tab.appendChild(label);
+  var sw=document.createElement("span");sw.className="bswitch";
   (c.sides||[]).forEach(function(side){
-   var b=document.createElement("button");b.textContent=side;b.className=branchState[c.id]===side?"on":"";
+   var b=document.createElement("button");b.textContent=sideLabel(side);b.title=sideTitle(side);b.className=branchState[c.id]===side?"on":"";
    b.onclick=function(){branchState[c.id]=side;discover(el("uinputs").value);};
-   tab.appendChild(b);
+   sw.appendChild(b);
   });
+  tab.appendChild(sw);
   bar.appendChild(tab);
  });
 }
+function resetDirty(){
+ dirtyLines={};
+ el("usync").disabled=true;
+ el("usync").textContent="Sync changes";
+}
+function markDirty(row,line,code){
+ if(code===originalLines[line])delete dirtyLines[line];
+ else dirtyLines[line]=code;
+ row.classList.toggle("dirty",!!dirtyLines[line]);
+ var n=Object.keys(dirtyLines).length;
+ el("usync").disabled=n===0;
+ el("usync").textContent=n?"Sync "+n+" change"+(n===1?"":"s"):"Sync changes";
+}
 function renderProg(d){
  renderBranches(d);
+ resetDirty();
+ originalLines={};
  var prog=el("uprog");prog.innerHTML="";
  (d.lines||[]).forEach(function(l){
-  var row=document.createElement("div");row.className="pl"+(l.branch?" branch":"");
-  row.innerHTML='<span class=ln>'+l.n+'</span><span class=code></span><span class=org>'+(l.origin||"")+'</span>';
-  row.querySelector(".code").textContent=l.code.trim();
-  row.onclick=function(){editRow(row,l)};prog.appendChild(row);
+  originalLines[l.n]=l.code;
+  var row=document.createElement("div");row.className="pl";row.dataset.line=l.n;row.dataset.origin=l.origin||"";
+  var code=document.createElement("div");code.className="code";code.contentEditable="true";code.spellcheck=false;code.textContent=l.code;
+  code.oninput=function(){markDirty(row,l.n,code.textContent)};
+  code.onkeydown=function(e){
+   if(e.key==="Enter"){e.preventDefault();code.blur();}
+   if(e.key==="Tab"){e.preventDefault();document.execCommand("insertText",false,"    ");}
+  };
+  row.appendChild(code);prog.appendChild(row);
  });
  var b=el("ubanner");
  if(d.unresolved){
@@ -6228,9 +6284,8 @@ function renderProg(d){
   else b.innerHTML="① Unresolved branches (highlighted). The outcome depends on the inputs — type them above and <b>Apply inputs</b> to collapse to the one path that runs.";
  }
  else if((d.lines||[]).length){b.style.display="";b.className="banner ok";
-  var dec=(d.decisions&&d.decisions.length)?"<br><span>"+d.decisions.join("<br>")+"</span>":"";
-  var via=(d.choices&&d.choices.length)?" Branch tabs show the selected runtime-undecidable side; default is the longest side.":"";
-  b.innerHTML="✓ Single concrete path"+(d.inputs?" for inputs <code>"+esc(d.inputs)+"</code>":"")+". Click any line to edit — your change is written back to the source file shown on its right."+via+dec;}
+  var via=(d.choices&&d.choices.length)?" Assumptions stay visible on the left while you read and edit.":"";
+  b.innerHTML="✓ Editable path"+(d.inputs?" for inputs <code>"+esc(d.inputs)+"</code>":"")+". Edit the code directly, then sync changes."+via;}
  else b.style.display="none";
 }
 function discover(inputs){
@@ -6244,27 +6299,21 @@ function discover(inputs){
 el("udiscover").onclick=function(){discover("")};
 el("uapply").onclick=function(){discover(el("uinputs").value)};
 el("uinputs").addEventListener("keydown",function(e){if(e.key==="Enter")discover(el("uinputs").value)});
-function editRow(row,l){
- if(row.querySelector(".edit"))return;row.classList.add("editing");
- var ed=document.createElement("div");ed.className="edit";
- ed.innerHTML="<input><button>Save &amp; sync</button><button class=ghost>×</button>";
- var inp=ed.querySelector("input");inp.value=l.code.trim();
- var bs=ed.querySelectorAll("button");
- bs[0].onclick=function(e){e.stopPropagation();saveEdit(l.n,inp.value)};
- bs[1].onclick=function(e){e.stopPropagation();row.classList.remove("editing");ed.remove()};
- inp.onclick=function(e){e.stopPropagation()};
- inp.onkeydown=function(e){if(e.key==="Enter"){e.stopPropagation();saveEdit(l.n,inp.value)}};
- row.appendChild(ed);inp.focus();
-}
-function saveEdit(line,code){
- el("ustatus").textContent="syncing…";var body=ufields();body.Line=line;body.NewCode=code;
+function saveEdits(edits){
+ if(!edits.length)return Promise.resolve();
+ el("ustatus").textContent="syncing…";var body=ufields();body.Edits=edits;
  return fetch("/api/unroll/edit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
   .then(function(r){return r.json()}).then(function(d){
    if(d.error){el("ustatus").textContent="error: "+d.error;return;}
    renderProg(d);
-   var rows=el("uprog").querySelectorAll(".pl");if(rows[line-1])rows[line-1].classList.add("flash");
-   el("ustatus").innerHTML="✓ wrote line "+line+" → "+(d.origin||"")+" ("+d.synced+")";flash("synced to source");});
+   el("uprog").querySelectorAll(".pl").forEach(function(r){r.classList.add("flash")});
+   el("ustatus").innerHTML="✓ synced ("+d.synced+")";flash("synced to source");});
 }
+function saveEdit(line,code){return saveEdits([{Line:line,NewCode:code}]);}
+el("usync").onclick=function(){
+ var edits=Object.keys(dirtyLines).map(function(k){return {Line:parseInt(k),NewCode:dirtyLines[k]}}).sort(function(a,b){return a.Line-b.Line});
+ saveEdits(edits);
+};
 
 // Deep link / autoplay: ?do=discover|apply|edit drives the unroll tab from URL params, so a
 // particular view (or a walkthrough frame) is shareable. Harmless without the params.

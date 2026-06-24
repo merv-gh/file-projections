@@ -105,6 +105,10 @@ type ProjectionBlock struct {
 	// lines. Unlike SrcStart/SrcEnd, this supports analytical projections whose
 	// editable surface is assembled from many files.
 	LineOrigins []LineOrigin
+	// LineGuards holds, per line, the branch conditions that must hold to reach it
+	// (the unrolled-program "per-line assumptions"). In-memory only — never written
+	// to the projection text or serialized.
+	LineGuards [][]string `json:"-"`
 	// Sync/Src fields support two-way "extract" blocks. SrcHash is the hash of
 	// the source span at generation time; it lets SyncProjection detect whether
 	// the source changed independently of the projection (conflict detection).
@@ -270,6 +274,8 @@ func main() {
 	targetMethod := flag.String("method", "", "target method name for joern-var-flow")
 	targetType := flag.String("type", "", "target type name for object-flow")
 	inputs := flag.String("inputs", "", "concrete branch inputs for unrolled-program, e.g. amount=50,coupon=save")
+	inlineDepth := flag.String("inline_depth", "", "how many levels of called methods to inline for unrolled-program")
+	branches := flag.String("branches", "", "forced branch sides for unrolled-program, e.g. App.java:12=then")
 	mode := flag.String("mode", "", "adapter mode, e.g. auto, joern, fallback")
 	flag.Parse()
 
@@ -306,6 +312,12 @@ func main() {
 		}
 		if *inputs != "" {
 			params["inputs"] = *inputs
+		}
+		if *inlineDepth != "" {
+			params["inline_depth"] = *inlineDepth
+		}
+		if *branches != "" {
+			params["branches"] = *branches
 		}
 		if *mode != "" {
 			params["mode"] = *mode
@@ -3410,6 +3422,9 @@ type unrollLine struct {
 	code string
 	file string
 	line int
+	// guards is the conjunction of branch conditions that must hold to reach this
+	// line — the line's "assumptions" (e.g. ["score >= 0", "!(score >= 90)"]).
+	guards []string
 }
 
 type inlineCallChoice struct {
@@ -3440,19 +3455,22 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	u := &javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"]), seenDecision: map[string]bool{},
 		selectMode: lens.Params["branch_select"] == "1", forced: parseForcedBranches(lens.Params["branches"]), choiceSeen: map[string]bool{},
 		inlineDepth: parseInlineDepth(lens.Params["inline_depth"]), inlineSkips: parseIDSet(lens.Params["inline_skips"]), callSeen: map[string]bool{}}
-	lines, err := u.unrollMethod(file, method, 0)
+	lines, err := u.unrollMethod(file, method, 0, nil)
 	if err != nil {
 		return Projection{}, err
 	}
 	var body []string
 	var origins []LineOrigin
+	var lineGuards [][]string
 	for _, line := range lines {
 		body = append(body, line.code)
 		src := filepath.ToSlash(filepath.Join(lens.SourceRoot, line.file))
 		origins = append(origins, LineOrigin{SrcFile: src, Line: line.line, SrcHash: hash(line.code + "\n")})
+		lineGuards = append(lineGuards, line.guards)
 	}
 	if len(body) == 0 {
 		body = append(body, "// no executable path found")
+		lineGuards = append(lineGuards, nil)
 	}
 	p := Projection{Sync: "two-way"}
 	p.Blocks = append(p.Blocks, ProjectionBlock{
@@ -3462,6 +3480,7 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 		Tool:        "unrolled-program",
 		Lines:       body,
 		LineOrigins: origins,
+		LineGuards:  lineGuards,
 		Sync:        "two-way",
 	})
 	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "editable straight-line Java path; each line syncs back to its original source line"})
@@ -3474,6 +3493,14 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	for i, c := range u.choices {
 		if b, err := json.Marshal(c); err == nil {
 			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("choice-%d", i+1), Tool: "unrolled-program", Text: string(b)})
+		}
+	}
+	// Per-line assumptions: the conditions that must hold to reach each line, carried
+	// as text facts so the CLI/MCP (not just the web UI) can answer "why does this
+	// line run?". One fact per guarded line: `lguard-<n>` = `condA && condB`.
+	for n, g := range lineGuards {
+		if len(g) > 0 {
+			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("lguard-%d", n+1), Tool: "unrolled-program", Text: strings.Join(g, " && ")})
 		}
 	}
 	for i, c := range u.calls {
@@ -3554,7 +3581,7 @@ func parseIDSet(s string) map[string]bool {
 	return out
 }
 
-func (u *javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine, error) {
+func (u *javaUnroller) unrollMethod(file, method string, depth int, guards []string) ([]unrollLine, error) {
 	if depth > 10 {
 		return nil, fmt.Errorf("unrolled-program: recursion limit while inlining %s.%s", file, method)
 	}
@@ -3578,11 +3605,38 @@ func (u *javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLin
 	if err != nil {
 		return nil, err
 	}
-	return u.unrollRange(file, lines, open+1, close-1, depth)
+	return u.unrollRange(file, lines, open+1, close-1, depth, guards)
 }
 
-func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int) ([]unrollLine, error) {
+// withGuard returns a fresh copy of the guard stack with one more condition pushed,
+// so sibling branches never alias each other's assumptions.
+func withGuard(guards []string, cond string) []string {
+	g := make([]string, 0, len(guards)+1)
+	g = append(g, guards...)
+	return append(g, cond)
+}
+
+var uiExitStmtRE = regexp.MustCompile(`^\s*(return|throw|break|continue)\b`)
+
+// rangeExits reports whether the last meaningful statement in lines[lo..hi] is an
+// early exit (return/throw/break/continue) — i.e. a guard clause whose fall-through
+// implies the negation of its condition for everything after it.
+func rangeExits(lines []string, lo, hi int) bool {
+	for i := hi; i >= lo && i < len(lines); i-- {
+		t := strings.TrimSpace(stripLineComment(lines[i]))
+		if t == "" || t == "{" || t == "}" || strings.HasPrefix(t, "//") {
+			continue
+		}
+		return uiExitStmtRE.MatchString(t)
+	}
+	return false
+}
+
+func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int, guards []string) ([]unrollLine, error) {
 	var out []unrollLine
+	// running accumulates implied negations: after a guard clause `if (c) return;`,
+	// every later sibling line at this level assumes !(c).
+	running := guards
 	for i := lo; i <= hi && i < len(lines); i++ {
 		raw := lines[i]
 		trim := strings.TrimSpace(stripLineComment(raw))
@@ -3604,14 +3658,14 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 			switch {
 			case known && decision:
 				u.addDecision(file, i+1, cond, "then", "decided from inputs")
-				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
+				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth, withGuard(running, cond))
 				if err != nil {
 					return nil, err
 				}
 				out = append(out, part...)
 			case known && !decision && hasElse && !elseIf:
 				u.addDecision(file, i+1, cond, "else", "decided from inputs")
-				part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
+				part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth, withGuard(running, "!("+cond+")"))
 				if err != nil {
 					return nil, err
 				}
@@ -3644,13 +3698,13 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 				u.addDecision(file, i+1, cond, side, "branch toggle (runtime-undecidable)")
 				switch side {
 				case "then":
-					part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
+					part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth, withGuard(running, cond))
 					if err != nil {
 						return nil, err
 					}
 					out = append(out, part...)
 				case "else":
-					part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
+					part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth, withGuard(running, "!("+cond+")"))
 					if err != nil {
 						return nil, err
 					}
@@ -3658,19 +3712,24 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 				}
 			case !known:
 				u.addDecision(file, i+1, cond, "both", "runtime-dependent or missing input")
-				out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
-				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
+				out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1, guards: running})
+				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth, withGuard(running, cond))
 				if err != nil {
 					return nil, err
 				}
 				out = append(out, part...)
 				if hasElse && !elseIf {
-					part, err = u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
+					part, err = u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth, withGuard(running, "!("+cond+")"))
 					if err != nil {
 						return nil, err
 					}
 					out = append(out, part...)
 				}
+			}
+			// Guard-clause fall-through: `if (c) return;` with no else means every
+			// later sibling line at this level implicitly assumes !(c).
+			if !hasElse && rangeExits(lines, braceLine+1, closeLine-1) {
+				running = withGuard(running, "!("+cond+")")
 			}
 			if hasElse {
 				i = elseClose
@@ -3679,13 +3738,13 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 			}
 			continue
 		}
-		if inlined, ok, err := u.inlineCall(file, trim, i+1, depth); err != nil {
+		if inlined, ok, err := u.inlineCall(file, trim, i+1, depth, running); err != nil {
 			return nil, err
 		} else if ok {
 			out = append(out, inlined...)
 			continue
 		}
-		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
+		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1, guards: running})
 	}
 	return out, nil
 }
@@ -3719,7 +3778,32 @@ func (u *javaUnroller) addDecision(file string, line int, cond, branch, why stri
 	u.decisions = append(u.decisions, msg)
 }
 
-func (u *javaUnroller) inlineCall(file, trim string, line, depth int) ([]unrollLine, bool, error) {
+// When a call is inlined into an assignment (`x = helper(...)`), the helper's
+// `return E;` should read as `x = E;` in the flattened program — a bare `return`
+// looks like the outer method exits early and misleads readers (and models).
+var inlineLHSRE = regexp.MustCompile(`^(?:final\s+)?(?:[A-Za-z_][\w<>\[\].]*\s+)?([A-Za-z_]\w*)\s*=[^=]`)
+var inlineRetRE = regexp.MustCompile(`^(\s*)return\s+(.*?);\s*$`)
+
+func inlineAssignTarget(trim string) string {
+	if m := inlineLHSRE.FindStringSubmatch(trim); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+func rewriteInlinedReturns(lines []unrollLine, lhs string) {
+	if lhs == "" {
+		return
+	}
+	for i := range lines {
+		if m := inlineRetRE.FindStringSubmatch(lines[i].code); m != nil {
+			lines[i].code = m[1] + lhs + " = " + m[2] + ";"
+		}
+	}
+}
+
+func (u *javaUnroller) inlineCall(file, trim string, line, depth int, guards []string) ([]unrollLine, bool, error) {
+	lhs := inlineAssignTarget(trim)
 	if m := regexp.MustCompile(`new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
 		calleeFile := filepath.ToSlash(filepath.Join(filepath.Dir(file), m[1]+".java"))
 		id := fmt.Sprintf("%s:%d", file, line)
@@ -3730,13 +3814,14 @@ func (u *javaUnroller) inlineCall(file, trim string, line, depth int) ([]unrollL
 		}
 		next := *u
 		next.bindArgs(calleeFile, m[2], splitArgs(m[3]))
-		lines, err := next.unrollMethod(calleeFile, m[2], depth+1)
+		lines, err := next.unrollMethod(calleeFile, m[2], depth+1, guards)
 		u.decisions = next.decisions
 		u.seenDecision = next.seenDecision
 		u.choices = next.choices
 		u.choiceSeen = next.choiceSeen
 		u.calls = next.calls
 		u.callSeen = next.callSeen
+		rewriteInlinedReturns(lines, lhs)
 		return lines, true, err
 	}
 	if m := regexp.MustCompile(`=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
@@ -3751,13 +3836,14 @@ func (u *javaUnroller) inlineCall(file, trim string, line, depth int) ([]unrollL
 					}
 					next := *u
 					next.bindArgs(file, m[1], splitArgs(m[2]))
-					lines, err := next.unrollMethod(file, m[1], depth+1)
+					lines, err := next.unrollMethod(file, m[1], depth+1, guards)
 					u.decisions = next.decisions
 					u.seenDecision = next.seenDecision
 					u.choices = next.choices
 					u.choiceSeen = next.choiceSeen
 					u.calls = next.calls
 					u.callSeen = next.callSeen
+					rewriteInlinedReturns(lines, lhs)
 					return lines, true, err
 				}
 			}
@@ -6004,10 +6090,11 @@ func (s *uiServer) handleSymbols(w http.ResponseWriter, r *http.Request) {
 // came from, so the UI can show "discover branches -> choose inputs -> edit", and each edit
 // goes back to its true origin via the same two-way sync the CLI uses.
 type unrollLineView struct {
-	N      int    `json:"n"`
-	Code   string `json:"code"`
-	Origin string `json:"origin"` // file:line, the real source the line came from
-	Branch bool   `json:"branch"` // an unresolved `if (...)` / `switch` header
+	N      int      `json:"n"`
+	Code   string   `json:"code"`
+	Origin string   `json:"origin"`           // file:line, the real source the line came from
+	Branch bool     `json:"branch"`           // an unresolved `if (...)` / `switch` header
+	Guards []string `json:"guards,omitempty"` // conditions that must hold to reach this line
 }
 
 func (s *uiServer) unrollProjection(srcRoot, file, method, inputs, branches, inlineDepth, inlineSkips string) (Projection, Config, Registry, error) {
@@ -6080,6 +6167,9 @@ func unrollViewLines(p Projection) []unrollLineView {
 				if o.SrcFile != "" {
 					lv.Origin = fmt.Sprintf("%s:%d", o.SrcFile, o.Line)
 				}
+			}
+			if i < len(b.LineGuards) {
+				lv.Guards = b.LineGuards[i]
 			}
 			out = append(out, lv)
 		}

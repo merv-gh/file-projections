@@ -108,7 +108,7 @@ function entryParamNames(root) {
 	return m[1].split(",").map((p) => p.trim().split(/\s+/).pop()).filter(Boolean);
 }
 function parseProjection(text) {
-	const body = [], origins = {}, facts = [];
+	const body = [], origins = {}, facts = [], guards = {};
 	let inBlock = false;
 	for (const l of text.split("\n")) {
 		if (l.startsWith("@@ ")) { inBlock = true; continue; }
@@ -118,10 +118,12 @@ function parseProjection(text) {
 		if (m) origins[Number(m[1])] = [m[2], Number(m[3])];
 		const f = l.match(/^=> unrolled-program\.branch-\d+: (.+)$/);
 		if (f) facts.push(f[1]);
+		const g = l.match(/^=> unrolled-program\.lguard-(\d+): (.+)$/);
+		if (g) guards[Number(g[1])] = g[2];
 	}
-	return { body, origins, facts };
+	return { body, origins, facts, guards };
 }
-async function genUnrolled(root, inputs) {
+async function genUnrolled(root, inputs, inline) {
 	ensureConfig(root);
 	mkdirSync(join(root, ".projections"), { recursive: true });
 	const args = ["-config", CFG, "-analyzer", "unrolled-program", "-source-root", SRC,
@@ -129,6 +131,7 @@ async function genUnrolled(root, inputs) {
 	if (inputs && Object.keys(inputs).length) {
 		args.push("-inputs", Object.entries(inputs).map(([k, v]) => `${k}=${v}`).join(","));
 	}
+	if (inline != null && inline !== "") args.push("-inline_depth", String(inline));
 	await run(FPBIN, args, { cwd: root, maxBuffer: 16 * 1024 * 1024 });
 	const r = parseProjection(readFileSync(join(root, PROJ), "utf8"));
 	r._inputs = inputs || {};
@@ -256,10 +259,28 @@ async function tViewProgram(p) {
 		const r = shown || last || await genUnrolled(ROOT, {});
 		return hint + "\n" + listing(r);
 	}
-	const r = await genUnrolled(ROOT, parsed.env);
+	const r = await genUnrolled(ROOT, parsed.env, p.inline);
 	shown = r;
 	if (Object.keys(parsed.env).length) last = r;
 	return listing(r);
+}
+// line_assumptions: for one numbered line of the latest view_program output, return
+// the conditions that must be true to reach it (its guard set) plus the variable
+// names that feed it — so the model can ask "why does this line run, with what?".
+async function tLineAssumptions(p) {
+	const r = shown || last || await genUnrolled(ROOT, {});
+	const n = Number(p.line);
+	if (!(n >= 1 && n <= r.body.length)) return `line must be 1..${r.body.length}; call view_program first.`;
+	const code = r.body[n - 1].trim();
+	const o = r.origins[n];
+	const where = o ? `${o[0].split("/").pop()}:${o[1]}` : "?";
+	const guard = r.guards[n];
+	const bare = code.replace(/"[^"]*"/g, "").replace(/'[^']*'/g, "");
+	const vars = [...new Set((bare.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])
+		.filter((w) => !/^(if|else|return|new|int|long|double|float|boolean|String|void|true|false|null|this|for|while|switch|case|break|continue|throw|try|catch|finally)$/.test(w)))];
+	return `LINE ${n} ${where} | ${code}\n` +
+		`REACHED-WHEN ${guard || "(always — no branch guards on this line)"}\n` +
+		`VALUES-IN ${vars.join(", ") || "(none)"} — trace any of these with view_program at higher inline depth.`;
 }
 async function tEditProgram(p) {
 	if (!last) return 'Call view_program with concrete inputs first, e.g. inputs="coupon=save,amount=50".';
@@ -317,6 +338,18 @@ const VIEW = {
 	inputSchema: S({ inputs: str("Comma-separated arg=value pairs, or omit to reveal branches.") }, []),
 	run: tViewProgram,
 };
+const VIEW_INLINE = {
+	name: "view_program",
+	description: "Show the method as ONE numbered straight-line program with cross-file calls inlined. Args: inputs = comma-separated method args (e.g. \"amount=50,coupon=save\") to pick a concrete path, or omit to reveal branch conditions; inline = how many levels of called methods to expand inline (0 = none, 2 = expand calls and their calls). Each row is: <n> <file:line> | <code>.",
+	inputSchema: S({ inputs: str("Comma-separated arg=value pairs, or omit to reveal branches."), inline: num("Levels of called methods to expand inline, e.g. 2. Omit for default.") }, []),
+	run: tViewProgram,
+};
+const LINE_ASSUME = {
+	name: "line_assumptions",
+	description: "Explain ONE line of the latest view_program output: returns the exact conditions that must be true for execution to reach that line (its branch/guard assumptions), the file:line it came from, and the variable names feeding it. Use this on a suspicious line (a return, or a setter like counter=...) to learn WHY it runs and WHAT values drive it, instead of re-reading source. Arg: line = the row number from view_program.",
+	inputSchema: S({ line: num("Row number from the latest view_program output.") }, ["line"]),
+	run: tLineAssumptions,
+};
 const EDIT_PROGRAM = {
 	name: "edit_program",
 	description: "Replace line N of the latest concrete view_program listing; sync writes it to the real source origin.",
@@ -344,6 +377,9 @@ function toolsForVariant() {
 	if (VARIANT === "base") return [READ, EDIT_LINES, RUN_TESTS];
 	if (VARIANT === "graph") return [...GRAPH_TOOLS, READ, EDIT_LINES, RUN_TESTS];
 	if (VARIANT === "proj") return [VIEW, EDIT_PROGRAM, RUN_TESTS];
+	// "lens" = the minimal future-editing surface: expandable straight-line view +
+	// per-line assumptions + edit + tests. The two-tool core for the qwen validation.
+	if (VARIANT === "lens") return [VIEW_INLINE, LINE_ASSUME, EDIT_PROGRAM, RUN_TESTS];
 	throw new Error(`unknown BENCH_VARIANT=${VARIANT}`);
 }
 const TOOLS = toolsForVariant();

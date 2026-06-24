@@ -2,7 +2,9 @@
 ![tests](https://github.com/merv-gh/file-projections/actions/workflows/test.yml/badge.svg)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Stable, (optionally two-way) **projection files** that combine code concepts across
+### !!!! WORK IN PROGRESS, MIGHT NOT WORK AS EXPECTED OR BE HIGHLY NON USER-FRIENDLY !!!!
+
+Not stable, (optionally two-way) **projection files** that combine code concepts across
 many source files into a single read/edit surface.
 
 A folder tree only expresses **one** nesting of a codebase. Real questions cut across

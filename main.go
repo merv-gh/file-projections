@@ -3412,6 +3412,14 @@ type unrollLine struct {
 	line int
 }
 
+type inlineCallChoice struct {
+	ID       string `json:"id"`       // file:line of the call site
+	Name     string `json:"name"`     // called method/function name
+	Origin   string `json:"origin"`   // source_root-relative file:line
+	Expanded bool   `json:"expanded"` // currently expanded inline
+	Depth    int    `json:"depth"`    // caller nesting depth, entry body is 0
+}
+
 // AnalyzeUnrolledProgram builds an editable straight-line view of the Java path
 // selected by params.inputs. It is intentionally param-driven: callers name the
 // entry file/method and may provide concrete inputs for branch selection instead
@@ -3430,7 +3438,8 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 		return Projection{}, errors.New("unrolled-program: params.method is required")
 	}
 	u := &javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"]), seenDecision: map[string]bool{},
-		selectMode: lens.Params["branch_select"] == "1", forced: parseForcedBranches(lens.Params["branches"]), choiceSeen: map[string]bool{}}
+		selectMode: lens.Params["branch_select"] == "1", forced: parseForcedBranches(lens.Params["branches"]), choiceSeen: map[string]bool{},
+		inlineDepth: parseInlineDepth(lens.Params["inline_depth"]), inlineSkips: parseIDSet(lens.Params["inline_skips"]), callSeen: map[string]bool{}}
 	lines, err := u.unrollMethod(file, method, 0)
 	if err != nil {
 		return Projection{}, err
@@ -3467,6 +3476,11 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("choice-%d", i+1), Tool: "unrolled-program", Text: string(b)})
 		}
 	}
+	for i, c := range u.calls {
+		if b, err := json.Marshal(c); err == nil {
+			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("call-%d", i+1), Tool: "unrolled-program", Text: string(b)})
+		}
+	}
 	return p, nil
 }
 
@@ -3481,10 +3495,14 @@ type javaUnroller struct {
 	// undecidable conditional collapses to one side — forced[id] if the user toggled
 	// it, else the longest branch — and is recorded in choices so the UI can offer a
 	// per-conditional toggle. id is "file:line" of the `if`.
-	selectMode bool
-	forced     map[string]string
-	choices    []branchChoice
-	choiceSeen map[string]bool
+	selectMode  bool
+	forced      map[string]string
+	choices     []branchChoice
+	choiceSeen  map[string]bool
+	inlineDepth int
+	inlineSkips map[string]bool
+	calls       []inlineCallChoice
+	callSeen    map[string]bool
 }
 
 // branchChoice describes one undecidable conditional the UI can toggle. Sides are
@@ -3511,8 +3529,33 @@ func parseForcedBranches(s string) map[string]string {
 	return out
 }
 
+func parseInlineDepth(s string) int {
+	if strings.TrimSpace(s) == "" {
+		return 8
+	}
+	n := atoi(s)
+	if n < 0 {
+		return 0
+	}
+	if n > 10 {
+		return 10
+	}
+	return n
+}
+
+func parseIDSet(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out[part] = true
+		}
+	}
+	return out
+}
+
 func (u *javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine, error) {
-	if depth > 8 {
+	if depth > 10 {
 		return nil, fmt.Errorf("unrolled-program: recursion limit while inlining %s.%s", file, method)
 	}
 	lines, methods, err := u.readJavaMethods(file)
@@ -3636,7 +3679,7 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 			}
 			continue
 		}
-		if inlined, ok, err := u.inlineCall(file, trim, depth); err != nil {
+		if inlined, ok, err := u.inlineCall(file, trim, i+1, depth); err != nil {
 			return nil, err
 		} else if ok {
 			out = append(out, inlined...)
@@ -3645,6 +3688,16 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
 	}
 	return out, nil
+}
+
+func (u *javaUnroller) recordCall(file string, line int, name string, expanded bool, depth int) {
+	id := fmt.Sprintf("%s:%d", file, line)
+	if u.callSeen[id] {
+		return
+	}
+	u.callSeen[id] = true
+	origin := filepath.ToSlash(filepath.Join(u.lens.SourceRoot, file)) + fmt.Sprintf(":%d", line)
+	u.calls = append(u.calls, inlineCallChoice{ID: id, Name: name, Origin: origin, Expanded: expanded, Depth: depth})
 }
 
 func (u *javaUnroller) recordChoice(file string, line int, cond, side string, sides []string) {
@@ -3666,9 +3719,15 @@ func (u *javaUnroller) addDecision(file string, line int, cond, branch, why stri
 	u.decisions = append(u.decisions, msg)
 }
 
-func (u *javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, bool, error) {
+func (u *javaUnroller) inlineCall(file, trim string, line, depth int) ([]unrollLine, bool, error) {
 	if m := regexp.MustCompile(`new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
 		calleeFile := filepath.ToSlash(filepath.Join(filepath.Dir(file), m[1]+".java"))
+		id := fmt.Sprintf("%s:%d", file, line)
+		expanded := depth < u.inlineDepth && !u.inlineSkips[id]
+		u.recordCall(file, line, m[2], expanded, depth)
+		if !expanded {
+			return nil, false, nil
+		}
 		next := *u
 		next.bindArgs(calleeFile, m[2], splitArgs(m[3]))
 		lines, err := next.unrollMethod(calleeFile, m[2], depth+1)
@@ -3676,12 +3735,20 @@ func (u *javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, b
 		u.seenDecision = next.seenDecision
 		u.choices = next.choices
 		u.choiceSeen = next.choiceSeen
+		u.calls = next.calls
+		u.callSeen = next.callSeen
 		return lines, true, err
 	}
 	if m := regexp.MustCompile(`=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
 		if _, methods, err := u.readJavaMethods(file); err == nil {
 			for _, method := range methods {
 				if method.Name == m[1] {
+					id := fmt.Sprintf("%s:%d", file, line)
+					expanded := depth < u.inlineDepth && !u.inlineSkips[id]
+					u.recordCall(file, line, m[1], expanded, depth)
+					if !expanded {
+						return nil, false, nil
+					}
 					next := *u
 					next.bindArgs(file, m[1], splitArgs(m[2]))
 					lines, err := next.unrollMethod(file, m[1], depth+1)
@@ -3689,6 +3756,8 @@ func (u *javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, b
 					u.seenDecision = next.seenDecision
 					u.choices = next.choices
 					u.choiceSeen = next.choiceSeen
+					u.calls = next.calls
+					u.callSeen = next.callSeen
 					return lines, true, err
 				}
 			}
@@ -3830,9 +3899,13 @@ func evalJavaCond(cond string, env map[string]string) (bool, bool) {
 }
 
 type goUnroller struct {
-	cfg       Config
-	lens      LensConfig
-	functions map[string]goFuncRef
+	cfg         Config
+	lens        LensConfig
+	functions   map[string]goFuncRef
+	inlineDepth int
+	inlineSkips map[string]bool
+	calls       []inlineCallChoice
+	callSeen    map[string]bool
 }
 
 type goFuncRef struct {
@@ -3870,6 +3943,11 @@ func AnalyzeGoUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 		Lines: body, LineOrigins: origins, Sync: "two-way",
 	})
 	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "go adapter: editable straight-line function path; each line syncs back to its original source line"})
+	for i, c := range u.calls {
+		if b, err := json.Marshal(c); err == nil {
+			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("call-%d", i+1), Tool: "unrolled-program", Text: string(b)})
+		}
+	}
 	return p, nil
 }
 
@@ -3878,7 +3956,12 @@ func newGoUnroller(cfg Config, lens LensConfig) (*goUnroller, error) {
 	if err != nil {
 		return nil, err
 	}
-	u := &goUnroller{cfg: cfg, lens: lens, functions: map[string]goFuncRef{}}
+	u := &goUnroller{
+		cfg: cfg, lens: lens, functions: map[string]goFuncRef{},
+		inlineDepth: parseInlineDepth(lens.Params["inline_depth"]),
+		inlineSkips: parseIDSet(lens.Params["inline_skips"]),
+		callSeen:    map[string]bool{},
+	}
 	for _, f := range files {
 		rel := strings.TrimPrefix(strings.TrimPrefix(f.Rel, filepath.ToSlash(lens.SourceRoot)+"/"), "./")
 		for _, fn := range f.Funcs {
@@ -3889,7 +3972,7 @@ func newGoUnroller(cfg Config, lens LensConfig) (*goUnroller, error) {
 }
 
 func (u *goUnroller) unroll(file, name string, depth int) ([]unrollLine, error) {
-	if depth > 8 {
+	if depth > 10 {
 		return nil, fmt.Errorf("unrolled-program go: recursion limit while inlining %s", name)
 	}
 	ref, ok := u.functions[name]
@@ -3915,6 +3998,12 @@ func (u *goUnroller) unroll(file, name string, depth int) ([]unrollLine, error) 
 		}
 		if called := simpleGoCall(trim); called != "" && called != name {
 			if _, ok := u.functions[called]; ok {
+				expanded := depth < u.inlineDepth && !u.inlineSkips[fmt.Sprintf("%s:%d", ref.file, i+1)]
+				u.recordCall(ref.file, i+1, called, expanded, depth)
+				if !expanded {
+					out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: ref.file, line: i + 1})
+					continue
+				}
 				part, err := u.unroll("", called, depth+1)
 				if err != nil {
 					return nil, err
@@ -3926,6 +4015,16 @@ func (u *goUnroller) unroll(file, name string, depth int) ([]unrollLine, error) 
 		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: ref.file, line: i + 1})
 	}
 	return out, nil
+}
+
+func (u *goUnroller) recordCall(file string, line int, name string, expanded bool, depth int) {
+	id := fmt.Sprintf("%s:%d", file, line)
+	if u.callSeen[id] {
+		return
+	}
+	u.callSeen[id] = true
+	origin := filepath.ToSlash(filepath.Join(u.lens.SourceRoot, file)) + fmt.Sprintf(":%d", line)
+	u.calls = append(u.calls, inlineCallChoice{ID: id, Name: name, Origin: origin, Expanded: expanded, Depth: depth})
 }
 
 func (u *goUnroller) findGoFunc(file, name string) (goFuncRef, bool) {
@@ -5749,7 +5848,7 @@ type unrollLineView struct {
 	Branch bool   `json:"branch"` // an unresolved `if (...)` / `switch` header
 }
 
-func (s *uiServer) unrollProjection(srcRoot, file, method, inputs, branches string) (Projection, Config, Registry, error) {
+func (s *uiServer) unrollProjection(srcRoot, file, method, inputs, branches, inlineDepth, inlineSkips string) (Projection, Config, Registry, error) {
 	s.mu.Lock()
 	cfg := s.cfg
 	reg := s.registry
@@ -5769,6 +5868,12 @@ func (s *uiServer) unrollProjection(srcRoot, file, method, inputs, branches stri
 	if branches != "" {
 		lens.Params["branches"] = branches
 	}
+	if inlineDepth != "" {
+		lens.Params["inline_depth"] = inlineDepth
+	}
+	if inlineSkips != "" {
+		lens.Params["inline_skips"] = inlineSkips
+	}
 	p, err := ExecuteLens(cfg, reg, lens)
 	return p, cfg, reg, err
 }
@@ -5779,6 +5884,20 @@ func unrollChoices(p Projection) []branchChoice {
 	for _, f := range p.Facts {
 		if f.Tool == "unrolled-program" && strings.HasPrefix(f.ID, "choice-") {
 			var c branchChoice
+			if json.Unmarshal([]byte(f.Text), &c) == nil {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// unrollCalls pulls the per-call inline/collapse metadata the analyzer recorded.
+func unrollCalls(p Projection) []inlineCallChoice {
+	var out []inlineCallChoice
+	for _, f := range p.Facts {
+		if f.Tool == "unrolled-program" && strings.HasPrefix(f.ID, "call-") {
+			var c inlineCallChoice
 			if json.Unmarshal([]byte(f.Text), &c) == nil {
 				out = append(out, c)
 			}
@@ -5821,7 +5940,7 @@ func unrollDecisionFacts(p Projection) []string {
 // analyzer keeps the `if (...)` headers in place (branch discovery); with inputs it collapses
 // to the single path those inputs execute.
 func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
-	var req struct{ SourceRoot, File, Method, Inputs, Branches string }
+	var req struct{ SourceRoot, File, Method, Inputs, Branches, InlineDepth, InlineSkips string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
@@ -5830,7 +5949,7 @@ func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "file and method are required"})
 		return
 	}
-	p, _, _, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches)
+	p, _, _, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches, req.InlineDepth, req.InlineSkips)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
@@ -5843,7 +5962,7 @@ func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]any{"lines": lines, "unresolved": unresolved, "inputs": req.Inputs,
-		"decisions": unrollDecisionFacts(p), "choices": unrollChoices(p)})
+		"decisions": unrollDecisionFacts(p), "choices": unrollChoices(p), "calls": unrollCalls(p)})
 }
 
 // handleUnrollEdit applies one line edit and writes it back to that line's origin file via the
@@ -5855,9 +5974,9 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 		NewCode string
 	}
 	var req struct {
-		SourceRoot, File, Method, Inputs, Branches, NewCode string
-		Line                                                int
-		Edits                                               []uiEdit
+		SourceRoot, File, Method, Inputs, Branches, InlineDepth, InlineSkips, NewCode string
+		Line                                                                          int
+		Edits                                                                         []uiEdit
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -5870,7 +5989,7 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "no edits supplied"})
 		return
 	}
-	p, cfg, reg, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches)
+	p, cfg, reg, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches, req.InlineDepth, req.InlineSkips)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
@@ -5941,6 +6060,7 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 		"inputs":     req.Inputs,
 		"decisions":  unrollDecisionFacts(p2),
 		"choices":    unrollChoices(p2),
+		"calls":      unrollCalls(p2),
 		"synced":     fmt.Sprintf("%d → source, %d conflicts", res.ToSource, len(res.Conflicts)),
 		"conflicts":  res.Conflicts,
 		"origin":     origin,
@@ -6055,9 +6175,9 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
 .tabs button.on{background:var(--accent);color:#f9fbff}
 .banner{margin:.6rem 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;background:#fff3cd;color:#6a5118;border:1px solid #dfc46c}
 .banner.ok{background:#dfeddf;color:#265f3f;border-color:#9cc8a6}
-.unrollbody{display:grid;grid-template-columns:minmax(10rem,15rem) minmax(0,1fr);gap:.7rem;align-items:start}.unrollbody.no-choices{grid-template-columns:1fr}.unrollbody.no-choices .branchbar{display:none}
+.unrollbody{display:grid;grid-template-columns:minmax(10rem,15rem) minmax(0,1fr);gap:.7rem;align-items:start}.unrollbody.no-side{grid-template-columns:1fr}.unrollbody.no-side .branchbar{display:none}
 .branchbar{position:sticky;top:.2rem;z-index:2;display:block;background:#f5efe3;border:1px solid var(--line);border-radius:8px;padding:.55rem;max-height:calc(100vh - 12rem);overflow:auto}
-.branchbar .title{display:block;color:var(--mut);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem}.btab{border-top:1px solid var(--soft);padding:.45rem 0}.btab:first-of-type{border-top:0}.btab .where{display:block;color:var(--fg);font-size:.78rem;line-height:1.3;margin-bottom:.3rem}.bswitch{display:inline-flex;gap:.2rem;background:#e5ded1;border:1px solid var(--line);border-radius:999px;padding:.16rem}.bswitch button{padding:.16rem .45rem;border-radius:999px;background:transparent;color:var(--mut);border:0;font-size:.72rem}.bswitch button.on{background:var(--accent);color:#f9fbff}
+.branchbar .title{display:block;color:var(--mut);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin:.15rem 0 .45rem}.btab{border-top:1px solid var(--soft);padding:.45rem 0}.btab:first-of-type{border-top:0}.btab .where{display:block;color:var(--fg);font-size:.78rem;line-height:1.3;margin-bottom:.3rem}.btab .meta{display:block;color:var(--mut);font-size:.7rem;margin-bottom:.3rem}.bswitch{display:inline-flex;gap:.2rem;background:#e5ded1;border:1px solid var(--line);border-radius:999px;padding:.16rem}.bswitch button{padding:.16rem .45rem;border-radius:999px;background:transparent;color:var(--mut);border:0;font-size:.72rem}.bswitch button.on{background:var(--accent);color:#f9fbff}
 .prog{margin:0;border:1px solid var(--line);border-radius:8px;overflow:auto;background:#fbf8f0;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
 .pl{display:block;min-height:1.75rem;padding:.22rem .65rem;border-bottom:1px solid var(--soft)}
 .pl:last-child{border-bottom:0}.pl:hover{background:#f3ede2}
@@ -6088,6 +6208,10 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
     <div class=field><input id=ufile placeholder="entry file e.g. sample/App.java" autocomplete=off><div id=fileac class=ac></div></div>
     <div class=field><input id=umethod placeholder="method e.g. summary" autocomplete=off><div id=methodac class=ac></div></div>
    </div>
+   <div class=row style=margin-top:.45rem>
+    <label style="margin:0;min-width:6.8rem">inline depth <b id=uinlinelabel>0</b></label>
+    <input id=uinline type=range min=0 max=10 value=0 step=1 style=flex:1>
+   </div>
    <div class=row style=margin-top:.4rem>
     <button id=udiscover>① Discover branches</button>
     <input id=uinputs placeholder="② inputs e.g. coupon=save,amount=50" style=flex:1>
@@ -6095,7 +6219,7 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
     <button class=ghost id=usync disabled>Sync changes</button>
    </div>
    <div id=ubanner class=banner style=display:none></div>
-   <div id=unrollbody class="unrollbody no-choices">
+   <div id=unrollbody class="unrollbody no-side">
     <div id=branchbar class=branchbar></div>
     <div id=uprog class=prog></div>
    </div>
@@ -6142,7 +6266,7 @@ function presets(){var a=el("an").value;el("kvs").innerHTML="";
   if(ins[0].value==="file"&&el("ufile").value)ins[1].value=el("ufile").value;
   if(ins[0].value==="method"&&el("umethod").value)ins[1].value=el("umethod").value;});
  syncEntryParams();}
-function entryChanged(){branchState={};renderBranches({choices:[]});syncEntryParams();}
+function entryChanged(){branchState={};inlineSkipState={};renderRail({choices:[],calls:[]});syncEntryParams();}
 
 fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
@@ -6223,17 +6347,47 @@ el("tunroll").onclick=function(){tab("unroll")};el("tprev").onclick=function(){t
 
 // ---- Fix (unroll): discover branches -> choose inputs -> edit (two-way sync) ----
 var branchState={};
+var inlineSkipState={};
 var originalLines={},dirtyLines={};
 function branchString(){var out=[];Object.keys(branchState).sort().forEach(function(k){if(branchState[k])out.push(k+"="+branchState[k])});return out.join(",");}
 function parseBranchString(s){branchState={};(s||"").split(",").forEach(function(p){var i=p.indexOf("=");if(i>0)branchState[p.slice(0,i)]=p.slice(i+1);});}
-function ufields(){return {SourceRoot:el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value,Branches:branchString()};}
+function inlineSkipString(){return Object.keys(inlineSkipState).filter(function(k){return inlineSkipState[k]}).sort().join(",");}
+function parseInlineSkipString(s){inlineSkipState={};(s||"").split(",").forEach(function(p){p=p.trim();if(p)inlineSkipState[p]=true;});}
+function inlineDepth(){return parseInt(el("uinline").value||"0",10);}
+function updateInlineLabel(){el("uinlinelabel").textContent=String(inlineDepth());}
+function ufields(){return {SourceRoot:el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value,Branches:branchString(),InlineDepth:String(inlineDepth()),InlineSkips:inlineSkipString()};}
 function sideLabel(side){return side==="then"?"true":"false";}
 function sideTitle(side){return side==="then"?"show true branch":"show false branch";}
-function renderBranches(d){
- var choices=d.choices||[],bar=el("branchbar"),body=el("unrollbody");bar.innerHTML="";
- body.classList.toggle("no-choices",!choices.length);
- if(!choices.length)return;
- bar.innerHTML="<span class=title>assumptions</span>";
+function callDepthLabel(c){return "level "+(c.depth+1)+" · "+(c.origin||c.id).split("/").pop();}
+function renderRail(d){
+ var choices=d.choices||[],calls=d.calls||[],bar=el("branchbar"),body=el("unrollbody");bar.innerHTML="";
+ body.classList.toggle("no-side",!choices.length&&!calls.length);
+ if(!choices.length&&!calls.length)return;
+ if(calls.length){
+  bar.innerHTML+="<span class=title>calls</span>";
+  calls.forEach(function(c){
+   var tab=document.createElement("div");tab.className="btab";
+   var label=document.createElement("span");label.className="where";label.textContent=c.name||c.id;tab.appendChild(label);
+   var meta=document.createElement("span");meta.className="meta";meta.textContent=callDepthLabel(c);tab.appendChild(meta);
+   var sw=document.createElement("span");sw.className="bswitch";
+   ["source","inline"].forEach(function(mode){
+    var b=document.createElement("button");b.textContent=mode;
+    var on=(mode==="inline")?c.expanded:!c.expanded;b.className=on?"on":"";
+    b.onclick=function(){
+     if(mode==="inline"){
+      delete inlineSkipState[c.id];
+      if(inlineDepth()<=c.depth){el("uinline").value=String(Math.min(10,c.depth+1));updateInlineLabel();}
+     }else inlineSkipState[c.id]=true;
+     discover(el("uinputs").value);
+    };
+    sw.appendChild(b);
+   });
+   tab.appendChild(sw);bar.appendChild(tab);
+  });
+ }
+ if(choices.length){
+  var title=document.createElement("span");title.className="title";title.textContent="assumptions";bar.appendChild(title);
+ }
  choices.forEach(function(c,idx){
   if(!branchState[c.id])branchState[c.id]=c.side;
   var tab=document.createElement("div");tab.className="btab";
@@ -6262,7 +6416,7 @@ function markDirty(row,line,code){
  el("usync").textContent=n?"Sync "+n+" change"+(n===1?"":"s"):"Sync changes";
 }
 function renderProg(d){
- renderBranches(d);
+ renderRail(d);
  resetDirty();
  originalLines={};
  var prog=el("uprog");prog.innerHTML="";
@@ -6299,6 +6453,9 @@ function discover(inputs){
 el("udiscover").onclick=function(){discover("")};
 el("uapply").onclick=function(){discover(el("uinputs").value)};
 el("uinputs").addEventListener("keydown",function(e){if(e.key==="Enter")discover(el("uinputs").value)});
+updateInlineLabel();
+el("uinline").addEventListener("input",updateInlineLabel);
+el("uinline").addEventListener("change",function(){if(el("ufile").value&&el("umethod").value)discover(el("uinputs").value)});
 function saveEdits(edits){
  if(!edits.length)return Promise.resolve();
  el("ustatus").textContent="syncing…";var body=ufields();body.Edits=edits;
@@ -6326,6 +6483,8 @@ el("usync").onclick=function(){
   if(q.get("file"))el("ufile").value=q.get("file");
   if(q.get("method"))el("umethod").value=q.get("method");
   if(q.get("branches"))parseBranchString(q.get("branches"));
+  if(q.get("inline_depth")){el("uinline").value=q.get("inline_depth");updateInlineLabel();}
+  if(q.get("inline_skips"))parseInlineSkipString(q.get("inline_skips"));
   var inputs=q.get("inputs")||"";if(inputs)el("uinputs").value=inputs;
   var d=q.get("do");
   if(d==="discover")discover("");

@@ -848,6 +848,83 @@ public class App {
 	}
 }
 
+func TestUnrolledProgramInlineDepthAndCallSkips(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src/main/java/sample")
+	write(t, filepath.Join(src, "App.java"), `package sample;
+
+public class App {
+    public String summary() {
+        String v = helper();
+        return v;
+    }
+
+    public String helper() {
+        String v = leaf();
+        return v;
+    }
+
+    public String leaf() {
+        return "done";
+    }
+}
+`)
+	cfg := Config{Root: dir, ProjectionsDir: ".projections"}
+	base := LensConfig{
+		Name:       "unrolled",
+		Analyzer:   "unrolled-program",
+		SourceRoot: "src/main/java",
+		Params: map[string]string{
+			"file":   "sample/App.java",
+			"method": "summary",
+		},
+	}
+	run := func(depth string, skips string) (Projection, string) {
+		lens := base
+		lens.Params = map[string]string{}
+		for k, v := range base.Params {
+			lens.Params[k] = v
+		}
+		lens.Params["inline_depth"] = depth
+		if skips != "" {
+			lens.Params["inline_skips"] = skips
+		}
+		p, err := ExecuteLens(cfg, DefaultRegistry(), lens)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p, projectionBody(p)
+	}
+
+	p0, body0 := run("0", "")
+	if !strings.Contains(body0, "String v = helper();") || strings.Contains(body0, "String v = leaf();") {
+		t.Fatalf("depth 0 should keep direct call collapsed:\n%s", body0)
+	}
+	calls := unrollCalls(p0)
+	if len(calls) != 1 || calls[0].ID != "sample/App.java:5" || calls[0].Expanded {
+		t.Fatalf("depth 0 calls=%#v", calls)
+	}
+
+	p1, body1 := run("1", "")
+	if !strings.Contains(body1, "String v = leaf();") || strings.Contains(body1, `return "done";`) {
+		t.Fatalf("depth 1 should inline helper but not leaf:\n%s", body1)
+	}
+	calls = unrollCalls(p1)
+	if len(calls) != 2 || !calls[0].Expanded || calls[1].Expanded {
+		t.Fatalf("depth 1 calls=%#v", calls)
+	}
+
+	_, body2 := run("2", "")
+	if !strings.Contains(body2, `return "done";`) || strings.Contains(body2, "String v = leaf();") {
+		t.Fatalf("depth 2 should inline nested leaf:\n%s", body2)
+	}
+
+	_, skipped := run("2", "sample/App.java:5")
+	if !strings.Contains(skipped, "String v = helper();") || strings.Contains(skipped, `return "done";`) {
+		t.Fatalf("inline_skips should roll helper back to source call:\n%s", skipped)
+	}
+}
+
 func TestUnrolledProgramGoAdapterSyncsHelperLine(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")

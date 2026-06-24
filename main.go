@@ -5562,8 +5562,37 @@ type uiDefaults struct {
 	SourceRoot  string `json:"source_root"`
 	EntryFile   string `json:"entry_file"`
 	EntryMethod string `json:"entry_method"`
+	EntryLine   int    `json:"entry_line"`
 	Language    string `json:"language"`
 	Analyzer    string `json:"analyzer"`
+	// Real-repo examples so each lens is prefilled and runnable on first click.
+	ExampleVar  string `json:"example_var"`
+	ExampleType string `json:"example_type"`
+}
+
+// uiAnalyzerLanguages maps each analyzer to the languages it can meaningfully run
+// on, so the UI hides lenses that don't apply to the detected language. "any"
+// means language-agnostic (text/data lenses).
+func uiAnalyzerLanguages() map[string][]string {
+	return map[string][]string{
+		"control-flow":      {"java"},
+		"data-flow":         {"java"},
+		"object-flow":       {"java"},
+		"unrolled-program":  {"java"},
+		"entry-to-exit":     {"java"},
+		"cpg-methods":       {"java"},
+		"joern-var-flow":    {"java"},
+		"entrypoints":       {"java"},
+		"exitpoints":        {"java"},
+		"flow":              {"java"},
+		"java-post-to-save": {"java"},
+		"go-symbols":        {"go"},
+		"js-events":         {"js"},
+		"jsonl":             {"any"},
+		"bookmark":          {"java", "go", "js"},
+		"extract":           {"java", "go", "js"},
+		"ast-grep":          {"java", "go", "js"},
+	}
 }
 
 func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
@@ -5583,6 +5612,9 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/preview", s.handlePreview)
 	mux.HandleFunc("/api/symbols", s.handleSymbols)
+	mux.HandleFunc("/api/vars", s.handleVars)
+	mux.HandleFunc("/api/dirs", s.handleDirs)
+	mux.HandleFunc("/api/detect", s.handleDetect)
 	mux.HandleFunc("/api/unroll", s.handleUnroll)
 	mux.HandleFunc("/api/unroll/edit", s.handleUnrollEdit)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
@@ -5633,11 +5665,105 @@ func (s *uiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(analyzers)
 	writeJSON(w, 200, map[string]any{
-		"config":    json.RawMessage(raw),
-		"analyzers": analyzers,
-		"path":      s.configPath,
-		"defaults":  def,
+		"config":        json.RawMessage(raw),
+		"analyzers":     analyzers,
+		"applicability": uiAnalyzerLanguages(),
+		"path":          s.configPath,
+		"defaults":      def,
 	})
+}
+
+// handleDetect re-detects the dominant language under a given source root so the UI
+// can re-filter analyzers and re-prefill examples when the user changes the root.
+func (s *uiServer) handleDetect(w http.ResponseWriter, r *http.Request) {
+	root := r.URL.Query().Get("root")
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	if root != "" {
+		cfg.Root = filepath.Join(cfg.Root, root)
+	}
+	def := suggestUIDefaults(cfg)
+	if root != "" {
+		// suggestUIDefaults picked a nested source root (e.g. "sample") under the
+		// chosen root and reported entry_file relative to it. Re-base entry_file to
+		// the chosen root so it matches the source_root the UI actually uses.
+		if def.SourceRoot != "" && def.SourceRoot != "." && def.EntryFile != "" {
+			def.EntryFile = filepath.ToSlash(filepath.Join(def.SourceRoot, def.EntryFile))
+		}
+		def.SourceRoot = root // keep the user's chosen root; defaults re-scanned under it
+	}
+	writeJSON(w, 200, map[string]any{"language": def.Language, "defaults": def})
+}
+
+// handleDirs lists immediate subdirectories of a path (relative to cfg.Root) so the
+// source_root "Change" button can browse instead of forcing the user to type a path.
+func (s *uiServer) handleDirs(w http.ResponseWriter, r *http.Request) {
+	rel := r.URL.Query().Get("path")
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	base := filepath.Join(cfg.Root, rel)
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "target" {
+			continue
+		}
+		dirs = append(dirs, name)
+	}
+	sort.Strings(dirs)
+	writeJSON(w, 200, map[string]any{"path": filepath.ToSlash(rel), "dirs": dirs})
+}
+
+// handleVars returns identifier names declared in a file (locals, params, fields) so
+// the data-flow/joern-var-flow `var` param is autosuggestable instead of copy-pasted.
+func (s *uiServer) handleVars(w http.ResponseWriter, r *http.Request) {
+	root := r.URL.Query().Get("root")
+	file := r.URL.Query().Get("file")
+	q := strings.ToLower(r.URL.Query().Get("q"))
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	if file == "" {
+		writeJSON(w, 200, map[string]any{"vars": []string{}})
+		return
+	}
+	lines, err := readLines(filepath.Join(cfg.Root, root, file))
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	seen := map[string]bool{}
+	var vars []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		if q != "" && !strings.Contains(strings.ToLower(name), q) {
+			return
+		}
+		seen[name] = true
+		vars = append(vars, name)
+	}
+	declRE := []*regexp.Regexp{uiJavaLocalRE, uiGoLocalRE, regexp.MustCompile(`\b([a-z][A-Za-z0-9_]*)\s*=[^=]`)}
+	for _, l := range lines {
+		for _, re := range declRE {
+			if m := re.FindStringSubmatch(l); m != nil {
+				add(m[1])
+			}
+		}
+	}
+	sort.Strings(vars)
+	writeJSON(w, 200, map[string]any{"vars": vars})
 }
 
 func suggestUIDefaults(cfg Config) uiDefaults {
@@ -5652,7 +5778,11 @@ func suggestUIDefaults(cfg Config) uiDefaults {
 	if def.SourceRoot == "" {
 		def.SourceRoot = "."
 	}
-	def.EntryFile, def.EntryMethod = suggestUIMethod(cfg, def.SourceRoot, lang)
+	def.EntryFile, def.EntryMethod, def.EntryLine = suggestUIMethod(cfg, def.SourceRoot, lang)
+	def.ExampleVar, def.ExampleType = suggestUIExamples(cfg, def.SourceRoot, def.EntryFile, lang)
+	if def.EntryLine == 0 {
+		def.EntryLine = 1
+	}
 	switch lang {
 	case "go":
 		def.Analyzer = "go-symbols"
@@ -5664,7 +5794,7 @@ func suggestUIDefaults(cfg Config) uiDefaults {
 	return def
 }
 
-func suggestUIMethod(cfg Config, sourceRoot, lang string) (file, method string) {
+func suggestUIMethod(cfg Config, sourceRoot, lang string) (file, method string, line int) {
 	base := filepath.Join(cfg.Root, sourceRoot)
 	type cand struct {
 		file   string
@@ -5745,9 +5875,41 @@ func suggestUIMethod(cfg Config, sourceRoot, lang string) (file, method string) 
 		return cands[i].score > cands[j].score
 	})
 	if len(cands) == 0 {
+		return "", "", 0
+	}
+	return cands[0].file, cands[0].method, cands[0].line
+}
+
+// suggestUIExamples picks a real line/var/type from the entry file so lenses that
+// need file+line/var/type are prefilled with something that actually exists.
+var uiJavaLocalRE = regexp.MustCompile(`^\s*(?:final\s+)?[A-Z][A-Za-z0-9_<>\[\].]*\s+([a-z][A-Za-z0-9_]*)\s*=`)
+var uiGoLocalRE = regexp.MustCompile(`^\s*([a-z][A-Za-z0-9_]*)\s*:?=`)
+
+func suggestUIExamples(cfg Config, sourceRoot, entryFile, lang string) (varName, typeName string) {
+	if entryFile == "" {
 		return "", ""
 	}
-	return cands[0].file, cands[0].method
+	lines, err := readLines(filepath.Join(cfg.Root, sourceRoot, entryFile))
+	if err != nil {
+		return "", ""
+	}
+	localRE := uiJavaLocalRE
+	if lang == "go" {
+		localRE = uiGoLocalRE
+	}
+	for _, l := range lines {
+		if varName == "" {
+			if m := localRE.FindStringSubmatch(l); m != nil {
+				varName = m[1]
+			}
+		}
+		if typeName == "" {
+			if m := uiJavaClassRE.FindStringSubmatch(l); m != nil {
+				typeName = m[2]
+			}
+		}
+	}
+	return varName, typeName
 }
 
 // handlePreview runs a single ad-hoc lens and returns the rendered projection
@@ -6143,363 +6305,5 @@ func collectSymbols(cfg Config, root, q string, limit int) ([]uiSymbol, error) {
 	return out, err
 }
 
-const uiHTML = `<!doctype html><html><head><meta charset=utf-8>
-<title>file-projections · lens studio</title>
-<style>
-:root{--bg:#ebe7dd;--panel:#f4f0e8;--soft:#e2ddd2;--line:#cec6b8;--fg:#25231f;--mut:#746b5d;--accent:#3f6f9f;--ok:#24784f;--bad:#b54848}
-*{box-sizing:border-box}body{margin:0;font:13px/1.5 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
-header{padding:.7rem 1rem;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:.6rem}
-header b{font-size:1.05rem}header span{color:var(--mut);font-size:.8rem}
-.wrap{display:grid;grid-template-columns:340px 1fr;gap:0;height:calc(100vh - 49px)}
-.wrap.left-collapsed{grid-template-columns:0 1fr}.wrap.left-collapsed .col.left{padding:0;border-right:0;overflow:hidden}
-.col{overflow:auto;padding:1rem}.col.left{border-right:1px solid var(--line);background:var(--panel);transition:padding .15s ease}
-h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:1.2rem 0 .5rem}
-h2:first-child{margin-top:0}
-label{display:block;color:var(--mut);font-size:.72rem;margin:.5rem 0 .15rem}
-input,select,textarea{width:100%;background:#fbf8f0;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:.4rem .5rem;font:inherit}
-textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical}
-button{background:var(--accent);color:#f9fbff;border:0;border-radius:6px;padding:.45rem .8rem;font-weight:600;cursor:pointer}
-button:disabled{opacity:.5;cursor:default}
-button.ghost{background:#e7e1d6;color:var(--fg);border:1px solid var(--line)}
-button.icon{width:2rem;height:2rem;padding:0;display:inline-grid;place-items:center;font-size:1rem}
-.row{display:flex;gap:.4rem;align-items:center}.row input{flex:1}
-.kv{display:grid;grid-template-columns:1fr 1.4fr auto;gap:.3rem;margin:.2rem 0}
-.entrygrid{display:grid;grid-template-columns:1.5fr 1fr;gap:.4rem}.field{position:relative}
-.ac{display:none;position:absolute;z-index:5;left:0;right:0;top:calc(100% + 3px);max-height:16rem;overflow:auto;background:#fbf8f0;border:1px solid var(--line);border-radius:6px;box-shadow:0 10px 24px rgba(73,62,43,.18)}
-.acitem{padding:.36rem .5rem;border-bottom:1px solid var(--soft);cursor:pointer}.acitem:last-child{border-bottom:0}.acitem:hover,.acitem.on{background:#ece5d8}.acitem b{color:var(--fg);font-weight:600}.acitem span{display:block;color:var(--mut);font-size:.72rem}
-pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7rem;overflow:auto;white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:60vh}
-.sym{padding:.3rem .45rem;border-bottom:1px solid var(--line);cursor:pointer;display:flex;justify-content:space-between;gap:.5rem}
-.sym:hover{background:#ece5d8}.sym .k{color:var(--accent);font-size:.7rem}.sym .f{color:var(--mut);font-size:.72rem}
-.note{color:var(--mut);font-size:.74rem;margin:.3rem 0}.err{color:var(--bad)}.ok{color:var(--ok)}
-.tabs{display:flex;gap:.3rem;margin-bottom:.6rem}.tabs button{background:#e7e1d6;color:var(--fg);border:1px solid var(--line);font-weight:500}
-.tabs button.on{background:var(--accent);color:#f9fbff}
-.banner{margin:.6rem 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;background:#fff3cd;color:#6a5118;border:1px solid #dfc46c}
-.banner.ok{background:#dfeddf;color:#265f3f;border-color:#9cc8a6}
-.unrollbody{display:grid;grid-template-columns:minmax(10rem,15rem) minmax(0,1fr);gap:.7rem;align-items:start}.unrollbody.no-side{grid-template-columns:1fr}.unrollbody.no-side .branchbar{display:none}
-.branchbar{position:sticky;top:.2rem;z-index:2;display:block;background:#f5efe3;border:1px solid var(--line);border-radius:8px;padding:.55rem;max-height:calc(100vh - 12rem);overflow:auto}
-.branchbar .title{display:block;color:var(--mut);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin:.15rem 0 .45rem}.btab{border-top:1px solid var(--soft);padding:.45rem 0}.btab:first-of-type{border-top:0}.btab .where{display:block;color:var(--fg);font-size:.78rem;line-height:1.3;margin-bottom:.3rem}.btab .meta{display:block;color:var(--mut);font-size:.7rem;margin-bottom:.3rem}.bswitch{display:inline-flex;gap:.2rem;background:#e5ded1;border:1px solid var(--line);border-radius:999px;padding:.16rem}.bswitch button{padding:.16rem .45rem;border-radius:999px;background:transparent;color:var(--mut);border:0;font-size:.72rem}.bswitch button.on{background:var(--accent);color:#f9fbff}
-.prog{margin:0;border:1px solid var(--line);border-radius:8px;overflow:auto;background:#fbf8f0;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
-.pl{display:block;min-height:1.75rem;padding:.22rem .65rem;border-bottom:1px solid var(--soft)}
-.pl:last-child{border-bottom:0}.pl:hover{background:#f3ede2}
-.pl .code{display:block;white-space:pre;outline:0;tab-size:4;min-height:1.25rem}
-.pl .code:focus{background:#fffaf0;box-shadow:inset 2px 0 0 var(--accent)}
-.pl.dirty{background:#fff6dc}.pl.flash{animation:flash 1.1s ease-out}
-@keyframes flash{from{background:#d9eddc}to{background:transparent}}
-</style></head><body>
-<header><button class="ghost icon" id=toggleLeft title="Toggle tools">☰</button><b>file-projections</b><span id=cfgpath></span><span style=margin-left:auto id=msg></span></header>
-<div class=wrap id=wrap>
- <div class="col left">
-  <h2>Preview a lens</h2>
-  <label>analyzer</label><select id=an></select>
-  <label>source_root</label><input id=sr placeholder="src/main/java">
-  <div id=kvs></div>
-  <div class=row style=margin-top:.4rem><button class=ghost id=addkv>+ param</button><button id=run>Preview ▶</button></div>
-  <p class=note>Params depend on the lens: control-flow/data-flow want <code>file,line</code>; data-flow also <code>var</code>; object-flow <code>type</code>; unrolled-program <code>file,method,inputs</code>; entrypoints <code>patterns</code>; exitpoints <code>sinks</code>.</p>
-
-  <h2>Search symbols</h2>
-  <div class=row><input id=sq placeholder="name… (uses source_root above)"><button class=ghost id=sgo>Find</button></div>
-  <div id=syms></div>
- </div>
- <div class=col>
-  <div class=tabs><button class=on id=tunroll>Fix (unroll)</button><button id=tprev>Preview</button><button id=tcfg>config.json</button></div>
-  <div id=unrollpane>
-   <p class=note>Flatten a method's cross-file, branched execution into one straight-line program, then edit a line — the change syncs back to the real source file it came from. Workflow: <b>1) discover branches → 2) choose inputs → 3) edit</b>.</p>
-   <div class=entrygrid>
-    <div class=field><input id=ufile placeholder="entry file e.g. sample/App.java" autocomplete=off><div id=fileac class=ac></div></div>
-    <div class=field><input id=umethod placeholder="method e.g. summary" autocomplete=off><div id=methodac class=ac></div></div>
-   </div>
-   <div class=row style=margin-top:.45rem>
-    <label style="margin:0;min-width:6.8rem">inline depth <b id=uinlinelabel>0</b></label>
-    <input id=uinline type=range min=0 max=10 value=0 step=1 style=flex:1>
-   </div>
-   <div class=row style=margin-top:.4rem>
-    <button id=udiscover>① Discover branches</button>
-    <input id=uinputs placeholder="② inputs e.g. coupon=save,amount=50" style=flex:1>
-    <button class=ghost id=uapply>Apply inputs</button>
-    <button class=ghost id=usync disabled>Sync changes</button>
-   </div>
-   <div id=ubanner class=banner style=display:none></div>
-   <div id=unrollbody class="unrollbody no-side">
-    <div id=branchbar class=branchbar></div>
-    <div id=uprog class=prog></div>
-   </div>
-   <div class=note id=ustatus></div>
-  </div>
-  <div id=prevpane style=display:none><pre id=out>Pick an analyzer + source_root, then Preview.</pre><div id=extra></div></div>
-  <div id=cfgpane style=display:none>
-   <textarea id=cfg rows=28></textarea>
-   <div class=row style=margin-top:.5rem><button id=savecfg>Save config.json</button><span class=note id=cfgmsg></span></div>
-  </div>
- </div>
-</div>
-<script>
-var msg=document.getElementById("msg");
-function flash(t,bad){msg.textContent=t;msg.className=bad?"err":"ok";setTimeout(function(){msg.textContent=""},2500);}
-function el(id){return document.getElementById(id);}
-function esc(s){return String(s||"").replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]})}
-function addKv(k,v){var d=document.createElement("div");d.className="kv";
- d.innerHTML='<input placeholder=key><input placeholder=value><button class=ghost>×</button>';
- var ins=d.querySelectorAll("input");ins[0].value=k||"";ins[1].value=v||"";
- d.querySelector("button").onclick=function(){d.remove()};el("kvs").appendChild(d);}
-function params(){var o={};el("kvs").querySelectorAll(".kv").forEach(function(d){
- var ins=d.querySelectorAll("input");if(ins[0].value)o[ins[0].value]=ins[1].value;});return o;}
-function setParam(key,val){var done=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
- var ins=d.querySelectorAll("input");if(ins[0].value===key){ins[1].value=val;done=true}});
- if(!done)addKv(key,val);}
-function hasParam(key){var hit=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
- if(d.querySelectorAll("input")[0].value===key)hit=true});return hit;}
-var PRESETS={"control-flow":[["file",""],["line",""]],"data-flow":[["file",""],["line",""],["var",""]],
-  "object-flow":[["type",""],["mode","joern"]],"unrolled-program":[["file",""],["method",""],["inputs",""]],
-  "cpg-methods":[["file",""],["method",""]],"go-symbols":[],
-  "entrypoints":[["patterns","http-mapping=@(Get|Post)Mapping"]],"exitpoints":[["sinks","*repository*.save,*kafka*.send"]],
-  "flow":[["entry","@PostMapping"],["sink","\\.save\\("]],"bookmark":[["file",""],["lines",""]],
-  "joern-var-flow":[["file",""],["var",""],["mode","joern"]]};
-function syncEntryParams(){
- if(el("ufile").value&&hasParam("file"))setParam("file",el("ufile").value);
- if(el("umethod").value&&hasParam("method"))setParam("method",el("umethod").value);
- var p=params();
- if("inputs" in p)setParam("inputs",el("uinputs").value);
-}
-function presets(){var a=el("an").value;el("kvs").innerHTML="";
- (PRESETS[a]||[]).forEach(function(p){addKv(p[0],p[1])});
- el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");
-  if(ins[0].value==="file"&&el("ufile").value)ins[1].value=el("ufile").value;
-  if(ins[0].value==="method"&&el("umethod").value)ins[1].value=el("umethod").value;});
- syncEntryParams();}
-function entryChanged(){branchState={};inlineSkipState={};renderRail({choices:[],calls:[]});syncEntryParams();}
-
-fetch("/api/config").then(function(r){return r.json()}).then(function(d){
- el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
- var s=el("an");(d.analyzers||[]).forEach(function(a){var o=document.createElement("option");o.value=o.textContent=a;s.appendChild(o)});
- var df=d.defaults||{};
- if(df.analyzer && Array.from(s.options).some(function(o){return o.value===df.analyzer}))s.value=df.analyzer;
- else s.value="control-flow";
- presets();
- if(df.source_root){el("sr").value=df.source_root;}
- if(df.entry_file)el("ufile").value=df.entry_file;
- if(df.entry_method)el("umethod").value=df.entry_method;
- syncEntryParams();
- search();
-});
-el("an").onchange=function(){presets();flash("params reset for "+el("an").value)};el("addkv").onclick=function(){addKv("","")};
-el("toggleLeft").onclick=function(){el("wrap").classList.toggle("left-collapsed")};
-
-el("run").onclick=function(){
- el("out").textContent="running "+el("an").value+"…";el("extra").innerHTML="";
- fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({analyzer:el("an").value,source_root:el("sr").value,params:params()})})
- .then(function(r){return r.json()}).then(function(d){
-  if(d.error){el("out").textContent="error: "+d.error;el("out").classList.add("err");return;}
-  el("out").classList.remove("err");
-  el("out").textContent=(d.body||"(empty projection)")+"\n— "+d.blocks+" blocks · "+d.facts+" facts · "+d.sync;
-  if(d.extra&&d.extra.length){var h="";d.extra.forEach(function(e){
-   h+="<h2>"+e.path+"</h2><pre>"+e.body.replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})+"</pre>";});
-   el("extra").innerHTML=h;}
- }).catch(function(e){el("out").textContent=String(e)});};
-
-function search(){var q=el("sq").value;el("syms").textContent="…";
- fetch("/api/symbols?root="+encodeURIComponent(el("sr").value)+"&q="+encodeURIComponent(q))
- .then(function(r){return r.json()}).then(function(d){
-  if(d.error){el("syms").innerHTML="<p class=err>"+d.error+"</p>";return;}
-  var h="";(d.symbols||[]).slice(0,150).forEach(function(s){
-   h+="<div class=sym data-f='"+s.file+"' data-l='"+s.line+"' data-n='"+s.name+"' data-k='"+s.kind+"'>"
-     +"<span><span class=k>"+s.kind+"</span> "+s.name+"</span><span class=f>"+s.file+":"+s.line+"</span></div>";});
-  el("syms").innerHTML=h||"<p class=note>no matches</p>";
-  el("syms").querySelectorAll(".sym").forEach(function(n){n.onclick=function(){
-   var k=n.dataset.k,f=n.dataset.f,l=n.dataset.l;
-   if(k==="file"){setParam("file",f);el("ufile").value=f;entryChanged();}
-   else if(k==="class"||k==="interface"||k==="enum"||k==="record"){setParam("type",n.dataset.n)}
-   else if(k==="method"||k==="func"){setParam("method",n.dataset.n);el("umethod").value=n.dataset.n;entryChanged();}
-   setParam("file",f);if(hasParam("line"))setParam("line",l);
-   el("ufile").value=f;
-   flash("filled "+f+":"+l);};});
- });}
-el("sgo").onclick=search;el("sq").addEventListener("keydown",function(e){if(e.key==="Enter")search()});
-var stimer=null;el("sq").addEventListener("input",function(){clearTimeout(stimer);stimer=setTimeout(search,180)});
-el("sr").addEventListener("input",function(){clearTimeout(stimer);stimer=setTimeout(search,220)});
-function fetchSymbols(q,cb){
- fetch("/api/symbols?root="+encodeURIComponent(el("sr").value)+"&q="+encodeURIComponent(q||""))
-  .then(function(r){return r.json()}).then(function(d){cb(d.symbols||[])}).catch(function(){cb([])});
-}
-function showAC(inputID,boxID,filter,pick){
- var input=el(inputID),box=el(boxID);
- fetchSymbols(input.value,function(items){
-  items=items.filter(filter).slice(0,40);
-  if(!items.length){box.style.display="none";box.innerHTML="";return;}
-  box.innerHTML=items.map(function(s,i){return "<div class=acitem data-i='"+i+"'><b>"+esc(s.name)+"</b><span>"+esc(s.kind+" · "+s.file+":"+s.line)+"</span></div>"}).join("");
-  box.style.display="block";
-  box.querySelectorAll(".acitem").forEach(function(n){n.onclick=function(e){e.stopPropagation();pick(items[parseInt(n.dataset.i)]);box.style.display="none";}});
- });
-}
-var actimer=null;
-function queueFileAC(){clearTimeout(actimer);actimer=setTimeout(function(){showAC("ufile","fileac",function(s){return s.kind==="file"},function(s){el("ufile").value=s.file;setParam("file",s.file);entryChanged();});},120)}
-function queueMethodAC(){clearTimeout(actimer);actimer=setTimeout(function(){var f=el("ufile").value;showAC("umethod","methodac",function(s){return (s.kind==="method"||s.kind==="func")&&(!f||s.file===f)},function(s){el("umethod").value=s.name;setParam("method",s.name);if(!el("ufile").value){el("ufile").value=s.file;setParam("file",s.file)}entryChanged();});},120)}
-el("ufile").addEventListener("input",function(){entryChanged();queueFileAC()});
-el("ufile").addEventListener("focus",queueFileAC);
-el("umethod").addEventListener("input",function(){entryChanged();queueMethodAC()});
-el("umethod").addEventListener("focus",queueMethodAC);
-el("uinputs").addEventListener("input",syncEntryParams);
-document.addEventListener("click",function(e){if(!e.target.closest(".field")){el("fileac").style.display="none";el("methodac").style.display="none";}});
-
-var PANES={unroll:["tunroll","unrollpane"],prev:["tprev","prevpane"],cfg:["tcfg","cfgpane"]};
-function tab(name){for(var k in PANES){var on=k===name;el(PANES[k][0]).classList.toggle("on",on);el(PANES[k][1]).style.display=on?"":"none";}}
-el("tunroll").onclick=function(){tab("unroll")};el("tprev").onclick=function(){tab("prev")};el("tcfg").onclick=function(){tab("cfg")};
-
-// ---- Fix (unroll): discover branches -> choose inputs -> edit (two-way sync) ----
-var branchState={};
-var inlineSkipState={};
-var originalLines={},dirtyLines={};
-function branchString(){var out=[];Object.keys(branchState).sort().forEach(function(k){if(branchState[k])out.push(k+"="+branchState[k])});return out.join(",");}
-function parseBranchString(s){branchState={};(s||"").split(",").forEach(function(p){var i=p.indexOf("=");if(i>0)branchState[p.slice(0,i)]=p.slice(i+1);});}
-function inlineSkipString(){return Object.keys(inlineSkipState).filter(function(k){return inlineSkipState[k]}).sort().join(",");}
-function parseInlineSkipString(s){inlineSkipState={};(s||"").split(",").forEach(function(p){p=p.trim();if(p)inlineSkipState[p]=true;});}
-function inlineDepth(){return parseInt(el("uinline").value||"0",10);}
-function updateInlineLabel(){el("uinlinelabel").textContent=String(inlineDepth());}
-function ufields(){return {SourceRoot:el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value,Branches:branchString(),InlineDepth:String(inlineDepth()),InlineSkips:inlineSkipString()};}
-function sideLabel(side){return side==="then"?"true":"false";}
-function sideTitle(side){return side==="then"?"show true branch":"show false branch";}
-function callDepthLabel(c){return "level "+(c.depth+1)+" · "+(c.origin||c.id).split("/").pop();}
-function renderRail(d){
- var choices=d.choices||[],calls=d.calls||[],bar=el("branchbar"),body=el("unrollbody");bar.innerHTML="";
- body.classList.toggle("no-side",!choices.length&&!calls.length);
- if(!choices.length&&!calls.length)return;
- if(calls.length){
-  bar.innerHTML+="<span class=title>calls</span>";
-  calls.forEach(function(c){
-   var tab=document.createElement("div");tab.className="btab";
-   var label=document.createElement("span");label.className="where";label.textContent=c.name||c.id;tab.appendChild(label);
-   var meta=document.createElement("span");meta.className="meta";meta.textContent=callDepthLabel(c);tab.appendChild(meta);
-   var sw=document.createElement("span");sw.className="bswitch";
-   ["source","inline"].forEach(function(mode){
-    var b=document.createElement("button");b.textContent=mode;
-    var on=(mode==="inline")?c.expanded:!c.expanded;b.className=on?"on":"";
-    b.onclick=function(){
-     if(mode==="inline"){
-      delete inlineSkipState[c.id];
-      if(inlineDepth()<=c.depth){el("uinline").value=String(Math.min(10,c.depth+1));updateInlineLabel();}
-     }else inlineSkipState[c.id]=true;
-     discover(el("uinputs").value);
-    };
-    sw.appendChild(b);
-   });
-   tab.appendChild(sw);bar.appendChild(tab);
-  });
- }
- if(choices.length){
-  var title=document.createElement("span");title.className="title";title.textContent="assumptions";bar.appendChild(title);
- }
- choices.forEach(function(c,idx){
-  if(!branchState[c.id])branchState[c.id]=c.side;
-  var tab=document.createElement("div");tab.className="btab";
-  var label=document.createElement("span");label.className="where";label.textContent=c.cond||("branch "+(idx+1));tab.appendChild(label);
-  var sw=document.createElement("span");sw.className="bswitch";
-  (c.sides||[]).forEach(function(side){
-   var b=document.createElement("button");b.textContent=sideLabel(side);b.title=sideTitle(side);b.className=branchState[c.id]===side?"on":"";
-   b.onclick=function(){branchState[c.id]=side;discover(el("uinputs").value);};
-   sw.appendChild(b);
-  });
-  tab.appendChild(sw);
-  bar.appendChild(tab);
- });
-}
-function resetDirty(){
- dirtyLines={};
- el("usync").disabled=true;
- el("usync").textContent="Sync changes";
-}
-function markDirty(row,line,code){
- if(code===originalLines[line])delete dirtyLines[line];
- else dirtyLines[line]=code;
- row.classList.toggle("dirty",!!dirtyLines[line]);
- var n=Object.keys(dirtyLines).length;
- el("usync").disabled=n===0;
- el("usync").textContent=n?"Sync "+n+" change"+(n===1?"":"s"):"Sync changes";
-}
-function renderProg(d){
- renderRail(d);
- resetDirty();
- originalLines={};
- var prog=el("uprog");prog.innerHTML="";
- (d.lines||[]).forEach(function(l){
-  originalLines[l.n]=l.code;
-  var row=document.createElement("div");row.className="pl";row.dataset.line=l.n;row.dataset.origin=l.origin||"";
-  var code=document.createElement("div");code.className="code";code.contentEditable="true";code.spellcheck=false;code.textContent=l.code;
-  code.oninput=function(){markDirty(row,l.n,code.textContent)};
-  code.onkeydown=function(e){
-   if(e.key==="Enter"){e.preventDefault();code.blur();}
-   if(e.key==="Tab"){e.preventDefault();document.execCommand("insertText",false,"    ");}
-  };
-  row.appendChild(code);prog.appendChild(row);
- });
- var b=el("ubanner");
- if(d.unresolved){
-  b.style.display="";b.className="banner";
-  if(d.inputs)b.innerHTML="⚠ Some branches can't be decided from these inputs — they depend on <b>runtime</b> values (a call result, a field, or a possibly-null value), so <b>both</b> paths are shown (highlighted). Only runtime can tell which actually runs.";
-  else b.innerHTML="① Unresolved branches (highlighted). The outcome depends on the inputs — type them above and <b>Apply inputs</b> to collapse to the one path that runs.";
- }
- else if((d.lines||[]).length){b.style.display="";b.className="banner ok";
-  var via=(d.choices&&d.choices.length)?" Assumptions stay visible on the left while you read and edit.":"";
-  b.innerHTML="✓ Editable path"+(d.inputs?" for inputs <code>"+esc(d.inputs)+"</code>":"")+". Edit the code directly, then sync changes."+via;}
- else b.style.display="none";
-}
-function discover(inputs){
- if(!el("ufile").value||!el("umethod").value){el("ustatus").textContent="set entry file + method first (use Search symbols on the left)";return;}
- el("ustatus").textContent="running…";var body=ufields();body.Inputs=inputs;
- fetch("/api/unroll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
-  .then(function(r){return r.json()}).then(function(d){
-   if(d.error){el("ustatus").textContent="error: "+d.error;return;}
-   el("uinputs").value=inputs;renderProg(d);el("ustatus").textContent="";});
-}
-el("udiscover").onclick=function(){discover("")};
-el("uapply").onclick=function(){discover(el("uinputs").value)};
-el("uinputs").addEventListener("keydown",function(e){if(e.key==="Enter")discover(el("uinputs").value)});
-updateInlineLabel();
-el("uinline").addEventListener("input",updateInlineLabel);
-el("uinline").addEventListener("change",function(){if(el("ufile").value&&el("umethod").value)discover(el("uinputs").value)});
-function saveEdits(edits){
- if(!edits.length)return Promise.resolve();
- el("ustatus").textContent="syncing…";var body=ufields();body.Edits=edits;
- return fetch("/api/unroll/edit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
-  .then(function(r){return r.json()}).then(function(d){
-   if(d.error){el("ustatus").textContent="error: "+d.error;return;}
-   renderProg(d);
-   el("uprog").querySelectorAll(".pl").forEach(function(r){r.classList.add("flash")});
-   el("ustatus").innerHTML="✓ synced ("+d.synced+")";flash("synced to source");});
-}
-function saveEdit(line,code){return saveEdits([{Line:line,NewCode:code}]);}
-el("usync").onclick=function(){
- var edits=Object.keys(dirtyLines).map(function(k){return {Line:parseInt(k),NewCode:dirtyLines[k]}}).sort(function(a,b){return a.Line-b.Line});
- saveEdits(edits);
-};
-
-// Deep link / autoplay: ?do=discover|apply|edit drives the unroll tab from URL params, so a
-// particular view (or a walkthrough frame) is shareable. Harmless without the params.
-(function(){
- var q=new URLSearchParams(location.search);
- if(!q.get("do"))return;
- setTimeout(function(){
-  tab("unroll");
-  if(q.get("sr"))el("sr").value=q.get("sr");
-  if(q.get("file"))el("ufile").value=q.get("file");
-  if(q.get("method"))el("umethod").value=q.get("method");
-  if(q.get("branches"))parseBranchString(q.get("branches"));
-  if(q.get("inline_depth")){el("uinline").value=q.get("inline_depth");updateInlineLabel();}
-  if(q.get("inline_skips"))parseInlineSkipString(q.get("inline_skips"));
-  var inputs=q.get("inputs")||"";if(inputs)el("uinputs").value=inputs;
-  var d=q.get("do");
-  if(d==="discover")discover("");
-  else if(d==="apply")discover(inputs);
-  else if(d==="edit"){
-   var body=ufields();body.Inputs=inputs;
-   fetch("/api/unroll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
-    .then(function(r){return r.json()}).then(function(dd){renderProg(dd);return saveEdit(parseInt(q.get("line")),q.get("code")||"");});
-  }
- },120);
-})();
-el("savecfg").onclick=function(){
- var body;try{body=JSON.parse(el("cfg").value)}catch(e){el("cfgmsg").textContent="invalid JSON: "+e;el("cfgmsg").className="note err";return;}
- fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body,null,2)})
- .then(function(r){return r.json()}).then(function(d){
-  if(d.error){el("cfgmsg").textContent=d.error;el("cfgmsg").className="note err";}
-  else{el("cfgmsg").textContent="saved · "+d.lenses+" lenses";el("cfgmsg").className="note ok";flash("config saved");}});};
-</script></body></html>`
+//go:embed ui.html
+var uiHTML string

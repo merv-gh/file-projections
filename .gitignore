@@ -28,3 +28,4 @@ handoff.md
 # benchmark run artifacts (regenerable; keep results.json + report.png + READMEs)
 tools/benchmark/harness/*.jsonl
 tools/benchmark/harness/mcp-*.json
+todo.md

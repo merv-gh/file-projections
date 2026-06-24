@@ -5638,10 +5638,11 @@ func hasTwoWayBlock(projPath string) bool {
 // ---------------------------------------------------------------------------
 
 type uiServer struct {
-	mu         sync.Mutex
-	cfg        Config
-	configPath string
-	registry   Registry
+	mu          sync.Mutex
+	cfg         Config
+	configPath  string
+	registry    Registry
+	detectCache map[string]uiDefaults // keyed by chosen source root; avoids re-walking on every change
 }
 
 type uiDefaults struct {
@@ -5699,6 +5700,7 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/preview", s.handlePreview)
 	mux.HandleFunc("/api/symbols", s.handleSymbols)
 	mux.HandleFunc("/api/vars", s.handleVars)
+	mux.HandleFunc("/api/lenses", s.handleLenses)
 	mux.HandleFunc("/api/dirs", s.handleDirs)
 	mux.HandleFunc("/api/detect", s.handleDetect)
 	mux.HandleFunc("/api/unroll", s.handleUnroll)
@@ -5731,6 +5733,7 @@ func (s *uiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		s.cfg = c
+		s.detectCache = nil // config changed; re-detect from scratch
 		s.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"ok": true, "lenses": len(c.Lenses)})
 		return
@@ -5765,6 +5768,11 @@ func (s *uiServer) handleDetect(w http.ResponseWriter, r *http.Request) {
 	root := r.URL.Query().Get("root")
 	s.mu.Lock()
 	cfg := s.cfg
+	if cached, ok := s.detectCache[root]; ok {
+		s.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"language": cached.Language, "defaults": cached, "cached": true})
+		return
+	}
 	s.mu.Unlock()
 	if root != "" {
 		cfg.Root = filepath.Join(cfg.Root, root)
@@ -5779,6 +5787,12 @@ func (s *uiServer) handleDetect(w http.ResponseWriter, r *http.Request) {
 		}
 		def.SourceRoot = root // keep the user's chosen root; defaults re-scanned under it
 	}
+	s.mu.Lock()
+	if s.detectCache == nil {
+		s.detectCache = map[string]uiDefaults{}
+	}
+	s.detectCache[root] = def
+	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"language": def.Language, "defaults": def})
 }
 
@@ -5808,6 +5822,77 @@ func (s *uiServer) handleDirs(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(dirs)
 	writeJSON(w, 200, map[string]any{"path": filepath.ToSlash(rel), "dirs": dirs})
+}
+
+// handleLenses lets the UI bookmark a *configured lens* (analyzer + source root +
+// params), not just a code range — GET lists saved lenses; POST upserts one into
+// config.json (or removes it with delete:true), so a useful lens setup is one click
+// to re-open later. Saved lenses are the same LensConfig the CLI/build use.
+func (s *uiServer) handleLenses(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var req struct {
+			Name       string            `json:"name"`
+			Analyzer   string            `json:"analyzer"`
+			SourceRoot string            `json:"source_root"`
+			Params     map[string]string `json:"params"`
+			Out        string            `json:"out"`
+			Delete     bool              `json:"delete"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeJSON(w, 400, map[string]string{"error": "name is required"})
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		lenses := s.cfg.Lenses[:0:0]
+		found := false
+		for _, l := range s.cfg.Lenses {
+			if l.Name == req.Name {
+				found = true
+				if req.Delete {
+					continue // drop it
+				}
+				lenses = append(lenses, LensConfig{Name: req.Name, Analyzer: req.Analyzer, SourceRoot: req.SourceRoot, Params: req.Params, Out: l.Out})
+				continue
+			}
+			lenses = append(lenses, l)
+		}
+		if !found && !req.Delete {
+			out := req.Out
+			if out == "" {
+				out = filepath.ToSlash(filepath.Join(s.cfg.ProjectionsDir, req.Name+".projection"))
+			}
+			lenses = append(lenses, LensConfig{Name: req.Name, Analyzer: req.Analyzer, SourceRoot: req.SourceRoot, Params: req.Params, Out: out})
+		}
+		s.cfg.Lenses = lenses
+		raw, err := json.MarshalIndent(s.cfg, "", "  ")
+		if err == nil {
+			err = os.WriteFile(s.configPath, raw, 0644)
+		}
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "lenses": s.lensSummaries()})
+		return
+	}
+	s.mu.Lock()
+	out := s.lensSummaries()
+	s.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"lenses": out})
+}
+
+// lensSummaries returns the saved lenses as light records for the UI. Caller holds s.mu.
+func (s *uiServer) lensSummaries() []map[string]any {
+	out := make([]map[string]any, 0, len(s.cfg.Lenses))
+	for _, l := range s.cfg.Lenses {
+		out = append(out, map[string]any{"name": l.Name, "analyzer": l.Analyzer, "source_root": l.SourceRoot, "params": l.Params})
+	}
+	return out
 }
 
 // handleVars returns identifier names declared in a file (locals, params, fields) so

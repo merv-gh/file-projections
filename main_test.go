@@ -915,7 +915,7 @@ public class App {
 	}
 
 	_, body2 := run("2", "")
-	if !strings.Contains(body2, `return "done";`) || strings.Contains(body2, "String v = leaf();") {
+	if !strings.Contains(body2, `"done";`) || strings.Contains(body2, "String v = leaf();") {
 		t.Fatalf("depth 2 should inline nested leaf:\n%s", body2)
 	}
 

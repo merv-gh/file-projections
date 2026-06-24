@@ -250,6 +250,17 @@ async function tRunTests() {
 		return "TESTS FAIL" + (m ? "\n" + m[0] : "\n" + out.trim().split("\n").slice(-4).join("\n"));
 	}
 }
+// lineWritesJS: which variable a line writes (assign / += / ++ / setter) — mirrors
+// the UI's mutation detection so line_assumptions can report a write timeline.
+function lineWritesJS(t) {
+	let m;
+	if ((m = t.match(/^([A-Za-z_]\w*)\s*(?:\+\+|--)\s*;?\s*$/)) || (m = t.match(/^(?:\+\+|--)\s*([A-Za-z_]\w*)/))) return [m[1]];
+	if ((m = t.match(/\b([A-Za-z_]\w*)\.(set[A-Z]\w*)\s*\(/))) return [m[1]];
+	if ((m = t.match(/^(?:final\s+)?(?:[A-Za-z_][\w<>\[\].]*\s+)?([A-Za-z_]\w*)\s*(?:[-+*/|&^]?=)[^=]/))) {
+		if (!/^(if|for|while|return|else|switch|case|do)$/.test(m[1])) return [m[1]];
+	}
+	return [];
+}
 async function tViewProgram(p) {
 	const parsed = parseInputs(p.inputs);
 	const allowed = entryParamNames(ROOT);
@@ -278,9 +289,19 @@ async function tLineAssumptions(p) {
 	const bare = code.replace(/"[^"]*"/g, "").replace(/'[^']*'/g, "");
 	const vars = [...new Set((bare.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])
 		.filter((w) => !/^(if|else|return|new|int|long|double|float|boolean|String|void|true|false|null|this|for|while|switch|case|break|continue|throw|try|catch|finally)$/.test(w)))];
+	const written = lineWritesJS(code.trim());
+	let writeTimeline = "";
+	if (written.length) {
+		const v = written[0];
+		const sites = r.body.map((c, i) => ({ i: i + 1, c: c.trim() }))
+			.filter((x) => lineWritesJS(x.c).includes(v));
+		writeTimeline = `\nWRITES ${v} (this is write ${sites.findIndex((s) => s.i === n) + 1} of ${sites.length} on this path: ` +
+			sites.map((s) => `L${s.i}`).join(", ") + ")";
+	}
 	return `LINE ${n} ${where} | ${code}\n` +
 		`REACHED-WHEN ${guard || "(always — no branch guards on this line)"}\n` +
-		`VALUES-IN ${vars.join(", ") || "(none)"} — trace any of these with view_program at higher inline depth.`;
+		`VALUES-IN ${vars.join(", ") || "(none)"} — trace any of these with view_program at higher inline depth.` +
+		writeTimeline;
 }
 async function tEditProgram(p) {
 	if (!last) return 'Call view_program with concrete inputs first, e.g. inputs="coupon=save,amount=50".';

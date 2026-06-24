@@ -62,6 +62,16 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
 .assume .ah{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:#9ca3af;margin-bottom:.35rem}
 .assume code{font-family:ui-monospace,Menlo,monospace;background:rgba(255,255,255,.1);padding:.05rem .3rem;border-radius:4px}
 .assume .amp{color:#9ca3af;margin:0 .15rem}
+.assume .tlrow{padding:.22rem 0;border-top:1px solid rgba(255,255,255,.12);display:flex;gap:.45rem;align-items:baseline}
+.assume .tlrow b{color:#9ca3af;font-size:.7rem;min-width:1rem}.assume .tlrow .org{color:#9ca3af;font-size:.66rem}
+/* object-mutation + loop bands */
+.wbadge{position:absolute;right:.4rem;top:.24rem;font-size:10px;color:#2b6a45;background:#eaf3ec;border:1px solid #cadfce;border-radius:999px;padding:.03rem .42rem;cursor:pointer;font-family:ui-sans-serif,system-ui,sans-serif}
+.wbadge:hover{background:#dcecdf}
+.pl.inloop{background:#f4f6ee}.pl.inloop .org{border-left:3px solid #8ab37a}
+.pl.loophead .code{font-weight:600}
+.loopeff{position:absolute;right:.4rem;top:.24rem;font-size:10px;color:#55663f;background:#eef2e4;border:1px solid #d4ddc3;border-radius:6px;padding:.03rem .42rem}
+.pl.wlit{background:#fbf0d6 !important}
+.legend i.lw::before{background:#2b6a45}.legend i.ll::before{background:#8ab37a}
 </style></head><body>
 <header>
  <b>file-projections</b>
@@ -75,6 +85,11 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
   <h2>Lens</h2>
   <select id=an></select>
   <p class=hint id=anhint></p>
+  <div class=row style="gap:.3rem;margin:.2rem 0 .1rem">
+   <select id=savedlenses style=flex:1><option value="">★ saved lenses…</option></select>
+   <button class=ghost id=savelens title="Bookmark this lens + its config">★ Save</button>
+   <button class=ghost id=dellens title="Delete the selected saved lens">×</button>
+  </div>
   <div id=params></div>
   <div id=unrollctl style=display:none>
    <label>entry — file › method</label>
@@ -98,7 +113,7 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
     <div id=ubanner class=banner style=display:none></div>
     <div class=progctl>
      <button class=ghost id=foldtc>Hide try/catch</button>
-     <span class=legend><i class=lx>early return / throw</i><i class=lg>guard</i></span>
+     <span class=legend><i class=lx>early return / throw</i><i class=lg>guard</i><i class=lw>writes (✎ click=timeline)</i><i class=ll>loop body</i></span>
     </div>
     <div id=unrollbody class="unrollbody no-side">
      <div id=uprog class=prog></div>
@@ -215,6 +230,7 @@ function showLensView(){el("lensview").style.display="";el("unrollview").style.d
 function showUnrollView(){el("lensview").style.display="none";el("unrollview").style.display=""}
 function autoPreview(){
  tab("result");
+ if(typeof saveLast==="function")saveLast();
  var a=el("an").value;
  if(a==="unrolled-program"){showUnrollView();discover();return}
  showLensView();
@@ -242,11 +258,12 @@ el("an")&&(el("an").onchange=function(){renderParams();autoPreview()});
 
 // ---- source root + dir picker ------------------------------------------------
 function setSourceRoot(root){STATE.sourceRoot=root||".";el("srval").textContent=STATE.sourceRoot}
-function reDetect(){
+function reDetect(after){
  fetch("/api/detect?root="+encodeURIComponent(STATE.sourceRoot)).then(function(r){return r.json()}).then(function(d){
   STATE.lang=d.language||STATE.lang;STATE.defaults=d.defaults||STATE.defaults;
   el("langtag").textContent=STATE.lang;
-  buildAnalyzerSelect();renderParams();prefillEntry();autoPreview();
+  buildAnalyzerSelect();renderParams();prefillEntry();
+  if(after)after();else autoPreview();
  });
 }
 function openPicker(){
@@ -365,6 +382,58 @@ function tagFlow(items){
   for(var j=i+1;j<items.length;j++){if(items[j].indent<=it.indent)break;items[j].row.classList.add("catchbody");bodyRows.push(items[j].row)}
   it.row.querySelector(".code").onclick=function(){bodyRows.forEach(function(r){r.classList.toggle("show")})};
  });
+ // 3) object mutations — write-count badges + per-var timeline
+ var writeMap={};
+ items.forEach(function(it,i){
+  var w=lineWrites(it.t);
+  if(w.length){it.writes=w;w.forEach(function(v){(writeMap[v]=writeMap[v]||[]).push(i)})}
+ });
+ items.forEach(function(it,i){
+  if(!it.writes||it.row.classList.contains("struct"))return;
+  var v=it.writes[0],list=writeMap[v],k=list.indexOf(i)+1;
+  var chip=document.createElement("span");chip.className="wbadge";
+  chip.textContent="✎ "+v+(list.length>1?" "+k+"/"+list.length:"");
+  chip.title="write "+k+" of "+list.length+" to "+v+" — click for timeline";
+  chip.onclick=function(e){showTimeline(e,chip,v,list,items)};
+  it.row.appendChild(chip);
+ });
+ // 4) loop bands by indentation + effect summary at the head
+ items.forEach(function(it,i){
+  if(!/^(for|while|do)\b/.test(it.t))return;
+  it.row.classList.add("loophead");
+  var eff={};
+  for(var j=i+1;j<items.length;j++){
+   if(items[j].indent<=it.indent)break;
+   items[j].row.classList.add("inloop");
+   (items[j].writes||[]).forEach(function(v){eff[v]=(eff[v]||0)+1});
+  }
+  var keys=Object.keys(eff);
+  if(keys.length){var s=document.createElement("span");s.className="loopeff";
+   s.textContent="mutates: "+keys.map(function(v){return v+(eff[v]>1?"×"+eff[v]:"")}).join(", ");
+   it.row.appendChild(s);}
+ });
+}
+// lineWrites: which variable(s) a line writes (assign / compound / ++ / -- / setter).
+function lineWrites(t){
+ var m;
+ if((m=t.match(/^([A-Za-z_]\w*)\s*(?:\+\+|--)\s*;?\s*$/))||(m=t.match(/^(?:\+\+|--)\s*([A-Za-z_]\w*)/)))return [m[1]];
+ if((m=t.match(/\b([A-Za-z_]\w*)\.(set[A-Z]\w*)\s*\(/)))return [m[1]];
+ if((m=t.match(/^(?:final\s+)?(?:[A-Za-z_][\w<>\[\].]*\s+)?([A-Za-z_]\w*)\s*(?:[-+*\/|&^]?=)[^=]/))){
+  if(!/^(if|for|while|return|else|switch|case|do)$/.test(m[1]))return [m[1]];
+ }
+ return [];
+}
+function showTimeline(e,anchor,v,list,items){
+ e.stopPropagation();
+ var old=document.getElementById("tl");if(old){old._rows.forEach(function(r){r.classList.remove("wlit")});old.remove()}
+ var lit=list.map(function(idx){return items[idx].row});lit.forEach(function(r){r.classList.add("wlit")});
+ var d=document.createElement("div");d.className="assume";d.id="tl";d.style.maxWidth="40rem";d._rows=lit;
+ d.innerHTML="<div class=ah>writes to <code>"+esc(v)+"</code> on this path — "+list.length+(list.length>1?" (set "+list.length+"×)":"")+"</div>"+
+  list.map(function(idx,k){var o=items[idx].row.querySelector(".org");return "<div class=tlrow><b>"+(k+1)+"</b><span class=org>"+esc(o?o.textContent:"")+"</span><code>"+esc(items[idx].t)+"</code></div>"}).join("");
+ document.body.appendChild(d);
+ var r=anchor.getBoundingClientRect();
+ d.style.left=Math.max(8,r.left-380)+"px";d.style.top=(window.scrollY+r.top)+"px";
+ setTimeout(function(){document.addEventListener("click",function h(){lit.forEach(function(r){r.classList.remove("wlit")});d.remove();document.removeEventListener("click",h)})},0);
 }
 function renderProg(d){
  renderRail(d);resetDirty();originalLines={};
@@ -393,6 +462,7 @@ function renderProg(d){
  else b.style.display="none";
 }
 function discover(){
+ if(typeof saveLast==="function")saveLast();
  if(!uFile||!uMethod){el("ustatus").textContent="pick an entry file › method above";el("uprog").innerHTML="";return}
  showUnrollView();el("ustatus").textContent="running…";
  fetch("/api/unroll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(ufields())})
@@ -433,14 +503,79 @@ el("savecfg").onclick=function(){
   else{el("cfgmsg").textContent="saved · "+d.lenses+" lenses";el("cfgmsg").className="note ok";flash("config saved")}});
 };
 
+// ---- saved lenses (bookmark a lens + its config) -----------------------------
+// Capture the current lens setup as a LensConfig-shaped params bag.
+function currentLensParams(){
+ var a=el("an").value;
+ if(a==="unrolled-program")return {file:uFile,method:uMethod,inputs:el("uinputs").value,inline_depth:String(inlineDepth())};
+ return collectParams();
+}
+function loadSavedLenses(sel){
+ fetch("/api/lenses").then(function(r){return r.json()}).then(function(d){
+  var s=el("savedlenses");s.innerHTML="<option value=''>★ saved lenses…</option>";
+  (d.lenses||[]).forEach(function(l){var o=document.createElement("option");o.value=l.name;
+   o.textContent=l.name+" — "+l.analyzer;o._lens=l;s.appendChild(o)});
+  if(sel)s.value=sel;
+ });
+}
+function applyLens(l){
+ setSourceRoot(l.source_root||STATE.sourceRoot);
+ reDetect(function(){
+  var s=el("an");if(!Array.from(s.options).some(function(o){return o.value===l.analyzer})){var o=document.createElement("option");o.value=o.textContent=l.analyzer;s.appendChild(o)}
+  s.value=l.analyzer;renderParams();
+  var p=l.params||{};
+  if(l.analyzer==="unrolled-program"){uFile=p.file||"";uMethod=p.method||"";setEntryDisplay();
+   if(p.inputs!=null)el("uinputs").value=p.inputs;
+   if(p.inline_depth!=null){el("uinline").value=p.inline_depth;updateInlineLabel()}
+  }else{Object.keys(p).forEach(function(k){var i=el("p_"+k);if(i)i.value=p[k]})}
+  autoPreview();
+ });
+}
+el("savelens").onclick=function(){
+ var def=(el("an").value==="unrolled-program"&&uMethod)?uMethod:el("an").value;
+ var name=prompt("Save this lens as:",def);if(!name)return;
+ fetch("/api/lenses",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({name:name,analyzer:el("an").value,source_root:STATE.sourceRoot,params:currentLensParams()})})
+  .then(function(r){return r.json()}).then(function(d){if(d.error){flash(d.error,1);return}loadSavedLenses(name);flash("lens saved: "+name)});
+};
+el("dellens").onclick=function(){
+ var name=el("savedlenses").value;if(!name){flash("pick a saved lens first",1);return}
+ if(!confirm("Delete saved lens \""+name+"\"?"))return;
+ fetch("/api/lenses",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,delete:true})})
+  .then(function(r){return r.json()}).then(function(){loadSavedLenses();flash("deleted "+name)});
+};
+el("savedlenses").onchange=function(){var o=el("savedlenses").selectedOptions[0];if(o&&o._lens)applyLens(o._lens)};
+
+// ---- persistence: remember last lens/entry per repo (localStorage) ------------
+var LSKEY="fp:last:"+location.host+":"+location.pathname;
+function saveLast(){
+ try{localStorage.setItem(LSKEY,JSON.stringify({sourceRoot:STATE.sourceRoot,analyzer:el("an").value,
+  file:uFile,method:uMethod,inputs:el("uinputs").value,inline:el("uinline").value}))}catch(e){}
+}
+function loadLast(){try{return JSON.parse(localStorage.getItem(LSKEY)||"null")}catch(e){return null}}
+
 // ---- boot --------------------------------------------------------------------
 fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
  STATE.analyzers=d.analyzers||[];STATE.applic=d.applicability||{};STATE.defaults=d.defaults||{};
  STATE.lang=STATE.defaults.language||"";
- setSourceRoot(STATE.defaults.source_root||".");
- el("langtag").textContent=STATE.lang;
- buildAnalyzerSelect();renderParams();prefillEntry();autoPreview();
+ loadSavedLenses();
+ var last=loadLast();
+ if(last&&last.sourceRoot){
+  setSourceRoot(last.sourceRoot);
+  reDetect(function(){
+   var s=el("an");if(last.analyzer&&Array.from(s.options).some(function(o){return o.value===last.analyzer}))s.value=last.analyzer;
+   renderParams();
+   if(last.file){uFile=last.file;uMethod=last.method||"";setEntryDisplay()}
+   if(last.inputs)el("uinputs").value=last.inputs;
+   if(last.inline){el("uinline").value=last.inline;updateInlineLabel()}
+   autoPreview();
+  });
+ }else{
+  setSourceRoot(STATE.defaults.source_root||".");
+  el("langtag").textContent=STATE.lang;
+  buildAnalyzerSelect();renderParams();prefillEntry();autoPreview();
+ }
 });
 updateInlineLabel();
 </script></body></html>

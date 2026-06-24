@@ -3429,7 +3429,8 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	if method == "" {
 		return Projection{}, errors.New("unrolled-program: params.method is required")
 	}
-	u := &javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"]), seenDecision: map[string]bool{}}
+	u := &javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"]), seenDecision: map[string]bool{},
+		selectMode: lens.Params["branch_select"] == "1", forced: parseForcedBranches(lens.Params["branches"]), choiceSeen: map[string]bool{}}
 	lines, err := u.unrollMethod(file, method, 0)
 	if err != nil {
 		return Projection{}, err
@@ -3458,8 +3459,13 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	for i, d := range u.decisions {
 		p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("branch-%d", i+1), Tool: "unrolled-program", Text: d})
 	}
-	if lens.Params["inputs"] == "" {
+	if lens.Params["inputs"] == "" && !u.selectMode {
 		p.Facts = append(p.Facts, ProjectionFact{ID: "branching", Tool: "unrolled-program", Text: "no params.inputs supplied; unknown conditions include both branches"})
+	}
+	for i, c := range u.choices {
+		if b, err := json.Marshal(c); err == nil {
+			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("choice-%d", i+1), Tool: "unrolled-program", Text: string(b)})
+		}
 	}
 	return p, nil
 }
@@ -3470,6 +3476,39 @@ type javaUnroller struct {
 	env          map[string]string
 	decisions    []string
 	seenDecision map[string]bool
+	// Branch-select mode (UI only; CLI/benchmark leave selectMode=false so the
+	// undecidable "show both branches" behavior below is unchanged). When on, an
+	// undecidable conditional collapses to one side — forced[id] if the user toggled
+	// it, else the longest branch — and is recorded in choices so the UI can offer a
+	// per-conditional toggle. id is "file:line" of the `if`.
+	selectMode bool
+	forced     map[string]string
+	choices    []branchChoice
+	choiceSeen map[string]bool
+}
+
+// branchChoice describes one undecidable conditional the UI can toggle. Sides are
+// the selectable options ("then"+"else", or "then"+"skip" when there is no else).
+type branchChoice struct {
+	ID     string   `json:"id"`     // file:line of the if header
+	Cond   string   `json:"cond"`   // the condition text
+	Origin string   `json:"origin"` // source_root-relative file:line
+	Side   string   `json:"side"`   // currently shown side
+	Sides  []string `json:"sides"`  // available sides
+}
+
+func parseForcedBranches(s string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if k, v, ok := strings.Cut(part, "="); ok {
+			out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return out
 }
 
 func (u *javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine, error) {
@@ -3534,6 +3573,46 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 					return nil, err
 				}
 				out = append(out, part...)
+			case !known && u.selectMode:
+				// Runtime-undecidable: collapse to one side (the user's toggle, else the
+				// longest branch) and record it so the UI can offer a per-conditional switch.
+				elseSide := "skip"
+				if hasElse && !elseIf {
+					elseSide = "else"
+				}
+				sides := []string{"then", elseSide}
+				side := u.forced[fmt.Sprintf("%s:%d", file, i+1)]
+				if side != "then" && side != elseSide {
+					side = "" // ignore stale/invalid forced value
+				}
+				if side == "" {
+					thenSpan := closeLine - braceLine
+					elseSpan := 0
+					if elseSide == "else" {
+						elseSpan = elseClose - elseBrace
+					}
+					if elseSpan > thenSpan {
+						side = "else"
+					} else {
+						side = "then"
+					}
+				}
+				u.recordChoice(file, i+1, cond, side, sides)
+				u.addDecision(file, i+1, cond, side, "branch toggle (runtime-undecidable)")
+				switch side {
+				case "then":
+					part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, part...)
+				case "else":
+					part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, part...)
+				}
 			case !known:
 				u.addDecision(file, i+1, cond, "both", "runtime-dependent or missing input")
 				out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
@@ -3566,6 +3645,16 @@ func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth in
 		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
 	}
 	return out, nil
+}
+
+func (u *javaUnroller) recordChoice(file string, line int, cond, side string, sides []string) {
+	id := fmt.Sprintf("%s:%d", file, line)
+	if u.choiceSeen[id] {
+		return
+	}
+	u.choiceSeen[id] = true
+	origin := filepath.ToSlash(filepath.Join(u.lens.SourceRoot, file)) + fmt.Sprintf(":%d", line)
+	u.choices = append(u.choices, branchChoice{ID: id, Cond: cond, Origin: origin, Side: side, Sides: sides})
 }
 
 func (u *javaUnroller) addDecision(file string, line int, cond, branch, why string) {
@@ -5656,7 +5745,7 @@ type unrollLineView struct {
 	Branch bool   `json:"branch"` // an unresolved `if (...)` / `switch` header
 }
 
-func (s *uiServer) unrollProjection(srcRoot, file, method, inputs string) (Projection, Config, Registry, error) {
+func (s *uiServer) unrollProjection(srcRoot, file, method, inputs, branches string) (Projection, Config, Registry, error) {
 	s.mu.Lock()
 	cfg := s.cfg
 	reg := s.registry
@@ -5666,13 +5755,32 @@ func (s *uiServer) unrollProjection(srcRoot, file, method, inputs string) (Proje
 		Out:        filepath.Join(cfg.ProjectionsDir, "ui-unroll.projection"),
 		Analyzer:   "unrolled-program",
 		SourceRoot: srcRoot,
-		Params:     map[string]string{"file": file, "method": method},
+		// branch_select makes undecidable conditionals collapse to one (toggleable) side
+		// instead of inlining both — the UI's branch-tabs experience.
+		Params: map[string]string{"file": file, "method": method, "branch_select": "1"},
 	}
 	if inputs != "" {
 		lens.Params["inputs"] = inputs
 	}
+	if branches != "" {
+		lens.Params["branches"] = branches
+	}
 	p, err := ExecuteLens(cfg, reg, lens)
 	return p, cfg, reg, err
+}
+
+// unrollChoices pulls the per-conditional toggle metadata the analyzer recorded.
+func unrollChoices(p Projection) []branchChoice {
+	var out []branchChoice
+	for _, f := range p.Facts {
+		if f.Tool == "unrolled-program" && strings.HasPrefix(f.ID, "choice-") {
+			var c branchChoice
+			if json.Unmarshal([]byte(f.Text), &c) == nil {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
 }
 
 var uiBranchRE = regexp.MustCompile(`^\s*(if|else if|switch|while|for|case)\b`)
@@ -5709,7 +5817,7 @@ func unrollDecisionFacts(p Projection) []string {
 // analyzer keeps the `if (...)` headers in place (branch discovery); with inputs it collapses
 // to the single path those inputs execute.
 func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
-	var req struct{ SourceRoot, File, Method, Inputs string }
+	var req struct{ SourceRoot, File, Method, Inputs, Branches string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
@@ -5718,7 +5826,7 @@ func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "file and method are required"})
 		return
 	}
-	p, _, _, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs)
+	p, _, _, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
@@ -5730,7 +5838,8 @@ func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
 			unresolved = true
 		}
 	}
-	writeJSON(w, 200, map[string]any{"lines": lines, "unresolved": unresolved, "inputs": req.Inputs, "decisions": unrollDecisionFacts(p)})
+	writeJSON(w, 200, map[string]any{"lines": lines, "unresolved": unresolved, "inputs": req.Inputs,
+		"decisions": unrollDecisionFacts(p), "choices": unrollChoices(p)})
 }
 
 // handleUnrollEdit applies one line edit and writes it back to that line's origin file via the
@@ -5738,14 +5847,14 @@ func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
 // path: render projection -> edit the block line -> sync -> re-render.
 func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SourceRoot, File, Method, Inputs, NewCode string
-		Line                                      int
+		SourceRoot, File, Method, Inputs, Branches, NewCode string
+		Line                                                int
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	p, cfg, reg, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs)
+	p, cfg, reg, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs, req.Branches)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
@@ -5799,6 +5908,7 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"lines":     unrollViewLines(p2),
 		"decisions": unrollDecisionFacts(p2),
+		"choices":   unrollChoices(p2),
 		"synced":    fmt.Sprintf("%d → source, %d conflicts", res.ToSource, len(res.Conflicts)),
 		"conflicts": res.Conflicts,
 		"origin":    origin,

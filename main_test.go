@@ -784,6 +784,70 @@ public class TierStage {
 	}
 }
 
+func TestUnrolledProgramBranchChoicesToggleUndecidableCondition(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src/main/java/sample")
+	write(t, filepath.Join(src, "App.java"), `package sample;
+
+public class App {
+    public String summary(int amount) {
+        if (amount >= 100) {
+            String label = "gold";
+            label = label + "!";
+            return label;
+        } else {
+            return "silver";
+        }
+    }
+}
+`)
+	base := LensConfig{
+		Name:       "unrolled",
+		Analyzer:   "unrolled-program",
+		SourceRoot: "src/main/java",
+		Params: map[string]string{
+			"file":          "sample/App.java",
+			"method":        "summary",
+			"branch_select": "1",
+		},
+	}
+	cfg := Config{Root: dir, ProjectionsDir: ".projections"}
+	p, err := ExecuteLens(cfg, DefaultRegistry(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	choices := unrollChoices(p)
+	if len(choices) != 1 {
+		t.Fatalf("choices=%#v", choices)
+	}
+	if choices[0].Side != "then" {
+		t.Fatalf("default side = %q, want then (longest branch)", choices[0].Side)
+	}
+	got := projectionBody(p)
+	if !strings.Contains(got, `label = label + "!";`) || strings.Contains(got, `return "silver";`) {
+		t.Fatalf("default path should use the longer then branch:\n%s", got)
+	}
+
+	forced := base
+	forced.Params = map[string]string{}
+	for k, v := range base.Params {
+		forced.Params[k] = v
+	}
+	forced.Params["branches"] = choices[0].ID + "=else"
+	p, err = ExecuteLens(cfg, DefaultRegistry(), forced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	choices = unrollChoices(p)
+	if len(choices) != 1 || choices[0].Side != "else" {
+		t.Fatalf("forced choices=%#v", choices)
+	}
+	got = projectionBody(p)
+	if !strings.Contains(got, `return "silver";`) || strings.Contains(got, `label = label + "!";`) {
+		t.Fatalf("forced path should use else branch:\n%s", got)
+	}
+}
+
 func TestUnrolledProgramGoAdapterSyncsHelperLine(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")

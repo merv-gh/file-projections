@@ -3674,6 +3674,8 @@ func (u *javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, b
 		lines, err := next.unrollMethod(calleeFile, m[2], depth+1)
 		u.decisions = next.decisions
 		u.seenDecision = next.seenDecision
+		u.choices = next.choices
+		u.choiceSeen = next.choiceSeen
 		return lines, true, err
 	}
 	if m := regexp.MustCompile(`=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
@@ -3685,6 +3687,8 @@ func (u *javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, b
 					lines, err := next.unrollMethod(file, m[1], depth+1)
 					u.decisions = next.decisions
 					u.seenDecision = next.seenDecision
+					u.choices = next.choices
+					u.choiceSeen = next.choiceSeen
 					return lines, true, err
 				}
 			}
@@ -5996,10 +6000,11 @@ const uiHTML = `<!doctype html><html><head><meta charset=utf-8>
 <style>
 :root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a7;--accent:#6ea8fe;--ok:#4ade80;--bad:#f87171}
 *{box-sizing:border-box}body{margin:0;font:13px/1.5 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
-header{padding:.7rem 1rem;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:.6rem}
+header{padding:.7rem 1rem;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:.6rem}
 header b{font-size:1.05rem}header span{color:var(--mut);font-size:.8rem}
 .wrap{display:grid;grid-template-columns:340px 1fr;gap:0;height:calc(100vh - 49px)}
-.col{overflow:auto;padding:1rem}.col.left{border-right:1px solid var(--line);background:var(--panel)}
+.wrap.left-collapsed{grid-template-columns:0 1fr}.wrap.left-collapsed .col.left{padding:0;border-right:0;overflow:hidden}
+.col{overflow:auto;padding:1rem}.col.left{border-right:1px solid var(--line);background:var(--panel);transition:padding .15s ease}
 h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:1.2rem 0 .5rem}
 h2:first-child{margin-top:0}
 label{display:block;color:var(--mut);font-size:.72rem;margin:.5rem 0 .15rem}
@@ -6007,8 +6012,12 @@ input,select,textarea{width:100%;background:#0c0e13;color:var(--fg);border:1px s
 textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical}
 button{background:var(--accent);color:#06121f;border:0;border-radius:6px;padding:.45rem .8rem;font-weight:600;cursor:pointer}
 button.ghost{background:#222836;color:var(--fg);border:1px solid var(--line)}
+button.icon{width:2rem;height:2rem;padding:0;display:inline-grid;place-items:center;font-size:1rem}
 .row{display:flex;gap:.4rem;align-items:center}.row input{flex:1}
 .kv{display:grid;grid-template-columns:1fr 1.4fr auto;gap:.3rem;margin:.2rem 0}
+.entrygrid{display:grid;grid-template-columns:1.5fr 1fr;gap:.4rem}.field{position:relative}
+.ac{display:none;position:absolute;z-index:5;left:0;right:0;top:calc(100% + 3px);max-height:16rem;overflow:auto;background:#0c0e13;border:1px solid var(--line);border-radius:6px;box-shadow:0 10px 24px rgba(0,0,0,.32)}
+.acitem{padding:.36rem .5rem;border-bottom:1px solid #20242e;cursor:pointer}.acitem:last-child{border-bottom:0}.acitem:hover,.acitem.on{background:#1d2230}.acitem b{color:var(--fg);font-weight:600}.acitem span{display:block;color:var(--mut);font-size:.72rem}
 pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7rem;overflow:auto;white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:60vh}
 .sym{padding:.3rem .45rem;border-bottom:1px solid var(--line);cursor:pointer;display:flex;justify-content:space-between;gap:.5rem}
 .sym:hover{background:#1d2230}.sym .k{color:var(--accent);font-size:.7rem}.sym .f{color:var(--mut);font-size:.72rem}
@@ -6017,6 +6026,8 @@ pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7
 .tabs button.on{background:var(--accent);color:#06121f}
 .banner{margin:.6rem 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;background:#3a2d12;color:#f0c674;border:1px solid #5a4a1e}
 .banner.ok{background:#12331c;color:#7bd88f;border-color:#1e5a30}
+.branchbar{position:sticky;top:-1rem;z-index:2;margin:.6rem -1rem 0;padding:.5rem 1rem;background:rgba(15,17,21,.96);border-top:1px solid var(--line);border-bottom:1px solid var(--line);display:none;gap:.45rem;align-items:center;overflow-x:auto}
+.branchbar.show{display:flex}.branchbar .title{color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;white-space:nowrap}.btab{display:flex;align-items:center;gap:.35rem;white-space:nowrap;border:1px solid var(--line);border-radius:7px;padding:.25rem;background:#151922}.btab .where{color:var(--mut);font-size:.72rem}.btab button{padding:.25rem .45rem;background:#222836;color:var(--fg);border:1px solid var(--line);font-weight:600}.btab button.on{background:var(--accent);color:#06121f;border-color:var(--accent)}
 .prog{margin:.6rem 0;border:1px solid var(--line);border-radius:8px;overflow:hidden;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
 .pl{display:grid;grid-template-columns:2.2rem 1fr auto;gap:.4rem;align-items:center;padding:.28rem .6rem;border-bottom:1px solid #20242e;cursor:pointer}
 .pl:last-child{border-bottom:0}.pl:hover{background:#1d2230}.pl .ln{color:#5b6675;text-align:right}
@@ -6027,8 +6038,8 @@ pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7
 .pl .edit{grid-column:2/4;display:flex;gap:.4rem;margin-top:.2rem}
 .pl .edit input{flex:1;font-family:inherit;font-size:12.5px}
 </style></head><body>
-<header><b>file-projections</b><span id=cfgpath></span><span style=margin-left:auto id=msg></span></header>
-<div class=wrap>
+<header><button class="ghost icon" id=toggleLeft title="Toggle tools">☰</button><b>file-projections</b><span id=cfgpath></span><span style=margin-left:auto id=msg></span></header>
+<div class=wrap id=wrap>
  <div class="col left">
   <h2>Preview a lens</h2>
   <label>analyzer</label><select id=an></select>
@@ -6045,16 +6056,16 @@ pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7
   <div class=tabs><button class=on id=tunroll>Fix (unroll)</button><button id=tprev>Preview</button><button id=tcfg>config.json</button></div>
   <div id=unrollpane>
    <p class=note>Flatten a method's cross-file, branched execution into one straight-line program, then edit a line — the change syncs back to the real source file it came from. Workflow: <b>1) discover branches → 2) choose inputs → 3) edit</b>.</p>
-   <div class=kv style="grid-template-columns:1fr 1.6fr 1fr">
-    <input id=usr placeholder="source_root e.g. src/main/java">
-    <input id=ufile placeholder="entry file e.g. sample/App.java">
-    <input id=umethod placeholder="method e.g. summary">
+   <div class=entrygrid>
+    <div class=field><input id=ufile placeholder="entry file e.g. sample/App.java" autocomplete=off><div id=fileac class=ac></div></div>
+    <div class=field><input id=umethod placeholder="method e.g. summary" autocomplete=off><div id=methodac class=ac></div></div>
    </div>
    <div class=row style=margin-top:.4rem>
     <button id=udiscover>① Discover branches</button>
     <input id=uinputs placeholder="② inputs e.g. coupon=save,amount=50" style=flex:1>
     <button class=ghost id=uapply>Apply inputs</button>
    </div>
+   <div id=branchbar class=branchbar></div>
    <div id=ubanner class=banner style=display:none></div>
    <div id=uprog class=prog></div>
    <div class=note id=ustatus></div>
@@ -6070,23 +6081,37 @@ pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7
 var msg=document.getElementById("msg");
 function flash(t,bad){msg.textContent=t;msg.className=bad?"err":"ok";setTimeout(function(){msg.textContent=""},2500);}
 function el(id){return document.getElementById(id);}
+function esc(s){return String(s||"").replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]})}
 function addKv(k,v){var d=document.createElement("div");d.className="kv";
  d.innerHTML='<input placeholder=key><input placeholder=value><button class=ghost>×</button>';
  var ins=d.querySelectorAll("input");ins[0].value=k||"";ins[1].value=v||"";
  d.querySelector("button").onclick=function(){d.remove()};el("kvs").appendChild(d);}
 function params(){var o={};el("kvs").querySelectorAll(".kv").forEach(function(d){
  var ins=d.querySelectorAll("input");if(ins[0].value)o[ins[0].value]=ins[1].value;});return o;}
-function presets(){var a=el("an").value;el("kvs").innerHTML="";
- var P={"control-flow":[["file",""],["line",""]],"data-flow":[["file",""],["line",""],["var",""]],
+function setParam(key,val){var done=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
+ var ins=d.querySelectorAll("input");if(ins[0].value===key){ins[1].value=val;done=true}});
+ if(!done)addKv(key,val);}
+function hasParam(key){var hit=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
+ if(d.querySelectorAll("input")[0].value===key)hit=true});return hit;}
+var PRESETS={"control-flow":[["file",""],["line",""]],"data-flow":[["file",""],["line",""],["var",""]],
   "object-flow":[["type",""],["mode","joern"]],"unrolled-program":[["file",""],["method",""],["inputs",""]],
   "cpg-methods":[["file",""],["method",""]],"go-symbols":[],
   "entrypoints":[["patterns","http-mapping=@(Get|Post)Mapping"]],"exitpoints":[["sinks","*repository*.save,*kafka*.send"]],
   "flow":[["entry","@PostMapping"],["sink","\\.save\\("]],"bookmark":[["file",""],["lines",""]],
   "joern-var-flow":[["file",""],["var",""],["mode","joern"]]};
- (P[a]||[]).forEach(function(p){addKv(p[0],p[1])});
+function syncEntryParams(){
+ if(el("ufile").value&&hasParam("file"))setParam("file",el("ufile").value);
+ if(el("umethod").value&&hasParam("method"))setParam("method",el("umethod").value);
+ var p=params();
+ if("inputs" in p)setParam("inputs",el("uinputs").value);
+}
+function presets(){var a=el("an").value;el("kvs").innerHTML="";
+ (PRESETS[a]||[]).forEach(function(p){addKv(p[0],p[1])});
  el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");
   if(ins[0].value==="file"&&el("ufile").value)ins[1].value=el("ufile").value;
-  if(ins[0].value==="method"&&el("umethod").value)ins[1].value=el("umethod").value;});}
+  if(ins[0].value==="method"&&el("umethod").value)ins[1].value=el("umethod").value;});
+ syncEntryParams();}
+function entryChanged(){branchState={};renderBranches({choices:[]});syncEntryParams();}
 
 fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
@@ -6095,14 +6120,14 @@ fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  if(df.analyzer && Array.from(s.options).some(function(o){return o.value===df.analyzer}))s.value=df.analyzer;
  else s.value="control-flow";
  presets();
- if(df.source_root){el("sr").value=df.source_root;el("usr").value=df.source_root;}
+ if(df.source_root){el("sr").value=df.source_root;}
  if(df.entry_file)el("ufile").value=df.entry_file;
  if(df.entry_method)el("umethod").value=df.entry_method;
- if(df.entry_file){el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");if(ins[0].value==="file")ins[1].value=df.entry_file;});}
- if(df.entry_method){el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");if(ins[0].value==="method")ins[1].value=df.entry_method;});}
+ syncEntryParams();
  search();
 });
-el("an").onchange=presets;el("addkv").onclick=function(){addKv("","")};
+el("an").onchange=function(){presets();flash("params reset for "+el("an").value)};el("addkv").onclick=function(){addKv("","")};
+el("toggleLeft").onclick=function(){el("wrap").classList.toggle("left-collapsed")};
 
 el("run").onclick=function(){
  el("out").textContent="running "+el("an").value+"…";el("extra").innerHTML="";
@@ -6127,29 +6152,68 @@ function search(){var q=el("sq").value;el("syms").textContent="…";
   el("syms").innerHTML=h||"<p class=note>no matches</p>";
   el("syms").querySelectorAll(".sym").forEach(function(n){n.onclick=function(){
    var k=n.dataset.k,f=n.dataset.f,l=n.dataset.l;
-   var has=function(key){var hit=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
-    if(d.querySelectorAll("input")[0].value===key)hit=true});return hit};
-   var set=function(key,val){var done=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
-    var ins=d.querySelectorAll("input");if(ins[0].value===key){ins[1].value=val;done=true}});
-    if(!done)addKv(key,val)};
-   if(k==="file"){set("file",f);el("ufile").value=f;}
-   else if(k==="class"||k==="interface"||k==="enum"||k==="record"){set("type",n.dataset.n)}
-   else if(k==="method"||k==="func"){set("method",n.dataset.n);el("umethod").value=n.dataset.n;}
-   set("file",f);if(has("line"))set("line",l);
-   el("usr").value=el("sr").value;el("ufile").value=f;
+   if(k==="file"){setParam("file",f);el("ufile").value=f;entryChanged();}
+   else if(k==="class"||k==="interface"||k==="enum"||k==="record"){setParam("type",n.dataset.n)}
+   else if(k==="method"||k==="func"){setParam("method",n.dataset.n);el("umethod").value=n.dataset.n;entryChanged();}
+   setParam("file",f);if(hasParam("line"))setParam("line",l);
+   el("ufile").value=f;
    flash("filled "+f+":"+l);};});
  });}
 el("sgo").onclick=search;el("sq").addEventListener("keydown",function(e){if(e.key==="Enter")search()});
 var stimer=null;el("sq").addEventListener("input",function(){clearTimeout(stimer);stimer=setTimeout(search,180)});
-el("sr").addEventListener("input",function(){el("usr").value=el("sr").value;clearTimeout(stimer);stimer=setTimeout(search,220)});
+el("sr").addEventListener("input",function(){clearTimeout(stimer);stimer=setTimeout(search,220)});
+function fetchSymbols(q,cb){
+ fetch("/api/symbols?root="+encodeURIComponent(el("sr").value)+"&q="+encodeURIComponent(q||""))
+  .then(function(r){return r.json()}).then(function(d){cb(d.symbols||[])}).catch(function(){cb([])});
+}
+function showAC(inputID,boxID,filter,pick){
+ var input=el(inputID),box=el(boxID);
+ fetchSymbols(input.value,function(items){
+  items=items.filter(filter).slice(0,40);
+  if(!items.length){box.style.display="none";box.innerHTML="";return;}
+  box.innerHTML=items.map(function(s,i){return "<div class=acitem data-i='"+i+"'><b>"+esc(s.name)+"</b><span>"+esc(s.kind+" · "+s.file+":"+s.line)+"</span></div>"}).join("");
+  box.style.display="block";
+  box.querySelectorAll(".acitem").forEach(function(n){n.onclick=function(e){e.stopPropagation();pick(items[parseInt(n.dataset.i)]);box.style.display="none";}});
+ });
+}
+var actimer=null;
+function queueFileAC(){clearTimeout(actimer);actimer=setTimeout(function(){showAC("ufile","fileac",function(s){return s.kind==="file"},function(s){el("ufile").value=s.file;setParam("file",s.file);entryChanged();});},120)}
+function queueMethodAC(){clearTimeout(actimer);actimer=setTimeout(function(){var f=el("ufile").value;showAC("umethod","methodac",function(s){return (s.kind==="method"||s.kind==="func")&&(!f||s.file===f)},function(s){el("umethod").value=s.name;setParam("method",s.name);if(!el("ufile").value){el("ufile").value=s.file;setParam("file",s.file)}entryChanged();});},120)}
+el("ufile").addEventListener("input",function(){entryChanged();queueFileAC()});
+el("ufile").addEventListener("focus",queueFileAC);
+el("umethod").addEventListener("input",function(){entryChanged();queueMethodAC()});
+el("umethod").addEventListener("focus",queueMethodAC);
+el("uinputs").addEventListener("input",syncEntryParams);
+document.addEventListener("click",function(e){if(!e.target.closest(".field")){el("fileac").style.display="none";el("methodac").style.display="none";}});
 
 var PANES={unroll:["tunroll","unrollpane"],prev:["tprev","prevpane"],cfg:["tcfg","cfgpane"]};
 function tab(name){for(var k in PANES){var on=k===name;el(PANES[k][0]).classList.toggle("on",on);el(PANES[k][1]).style.display=on?"":"none";}}
 el("tunroll").onclick=function(){tab("unroll")};el("tprev").onclick=function(){tab("prev")};el("tcfg").onclick=function(){tab("cfg")};
 
 // ---- Fix (unroll): discover branches -> choose inputs -> edit (two-way sync) ----
-function ufields(){return {SourceRoot:el("usr").value||el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value};}
+var branchState={};
+function branchString(){var out=[];Object.keys(branchState).sort().forEach(function(k){if(branchState[k])out.push(k+"="+branchState[k])});return out.join(",");}
+function parseBranchString(s){branchState={};(s||"").split(",").forEach(function(p){var i=p.indexOf("=");if(i>0)branchState[p.slice(0,i)]=p.slice(i+1);});}
+function ufields(){return {SourceRoot:el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value,Branches:branchString()};}
+function renderBranches(d){
+ var choices=d.choices||[],bar=el("branchbar");bar.innerHTML="";
+ if(!choices.length){bar.className="branchbar";return;}
+ bar.className="branchbar show";bar.innerHTML="<span class=title>branches</span>";
+ choices.forEach(function(c,idx){
+  if(!branchState[c.id])branchState[c.id]=c.side;
+  var tab=document.createElement("div");tab.className="btab";
+  var where=(c.origin||c.id).split("/").pop();
+  var label=document.createElement("span");label.className="where";label.title=c.cond||"";label.textContent=(idx+1)+". "+where;tab.appendChild(label);
+  (c.sides||[]).forEach(function(side){
+   var b=document.createElement("button");b.textContent=side;b.className=branchState[c.id]===side?"on":"";
+   b.onclick=function(){branchState[c.id]=side;discover(el("uinputs").value);};
+   tab.appendChild(b);
+  });
+  bar.appendChild(tab);
+ });
+}
 function renderProg(d){
+ renderBranches(d);
  var prog=el("uprog");prog.innerHTML="";
  (d.lines||[]).forEach(function(l){
   var row=document.createElement("div");row.className="pl"+(l.branch?" branch":"");
@@ -6165,7 +6229,8 @@ function renderProg(d){
  }
  else if((d.lines||[]).length){b.style.display="";b.className="banner ok";
   var dec=(d.decisions&&d.decisions.length)?"<br><span>"+d.decisions.join("<br>")+"</span>":"";
-  b.innerHTML="✓ Single concrete path"+(d.inputs?" for inputs <code>"+d.inputs+"</code>":"")+". Click any line to edit — your change is written back to the source file shown on its right."+dec;}
+  var via=(d.choices&&d.choices.length)?" Branch tabs show the selected runtime-undecidable side; default is the longest side.":"";
+  b.innerHTML="✓ Single concrete path"+(d.inputs?" for inputs <code>"+esc(d.inputs)+"</code>":"")+". Click any line to edit — your change is written back to the source file shown on its right."+via+dec;}
  else b.style.display="none";
 }
 function discover(inputs){
@@ -6208,9 +6273,10 @@ function saveEdit(line,code){
  if(!q.get("do"))return;
  setTimeout(function(){
   tab("unroll");
-  if(q.get("sr"))el("usr").value=q.get("sr");
+  if(q.get("sr"))el("sr").value=q.get("sr");
   if(q.get("file"))el("ufile").value=q.get("file");
   if(q.get("method"))el("umethod").value=q.get("method");
+  if(q.get("branches"))parseBranchString(q.get("branches"));
   var inputs=q.get("inputs")||"";if(inputs)el("uinputs").value=inputs;
   var d=q.get("do");
   if(d==="discover")discover("");

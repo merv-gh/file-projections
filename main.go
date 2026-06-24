@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -159,6 +160,7 @@ func DefaultRegistry() Registry {
 		"entry-to-exit":     AnalyzerFunc{"entry-to-exit", AnalyzeEntryToExit},
 		"data-flow":         AnalyzerFunc{"data-flow", AnalyzeDataFlow},
 		"object-flow":       AnalyzerFunc{"object-flow", AnalyzeObjectFlow},
+		"cpg-methods":       AnalyzerFunc{"cpg-methods", AnalyzeCPGMethods},
 		"unrolled-program":  AnalyzerFunc{"unrolled-program", AnalyzeUnrolledProgram},
 		"bookmark":          AnalyzerFunc{"bookmark", AnalyzeBookmark},
 		"extract":           AnalyzerFunc{"extract", AnalyzeBookmark}, // back-compat alias
@@ -193,6 +195,54 @@ func main() {
 			return
 		case "perf":
 			must(RunPerf(os.Args[2:], os.Stdout))
+			return
+		case "sync":
+			// Reconcile a two-way projection with its source files (the same engine
+			// `watch` uses, exposed as a one-shot command so external tools can drive
+			// the scattered per-line sync of an unrolled-program edit explicitly).
+			args := os.Args[2:]
+			cfg, err := LoadConfig(subConfigPath(args))
+			must(err)
+			var projArgs []string
+			for i := 0; i < len(args); i++ {
+				a := args[i]
+				if a == "-config" {
+					i++ // skip the flag's value too
+					continue
+				}
+				if strings.HasPrefix(a, "-config=") {
+					continue
+				}
+				projArgs = append(projArgs, a)
+			}
+			if len(projArgs) == 0 {
+				must(errors.New("usage: file-projections sync <projection-file>"))
+			}
+			res, err := SyncProjection(cfg, projArgs[0])
+			must(err)
+			fmt.Printf("synced %s: %d -> source, %d -> projection, %d conflicts\n",
+				projArgs[0], res.ToSource, res.ToProjection, len(res.Conflicts))
+			for _, c := range res.Conflicts {
+				fmt.Println("  conflict:", c)
+			}
+			return
+		case "ui":
+			args := os.Args[2:]
+			cfg, err := LoadConfig(subConfigPath(args))
+			if err != nil && os.IsNotExist(err) {
+				cfg = Config{Root: ".", ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+			} else {
+				must(err)
+			}
+			addr := ":7777"
+			for i, a := range args {
+				if a == "-addr" && i+1 < len(args) {
+					addr = args[i+1]
+				} else if strings.HasPrefix(a, "-addr=") {
+					addr = strings.TrimPrefix(a, "-addr=")
+				}
+			}
+			must(RunUI(cfg, subConfigPath(args), addr, os.Stdout))
 			return
 		case "bookmarks":
 			cfg, err := LoadConfig(subConfigPath(os.Args[2:]))
@@ -295,13 +345,15 @@ COMMANDS
   watch         regenerate on change + sync two-way projection edits back to source
   build         build/refresh the cached Joern CPG (alias: refresh)
   bookmarks     expand single-line drop-in .projection files into two-way bookmarks
+  sync          reconcile a two-way projection with its source (one-shot, like watch)
+  ui            serve a local web UI to edit config, preview lenses, search symbols (-addr :7777)
   perf          benchmark all-to-all entry→exit on a repo, with a wall-clock cap
   version       print the version
   help          show this help
 
 FLAGS (run one ad-hoc lens without a config)
   -config <path>       config file (default config.json)
-  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow|object-flow|unrolled-program
+  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow|object-flow|cpg-methods|unrolled-program
   -source-root <dir>   source root for the ad-hoc lens
   -file -line -var -method -type -inputs -mode -out   lens parameters
 
@@ -312,7 +364,8 @@ LENSES
   data-flow      the lines that shape a variable, as trailing comments
   entry-to-exit  all call-graph flows from entrypoints to exitpoints (joern)
   object-flow    how target-type instances are assembled across files (joern)
-  unrolled-program editable straight-line Java path with scattered two-way sync
+  cpg-methods    language-neutral CPG method/call surface (joern; Java/Go)
+  unrolled-program editable straight-line Java/Go path with scattered two-way sync
   bookmark       two-way verbatim span; or drop in 'pkg/Foo.java:17'
   flow           generic "annotated entry reaches a sink"
 
@@ -1793,7 +1846,7 @@ func joernSourceRoots(cfg Config) []string {
 	roots := map[string]bool{}
 	for _, lens := range cfg.Lenses {
 		switch lens.Analyzer {
-		case "joern-var-flow", "control-flow", "data-flow", "entry-to-exit", "object-flow":
+		case "joern-var-flow", "control-flow", "data-flow", "entry-to-exit", "object-flow", "cpg-methods":
 			if lens.SourceRoot != "" {
 				roots[lens.SourceRoot] = true
 			}
@@ -3324,6 +3377,35 @@ func AnalyzeObjectFlow(cfg Config, lens LensConfig) (Projection, error) {
 	return p, nil
 }
 
+// AnalyzeCPGMethods is a small language-agnostic CPG adapter: it asks Joern for
+// methods and their direct call names under a source root. The root can be Java
+// or Go; ensureCPG/buildCPGForRoot chooses javasrc2cpg vs gosrc2cpg from the
+// source files, so the lens logic stays language-neutral.
+func AnalyzeCPGMethods(cfg Config, lens LensConfig) (Projection, error) {
+	outRel := filepath.ToSlash(filepath.Join(cfg.ProjectionsDir, ".joern-cpg-methods.jsonl"))
+	if err := os.MkdirAll(filepath.Join(cfg.Root, cfg.ProjectionsDir), 0755); err != nil {
+		return Projection{}, err
+	}
+	kv := map[string]string{
+		"root": lens.SourceRoot,
+		"out":  outRel,
+		"file": lens.Params["file"],
+		"name": lens.Params["method"],
+	}
+	if err := runJoernQuery(cfg, lens, "cpg-methods.sc", outRel, kv, os.Stderr); err != nil {
+		return Projection{}, fmt.Errorf("cpg-methods: %w", err)
+	}
+	jsonLens := lens
+	jsonLens.Input = outRel
+	jsonLens.Analyzer = "jsonl"
+	p, err := AnalyzeJSONL(cfg, jsonLens)
+	if err != nil {
+		return Projection{}, err
+	}
+	p.Sync = "view-only"
+	return p, nil
+}
+
 type unrollLine struct {
 	code string
 	file string
@@ -3335,6 +3417,10 @@ type unrollLine struct {
 // entry file/method and may provide concrete inputs for branch selection instead
 // of relying on fixture-specific package or class names.
 func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
+	lang := coalesce(lens.Params["lang"], rootLanguage(cfg, lens.SourceRoot))
+	if lang == "go" {
+		return AnalyzeGoUnrolledProgram(cfg, lens)
+	}
 	file := lens.Params["file"]
 	method := lens.Params["method"]
 	if file == "" {
@@ -3343,7 +3429,7 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	if method == "" {
 		return Projection{}, errors.New("unrolled-program: params.method is required")
 	}
-	u := javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"])}
+	u := &javaUnroller{cfg: cfg, lens: lens, env: parseUnrollInputs(lens.Params["inputs"]), seenDecision: map[string]bool{}}
 	lines, err := u.unrollMethod(file, method, 0)
 	if err != nil {
 		return Projection{}, err
@@ -3369,6 +3455,9 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 		Sync:        "two-way",
 	})
 	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "editable straight-line Java path; each line syncs back to its original source line"})
+	for i, d := range u.decisions {
+		p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("branch-%d", i+1), Tool: "unrolled-program", Text: d})
+	}
 	if lens.Params["inputs"] == "" {
 		p.Facts = append(p.Facts, ProjectionFact{ID: "branching", Tool: "unrolled-program", Text: "no params.inputs supplied; unknown conditions include both branches"})
 	}
@@ -3376,12 +3465,14 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 }
 
 type javaUnroller struct {
-	cfg  Config
-	lens LensConfig
-	env  map[string]string
+	cfg          Config
+	lens         LensConfig
+	env          map[string]string
+	decisions    []string
+	seenDecision map[string]bool
 }
 
-func (u javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine, error) {
+func (u *javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine, error) {
 	if depth > 8 {
 		return nil, fmt.Errorf("unrolled-program: recursion limit while inlining %s.%s", file, method)
 	}
@@ -3408,7 +3499,7 @@ func (u javaUnroller) unrollMethod(file, method string, depth int) ([]unrollLine
 	return u.unrollRange(file, lines, open+1, close-1, depth)
 }
 
-func (u javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int) ([]unrollLine, error) {
+func (u *javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int) ([]unrollLine, error) {
 	var out []unrollLine
 	for i := lo; i <= hi && i < len(lines); i++ {
 		raw := lines[i]
@@ -3430,18 +3521,21 @@ func (u javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int
 			decision, known := evalJavaCond(cond, u.env)
 			switch {
 			case known && decision:
+				u.addDecision(file, i+1, cond, "then", "decided from inputs")
 				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
 				if err != nil {
 					return nil, err
 				}
 				out = append(out, part...)
 			case known && !decision && hasElse && !elseIf:
+				u.addDecision(file, i+1, cond, "else", "decided from inputs")
 				part, err := u.unrollRange(file, lines, elseBrace+1, elseClose-1, depth)
 				if err != nil {
 					return nil, err
 				}
 				out = append(out, part...)
 			case !known:
+				u.addDecision(file, i+1, cond, "both", "runtime-dependent or missing input")
 				out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: file, line: i + 1})
 				part, err := u.unrollRange(file, lines, braceLine+1, closeLine-1, depth)
 				if err != nil {
@@ -3474,21 +3568,34 @@ func (u javaUnroller) unrollRange(file string, lines []string, lo, hi, depth int
 	return out, nil
 }
 
-func (u javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, bool, error) {
+func (u *javaUnroller) addDecision(file string, line int, cond, branch, why string) {
+	msg := fmt.Sprintf("%s:%d if (%s) -> %s (%s)", file, line, cond, branch, why)
+	if u.seenDecision[msg] {
+		return
+	}
+	u.seenDecision[msg] = true
+	u.decisions = append(u.decisions, msg)
+}
+
+func (u *javaUnroller) inlineCall(file, trim string, depth int) ([]unrollLine, bool, error) {
 	if m := regexp.MustCompile(`new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
 		calleeFile := filepath.ToSlash(filepath.Join(filepath.Dir(file), m[1]+".java"))
-		next := u
+		next := *u
 		next.bindArgs(calleeFile, m[2], splitArgs(m[3]))
 		lines, err := next.unrollMethod(calleeFile, m[2], depth+1)
+		u.decisions = next.decisions
+		u.seenDecision = next.seenDecision
 		return lines, true, err
 	}
 	if m := regexp.MustCompile(`=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)`).FindStringSubmatch(trim); m != nil {
 		if _, methods, err := u.readJavaMethods(file); err == nil {
 			for _, method := range methods {
 				if method.Name == m[1] {
-					next := u
+					next := *u
 					next.bindArgs(file, m[1], splitArgs(m[2]))
 					lines, err := next.unrollMethod(file, m[1], depth+1)
+					u.decisions = next.decisions
+					u.seenDecision = next.seenDecision
 					return lines, true, err
 				}
 			}
@@ -3522,7 +3629,7 @@ func (u *javaUnroller) bindArgs(file, method string, args []string) {
 	}
 }
 
-func (u javaUnroller) readJavaMethods(file string) ([]string, []JavaMethod, error) {
+func (u *javaUnroller) readJavaMethods(file string) ([]string, []JavaMethod, error) {
 	path := filepath.Join(u.cfg.Root, u.lens.SourceRoot, filepath.FromSlash(file))
 	lines, err := readLines(path)
 	if err != nil {
@@ -3627,6 +3734,132 @@ func evalJavaCond(cond string, env map[string]string) (bool, bool) {
 		return ok && v == m[2], ok
 	}
 	return false, false
+}
+
+type goUnroller struct {
+	cfg       Config
+	lens      LensConfig
+	functions map[string]goFuncRef
+}
+
+type goFuncRef struct {
+	file string
+	fn   GoFunc
+}
+
+func AnalyzeGoUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
+	file := lens.Params["file"]
+	method := lens.Params["method"]
+	if file == "" {
+		return Projection{}, errors.New("unrolled-program go: params.file is required")
+	}
+	if method == "" {
+		return Projection{}, errors.New("unrolled-program go: params.method is required")
+	}
+	u, err := newGoUnroller(cfg, lens)
+	if err != nil {
+		return Projection{}, err
+	}
+	lines, err := u.unroll(file, method, 0)
+	if err != nil {
+		return Projection{}, err
+	}
+	var body []string
+	var origins []LineOrigin
+	for _, line := range lines {
+		body = append(body, line.code)
+		src := filepath.ToSlash(filepath.Join(lens.SourceRoot, line.file))
+		origins = append(origins, LineOrigin{SrcFile: src, Line: line.line, SrcHash: hash(line.code + "\n")})
+	}
+	p := Projection{Sync: "two-way"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{
+		ID: method, File: file, Mode: "unrolled", Tool: "unrolled-program:go",
+		Lines: body, LineOrigins: origins, Sync: "two-way",
+	})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "go adapter: editable straight-line function path; each line syncs back to its original source line"})
+	return p, nil
+}
+
+func newGoUnroller(cfg Config, lens LensConfig) (*goUnroller, error) {
+	files, err := scanGoFiles(cfg, lens)
+	if err != nil {
+		return nil, err
+	}
+	u := &goUnroller{cfg: cfg, lens: lens, functions: map[string]goFuncRef{}}
+	for _, f := range files {
+		rel := strings.TrimPrefix(strings.TrimPrefix(f.Rel, filepath.ToSlash(lens.SourceRoot)+"/"), "./")
+		for _, fn := range f.Funcs {
+			u.functions[fn.Name] = goFuncRef{file: rel, fn: fn}
+		}
+	}
+	return u, nil
+}
+
+func (u *goUnroller) unroll(file, name string, depth int) ([]unrollLine, error) {
+	if depth > 8 {
+		return nil, fmt.Errorf("unrolled-program go: recursion limit while inlining %s", name)
+	}
+	ref, ok := u.functions[name]
+	if !ok {
+		return nil, fmt.Errorf("unrolled-program go: function %q not found", name)
+	}
+	if file != "" && ref.file != file {
+		if byFile, ok := u.findGoFunc(file, name); ok {
+			ref = byFile
+		}
+	}
+	path := filepath.Join(u.cfg.Root, u.lens.SourceRoot, filepath.FromSlash(ref.file))
+	lines, err := readLines(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []unrollLine
+	for i := ref.fn.Line; i <= ref.fn.End-2 && i < len(lines); i++ {
+		raw := lines[i]
+		trim := strings.TrimSpace(stripLineComment(raw))
+		if trim == "" || trim == "{" || trim == "}" {
+			continue
+		}
+		if called := simpleGoCall(trim); called != "" && called != name {
+			if _, ok := u.functions[called]; ok {
+				part, err := u.unroll("", called, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, part...)
+				continue
+			}
+		}
+		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: ref.file, line: i + 1})
+	}
+	return out, nil
+}
+
+func (u *goUnroller) findGoFunc(file, name string) (goFuncRef, bool) {
+	for _, ref := range u.functions {
+		if ref.file == file && ref.fn.Name == name {
+			return ref, true
+		}
+	}
+	return goFuncRef{}, false
+}
+
+func simpleGoCall(trim string) string {
+	if strings.HasPrefix(trim, "return ") {
+		trim = strings.TrimSpace(strings.TrimPrefix(trim, "return "))
+	}
+	if strings.Contains(trim, ":=") {
+		_, rhs, _ := strings.Cut(trim, ":=")
+		trim = strings.TrimSpace(rhs)
+	} else if strings.Contains(trim, "=") {
+		_, rhs, _ := strings.Cut(trim, "=")
+		trim = strings.TrimSpace(rhs)
+	}
+	m := regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*\(`).FindStringSubmatch(trim)
+	if m == nil {
+		return ""
+	}
+	return m[1]
 }
 
 func AnalyzeControlFlow(cfg Config, lens LensConfig) (Projection, error) {
@@ -5117,3 +5350,772 @@ func hasTwoWayBlock(projPath string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// `ui` command — a small local web UI (single embedded page, stdlib net/http)
+// to edit config.json, preview any lens ad-hoc against the real analyzers, and
+// search source symbols so the file/method/line/type params a lens needs can be
+// picked from real code instead of guessed. Same registry the CLI uses — the UI
+// is a thin shell over ExecuteLens, never a parallel implementation.
+// ---------------------------------------------------------------------------
+
+type uiServer struct {
+	mu         sync.Mutex
+	cfg        Config
+	configPath string
+	registry   Registry
+}
+
+type uiDefaults struct {
+	SourceRoot  string `json:"source_root"`
+	EntryFile   string `json:"entry_file"`
+	EntryMethod string `json:"entry_method"`
+	Language    string `json:"language"`
+	Analyzer    string `json:"analyzer"`
+}
+
+func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
+	if configPath == "" {
+		configPath = "config.json"
+	}
+	s := &uiServer{cfg: cfg, configPath: configPath, registry: DefaultRegistry()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, uiHTML)
+	})
+	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/preview", s.handlePreview)
+	mux.HandleFunc("/api/symbols", s.handleSymbols)
+	mux.HandleFunc("/api/unroll", s.handleUnroll)
+	mux.HandleFunc("/api/unroll/edit", s.handleUnrollEdit)
+	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
+	return http.ListenAndServe(addr, mux)
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func (s *uiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		var c Config
+		if err := json.Unmarshal(body, &c); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "invalid config: " + err.Error()})
+			return
+		}
+		if err := os.WriteFile(s.configPath, body, 0644); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		s.mu.Lock()
+		s.cfg = c
+		s.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"ok": true, "lenses": len(c.Lenses)})
+		return
+	}
+	raw, err := os.ReadFile(s.configPath)
+	if err != nil {
+		// no config yet: hand back the in-memory defaults
+		s.mu.Lock()
+		raw, _ = json.MarshalIndent(s.cfg, "", "  ")
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	def := suggestUIDefaults(s.cfg)
+	s.mu.Unlock()
+	analyzers := make([]string, 0, len(s.registry))
+	for name := range s.registry {
+		analyzers = append(analyzers, name)
+	}
+	sort.Strings(analyzers)
+	writeJSON(w, 200, map[string]any{
+		"config":    json.RawMessage(raw),
+		"analyzers": analyzers,
+		"path":      s.configPath,
+		"defaults":  def,
+	})
+}
+
+func suggestUIDefaults(cfg Config) uiDefaults {
+	def := uiDefaults{}
+	scan := scanProject(cfg)
+	lang := scan.dominant()
+	if fileExists(filepath.Join(cfg.Root, "go.mod")) || fileExists(filepath.Join(cfg.Root, "main.go")) {
+		lang = "go"
+	}
+	def.Language = lang
+	def.SourceRoot = scan.suggestRoot(cfg, lang)
+	if def.SourceRoot == "" {
+		def.SourceRoot = "."
+	}
+	def.EntryFile, def.EntryMethod = suggestUIMethod(cfg, def.SourceRoot, lang)
+	switch lang {
+	case "go":
+		def.Analyzer = "go-symbols"
+	case "java":
+		def.Analyzer = "unrolled-program"
+	default:
+		def.Analyzer = "entrypoints"
+	}
+	return def
+}
+
+func suggestUIMethod(cfg Config, sourceRoot, lang string) (file, method string) {
+	base := filepath.Join(cfg.Root, sourceRoot)
+	type cand struct {
+		file   string
+		method string
+		score  int
+		line   int
+	}
+	var cands []cand
+	preferred := map[string]int{"summary": 100, "main": 90, "handle": 80, "process": 70, "checkout": 60, "build": 50, "run": 40}
+	if lang == "go" {
+		preferred = map[string]int{"run": 120, "main": 100, "executelens": 90, "analyze": 80, "handle": 70, "build": 60}
+	}
+	_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if shouldSkipDir(cfg, path, d) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || strings.Contains(filepath.ToSlash(path), "/test/") {
+			return nil
+		}
+		lines, err := readLines(path)
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(base, path)
+		rel = filepath.ToSlash(rel)
+		switch filepath.Ext(path) {
+		case ".java":
+			if lang != "" && lang != "java" {
+				return nil
+			}
+			methods, err := parseJavaMethods(lines)
+			if err != nil {
+				return nil
+			}
+			for _, m := range methods {
+				score := preferred[strings.ToLower(m.Name)]
+				for _, a := range m.Annotations {
+					if strings.Contains(a, "Mapping") || strings.Contains(a, "Listener") || strings.Contains(a, "Scheduled") {
+						score += 30
+					}
+				}
+				if strings.Contains(strings.ToLower(filepath.Base(rel)), "controller") {
+					score += 10
+				}
+				cands = append(cands, cand{file: rel, method: m.Name, score: score, line: m.Start})
+			}
+		case ".go":
+			if lang != "" && lang != "go" {
+				return nil
+			}
+			gf, err := parseGoFile(base, path)
+			if err != nil {
+				return nil
+			}
+			for _, fn := range gf.Funcs {
+				score := preferred[strings.ToLower(fn.Name)]
+				if strings.EqualFold(filepath.Base(rel), "main.go") {
+					score += 20
+				}
+				if strings.HasSuffix(fn.Name, "Handler") || strings.HasPrefix(fn.Name, "Handle") {
+					score += 15
+				}
+				cands = append(cands, cand{file: rel, method: fn.Name, score: score, line: fn.Line})
+			}
+		}
+		return nil
+	})
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].score == cands[j].score {
+			if cands[i].file == cands[j].file {
+				return cands[i].line < cands[j].line
+			}
+			return cands[i].file < cands[j].file
+		}
+		return cands[i].score > cands[j].score
+	})
+	if len(cands) == 0 {
+		return "", ""
+	}
+	return cands[0].file, cands[0].method
+}
+
+// handlePreview runs a single ad-hoc lens and returns the rendered projection
+// body — exactly what would be written to disk, minus the volatile header — so a
+// user can try a lens/params combo on a real project before committing it to config.
+func (s *uiServer) handlePreview(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Analyzer   string            `json:"analyzer"`
+		SourceRoot string            `json:"source_root"`
+		Include    []string          `json:"include"`
+		Params     map[string]any    `json:"params"`
+		ParamsStr  map[string]string `json:"-"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Analyzer == "" {
+		writeJSON(w, 400, map[string]string{"error": "analyzer is required"})
+		return
+	}
+	params := map[string]string{}
+	for k, v := range req.Params {
+		switch t := v.(type) {
+		case string:
+			params[k] = t
+		case float64:
+			params[k] = strconv.FormatFloat(t, 'f', -1, 64)
+		case bool:
+			params[k] = strconv.FormatBool(t)
+		default:
+			if b, err := json.Marshal(v); err == nil {
+				params[k] = string(b)
+			}
+		}
+	}
+	s.mu.Lock()
+	cfg := s.cfg
+	reg := s.registry
+	s.mu.Unlock()
+	lens := LensConfig{
+		Name:       "ui-preview",
+		Analyzer:   req.Analyzer,
+		SourceRoot: req.SourceRoot,
+		Include:    req.Include,
+		Params:     params,
+	}
+	p, err := ExecuteLens(cfg, reg, lens)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	body := projectionBody(p)
+	extra := make([]map[string]any, 0, len(p.Extra))
+	for _, ex := range p.Extra {
+		extra = append(extra, map[string]any{"path": ex.Path, "body": projectionBody(ex.Proj)})
+	}
+	writeJSON(w, 200, map[string]any{
+		"body":   body,
+		"sync":   p.Sync,
+		"blocks": len(p.Blocks),
+		"facts":  len(p.Facts),
+		"extra":  extra,
+	})
+}
+
+type uiSymbol struct {
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+
+// handleSymbols searches source under a root for declarations (java classes/methods,
+// go funcs/types) matching q — so a user picking control-flow/data-flow/object-flow
+// params has the real file:line/type to fill in, the way an MCP symbol search would.
+func (s *uiServer) handleSymbols(w http.ResponseWriter, r *http.Request) {
+	q := strings.ToLower(r.URL.Query().Get("q"))
+	root := r.URL.Query().Get("root")
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	syms, err := collectSymbols(cfg, root, q, 200)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"symbols": syms})
+}
+
+// unrollLineView is one line of the straight-line program plus the real source location it
+// came from, so the UI can show "discover branches -> choose inputs -> edit", and each edit
+// goes back to its true origin via the same two-way sync the CLI uses.
+type unrollLineView struct {
+	N      int    `json:"n"`
+	Code   string `json:"code"`
+	Origin string `json:"origin"` // file:line, the real source the line came from
+	Branch bool   `json:"branch"` // an unresolved `if (...)` / `switch` header
+}
+
+func (s *uiServer) unrollProjection(srcRoot, file, method, inputs string) (Projection, Config, Registry, error) {
+	s.mu.Lock()
+	cfg := s.cfg
+	reg := s.registry
+	s.mu.Unlock()
+	lens := LensConfig{
+		Name:       "ui-unroll",
+		Out:        filepath.Join(cfg.ProjectionsDir, "ui-unroll.projection"),
+		Analyzer:   "unrolled-program",
+		SourceRoot: srcRoot,
+		Params:     map[string]string{"file": file, "method": method},
+	}
+	if inputs != "" {
+		lens.Params["inputs"] = inputs
+	}
+	p, err := ExecuteLens(cfg, reg, lens)
+	return p, cfg, reg, err
+}
+
+var uiBranchRE = regexp.MustCompile(`^\s*(if|else if|switch|while|for|case)\b`)
+
+func unrollViewLines(p Projection) []unrollLineView {
+	var out []unrollLineView
+	for _, b := range p.Blocks {
+		for i, code := range b.Lines {
+			lv := unrollLineView{N: len(out) + 1, Code: strings.TrimRight(code, " \t"), Branch: uiBranchRE.MatchString(code)}
+			if i < len(b.LineOrigins) {
+				o := b.LineOrigins[i]
+				if o.SrcFile != "" {
+					lv.Origin = fmt.Sprintf("%s:%d", o.SrcFile, o.Line)
+				}
+			}
+			out = append(out, lv)
+		}
+	}
+	return out
+}
+
+func unrollDecisionFacts(p Projection) []string {
+	var out []string
+	for _, f := range p.Facts {
+		if f.Tool == "unrolled-program" && strings.HasPrefix(f.ID, "branch-") {
+			out = append(out, f.Text)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// handleUnroll renders the straight-line program for an entry method. With no inputs the
+// analyzer keeps the `if (...)` headers in place (branch discovery); with inputs it collapses
+// to the single path those inputs execute.
+func (s *uiServer) handleUnroll(w http.ResponseWriter, r *http.Request) {
+	var req struct{ SourceRoot, File, Method, Inputs string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.File == "" || req.Method == "" {
+		writeJSON(w, 400, map[string]string{"error": "file and method are required"})
+		return
+	}
+	p, _, _, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	lines := unrollViewLines(p)
+	unresolved := false
+	for _, l := range lines {
+		if l.Branch {
+			unresolved = true
+		}
+	}
+	writeJSON(w, 200, map[string]any{"lines": lines, "unresolved": unresolved, "inputs": req.Inputs, "decisions": unrollDecisionFacts(p)})
+}
+
+// handleUnrollEdit applies one line edit and writes it back to that line's origin file via the
+// real SyncProjection (scattered two-way), then returns the refreshed program. Exactly the CLI
+// path: render projection -> edit the block line -> sync -> re-render.
+func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SourceRoot, File, Method, Inputs, NewCode string
+		Line                                      int
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	p, cfg, reg, err := s.unrollProjection(req.SourceRoot, req.File, req.Method, req.Inputs)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	lines := unrollViewLines(p)
+	if req.Line < 1 || req.Line > len(lines) {
+		writeJSON(w, 200, map[string]any{"error": fmt.Sprintf("line must be 1..%d", len(lines))})
+		return
+	}
+	// Render to a temp projection, replace the line (preserving indent), then sync back.
+	projPath := filepath.Join(cfg.Root, cfg.ProjectionsDir, "ui-unroll.projection")
+	if err := RenderProjection(projPath, p); err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	raw, err := readLines(projPath)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	bi := -1
+	for i, l := range raw {
+		if strings.HasPrefix(l, "@@ ") {
+			bi = i
+			break
+		}
+	}
+	if bi < 0 {
+		writeJSON(w, 200, map[string]any{"error": "no block in projection"})
+		return
+	}
+	orig := raw[bi+req.Line]
+	indent := orig[:len(orig)-len(strings.TrimLeft(orig, " \t"))]
+	raw[bi+req.Line] = indent + strings.TrimSpace(req.NewCode)
+	if err := writeLines(projPath, raw); err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	res, err := SyncProjection(cfg, projPath)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	// Re-render from current source so the UI shows the synced state.
+	p2, err := ExecuteLens(cfg, reg, p.Lens)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	origin := lines[req.Line-1].Origin
+	writeJSON(w, 200, map[string]any{
+		"lines":     unrollViewLines(p2),
+		"decisions": unrollDecisionFacts(p2),
+		"synced":    fmt.Sprintf("%d → source, %d conflicts", res.ToSource, len(res.Conflicts)),
+		"conflicts": res.Conflicts,
+		"origin":    origin,
+	})
+}
+
+var uiJavaClassRE = regexp.MustCompile(`^\s*(?:public\s+|final\s+|abstract\s+)*(class|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+var uiGoDeclRE = regexp.MustCompile(`^func(?:\s+\([^)]*\))?\s+([A-Za-z_][A-Za-z0-9_]*)|^type\s+([A-Za-z_][A-Za-z0-9_]*)`)
+
+func collectSymbols(cfg Config, root, q string, limit int) ([]uiSymbol, error) {
+	base := filepath.Join(cfg.Root, root)
+	var out []uiSymbol
+	match := func(name string) bool { return q == "" || strings.Contains(strings.ToLower(name), q) }
+	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries rather than abort the whole walk
+		}
+		if d.IsDir() {
+			if shouldSkipDir(cfg, path, d) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if len(out) >= limit {
+			return filepath.SkipAll
+		}
+		rel, _ := filepath.Rel(base, path)
+		rel = filepath.ToSlash(rel)
+		ext := filepath.Ext(path)
+		switch ext {
+		case ".java":
+			if match(rel) || match(filepath.Base(rel)) {
+				out = append(out, uiSymbol{Name: rel, Kind: "file", File: rel, Line: 1})
+			}
+			lines, err := readLines(path)
+			if err != nil {
+				return nil
+			}
+			for i, l := range lines {
+				if m := uiJavaClassRE.FindStringSubmatch(l); m != nil && match(m[2]) {
+					out = append(out, uiSymbol{Name: m[2], Kind: m[1], File: rel, Line: i + 1})
+				}
+			}
+			if methods, err := parseJavaMethods(lines); err == nil {
+				for _, m := range methods {
+					if match(m.Name) {
+						out = append(out, uiSymbol{Name: m.Name, Kind: "method", File: rel, Line: m.Start})
+					}
+				}
+			}
+		case ".go":
+			if match(rel) || match(filepath.Base(rel)) {
+				out = append(out, uiSymbol{Name: rel, Kind: "file", File: rel, Line: 1})
+			}
+			lines, err := readLines(path)
+			if err != nil {
+				return nil
+			}
+			for i, l := range lines {
+				if m := uiGoDeclRE.FindStringSubmatch(l); m != nil {
+					name := m[1]
+					kind := "func"
+					if name == "" {
+						name, kind = m[2], "type"
+					}
+					if match(name) {
+						out = append(out, uiSymbol{Name: name, Kind: kind, File: rel, Line: i + 1})
+					}
+				}
+			}
+		}
+		return nil
+	})
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].File == out[j].File {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].File < out[j].File
+	})
+	return out, err
+}
+
+const uiHTML = `<!doctype html><html><head><meta charset=utf-8>
+<title>file-projections · lens studio</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a7;--accent:#6ea8fe;--ok:#4ade80;--bad:#f87171}
+*{box-sizing:border-box}body{margin:0;font:13px/1.5 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:.7rem 1rem;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:.6rem}
+header b{font-size:1.05rem}header span{color:var(--mut);font-size:.8rem}
+.wrap{display:grid;grid-template-columns:340px 1fr;gap:0;height:calc(100vh - 49px)}
+.col{overflow:auto;padding:1rem}.col.left{border-right:1px solid var(--line);background:var(--panel)}
+h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:1.2rem 0 .5rem}
+h2:first-child{margin-top:0}
+label{display:block;color:var(--mut);font-size:.72rem;margin:.5rem 0 .15rem}
+input,select,textarea{width:100%;background:#0c0e13;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:.4rem .5rem;font:inherit}
+textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical}
+button{background:var(--accent);color:#06121f;border:0;border-radius:6px;padding:.45rem .8rem;font-weight:600;cursor:pointer}
+button.ghost{background:#222836;color:var(--fg);border:1px solid var(--line)}
+.row{display:flex;gap:.4rem;align-items:center}.row input{flex:1}
+.kv{display:grid;grid-template-columns:1fr 1.4fr auto;gap:.3rem;margin:.2rem 0}
+pre{background:#0c0e13;border:1px solid var(--line);border-radius:8px;padding:.7rem;overflow:auto;white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:60vh}
+.sym{padding:.3rem .45rem;border-bottom:1px solid var(--line);cursor:pointer;display:flex;justify-content:space-between;gap:.5rem}
+.sym:hover{background:#1d2230}.sym .k{color:var(--accent);font-size:.7rem}.sym .f{color:var(--mut);font-size:.72rem}
+.note{color:var(--mut);font-size:.74rem;margin:.3rem 0}.err{color:var(--bad)}.ok{color:var(--ok)}
+.tabs{display:flex;gap:.3rem;margin-bottom:.6rem}.tabs button{background:#222836;color:var(--fg);border:1px solid var(--line);font-weight:500}
+.tabs button.on{background:var(--accent);color:#06121f}
+.banner{margin:.6rem 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;background:#3a2d12;color:#f0c674;border:1px solid #5a4a1e}
+.banner.ok{background:#12331c;color:#7bd88f;border-color:#1e5a30}
+.prog{margin:.6rem 0;border:1px solid var(--line);border-radius:8px;overflow:hidden;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+.pl{display:grid;grid-template-columns:2.2rem 1fr auto;gap:.4rem;align-items:center;padding:.28rem .6rem;border-bottom:1px solid #20242e;cursor:pointer}
+.pl:last-child{border-bottom:0}.pl:hover{background:#1d2230}.pl .ln{color:#5b6675;text-align:right}
+.pl .code{white-space:pre;overflow-x:auto}.pl .org{color:#5b6675;font-size:.74rem;white-space:nowrap}
+.pl.branch{background:#2a2410}.pl.branch .ln{color:#f0c674}
+.pl.editing{background:#11202e}.pl.flash{animation:flash 1.1s ease-out}
+@keyframes flash{from{background:#1e5a30}to{background:transparent}}
+.pl .edit{grid-column:2/4;display:flex;gap:.4rem;margin-top:.2rem}
+.pl .edit input{flex:1;font-family:inherit;font-size:12.5px}
+</style></head><body>
+<header><b>file-projections</b><span id=cfgpath></span><span style=margin-left:auto id=msg></span></header>
+<div class=wrap>
+ <div class="col left">
+  <h2>Preview a lens</h2>
+  <label>analyzer</label><select id=an></select>
+  <label>source_root</label><input id=sr placeholder="src/main/java">
+  <div id=kvs></div>
+  <div class=row style=margin-top:.4rem><button class=ghost id=addkv>+ param</button><button id=run>Preview ▶</button></div>
+  <p class=note>Params depend on the lens: control-flow/data-flow want <code>file,line</code>; data-flow also <code>var</code>; object-flow <code>type</code>; unrolled-program <code>file,method,inputs</code>; entrypoints <code>patterns</code>; exitpoints <code>sinks</code>.</p>
+
+  <h2>Search symbols</h2>
+  <div class=row><input id=sq placeholder="name… (uses source_root above)"><button class=ghost id=sgo>Find</button></div>
+  <div id=syms></div>
+ </div>
+ <div class=col>
+  <div class=tabs><button class=on id=tunroll>Fix (unroll)</button><button id=tprev>Preview</button><button id=tcfg>config.json</button></div>
+  <div id=unrollpane>
+   <p class=note>Flatten a method's cross-file, branched execution into one straight-line program, then edit a line — the change syncs back to the real source file it came from. Workflow: <b>1) discover branches → 2) choose inputs → 3) edit</b>.</p>
+   <div class=kv style="grid-template-columns:1fr 1.6fr 1fr">
+    <input id=usr placeholder="source_root e.g. src/main/java">
+    <input id=ufile placeholder="entry file e.g. sample/App.java">
+    <input id=umethod placeholder="method e.g. summary">
+   </div>
+   <div class=row style=margin-top:.4rem>
+    <button id=udiscover>① Discover branches</button>
+    <input id=uinputs placeholder="② inputs e.g. coupon=save,amount=50" style=flex:1>
+    <button class=ghost id=uapply>Apply inputs</button>
+   </div>
+   <div id=ubanner class=banner style=display:none></div>
+   <div id=uprog class=prog></div>
+   <div class=note id=ustatus></div>
+  </div>
+  <div id=prevpane style=display:none><pre id=out>Pick an analyzer + source_root, then Preview.</pre><div id=extra></div></div>
+  <div id=cfgpane style=display:none>
+   <textarea id=cfg rows=28></textarea>
+   <div class=row style=margin-top:.5rem><button id=savecfg>Save config.json</button><span class=note id=cfgmsg></span></div>
+  </div>
+ </div>
+</div>
+<script>
+var msg=document.getElementById("msg");
+function flash(t,bad){msg.textContent=t;msg.className=bad?"err":"ok";setTimeout(function(){msg.textContent=""},2500);}
+function el(id){return document.getElementById(id);}
+function addKv(k,v){var d=document.createElement("div");d.className="kv";
+ d.innerHTML='<input placeholder=key><input placeholder=value><button class=ghost>×</button>';
+ var ins=d.querySelectorAll("input");ins[0].value=k||"";ins[1].value=v||"";
+ d.querySelector("button").onclick=function(){d.remove()};el("kvs").appendChild(d);}
+function params(){var o={};el("kvs").querySelectorAll(".kv").forEach(function(d){
+ var ins=d.querySelectorAll("input");if(ins[0].value)o[ins[0].value]=ins[1].value;});return o;}
+function presets(){var a=el("an").value;el("kvs").innerHTML="";
+ var P={"control-flow":[["file",""],["line",""]],"data-flow":[["file",""],["line",""],["var",""]],
+  "object-flow":[["type",""],["mode","joern"]],"unrolled-program":[["file",""],["method",""],["inputs",""]],
+  "cpg-methods":[["file",""],["method",""]],"go-symbols":[],
+  "entrypoints":[["patterns","http-mapping=@(Get|Post)Mapping"]],"exitpoints":[["sinks","*repository*.save,*kafka*.send"]],
+  "flow":[["entry","@PostMapping"],["sink","\\.save\\("]],"bookmark":[["file",""],["lines",""]],
+  "joern-var-flow":[["file",""],["var",""],["mode","joern"]]};
+ (P[a]||[]).forEach(function(p){addKv(p[0],p[1])});
+ el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");
+  if(ins[0].value==="file"&&el("ufile").value)ins[1].value=el("ufile").value;
+  if(ins[0].value==="method"&&el("umethod").value)ins[1].value=el("umethod").value;});}
+
+fetch("/api/config").then(function(r){return r.json()}).then(function(d){
+ el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
+ var s=el("an");(d.analyzers||[]).forEach(function(a){var o=document.createElement("option");o.value=o.textContent=a;s.appendChild(o)});
+ var df=d.defaults||{};
+ if(df.analyzer && Array.from(s.options).some(function(o){return o.value===df.analyzer}))s.value=df.analyzer;
+ else s.value="control-flow";
+ presets();
+ if(df.source_root){el("sr").value=df.source_root;el("usr").value=df.source_root;}
+ if(df.entry_file)el("ufile").value=df.entry_file;
+ if(df.entry_method)el("umethod").value=df.entry_method;
+ if(df.entry_file){el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");if(ins[0].value==="file")ins[1].value=df.entry_file;});}
+ if(df.entry_method){el("kvs").querySelectorAll(".kv").forEach(function(d){var ins=d.querySelectorAll("input");if(ins[0].value==="method")ins[1].value=df.entry_method;});}
+ search();
+});
+el("an").onchange=presets;el("addkv").onclick=function(){addKv("","")};
+
+el("run").onclick=function(){
+ el("out").textContent="running "+el("an").value+"…";el("extra").innerHTML="";
+ fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({analyzer:el("an").value,source_root:el("sr").value,params:params()})})
+ .then(function(r){return r.json()}).then(function(d){
+  if(d.error){el("out").textContent="error: "+d.error;el("out").classList.add("err");return;}
+  el("out").classList.remove("err");
+  el("out").textContent=(d.body||"(empty projection)")+"\n— "+d.blocks+" blocks · "+d.facts+" facts · "+d.sync;
+  if(d.extra&&d.extra.length){var h="";d.extra.forEach(function(e){
+   h+="<h2>"+e.path+"</h2><pre>"+e.body.replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})+"</pre>";});
+   el("extra").innerHTML=h;}
+ }).catch(function(e){el("out").textContent=String(e)});};
+
+function search(){var q=el("sq").value;el("syms").textContent="…";
+ fetch("/api/symbols?root="+encodeURIComponent(el("sr").value)+"&q="+encodeURIComponent(q))
+ .then(function(r){return r.json()}).then(function(d){
+  if(d.error){el("syms").innerHTML="<p class=err>"+d.error+"</p>";return;}
+  var h="";(d.symbols||[]).slice(0,150).forEach(function(s){
+   h+="<div class=sym data-f='"+s.file+"' data-l='"+s.line+"' data-n='"+s.name+"' data-k='"+s.kind+"'>"
+     +"<span><span class=k>"+s.kind+"</span> "+s.name+"</span><span class=f>"+s.file+":"+s.line+"</span></div>";});
+  el("syms").innerHTML=h||"<p class=note>no matches</p>";
+  el("syms").querySelectorAll(".sym").forEach(function(n){n.onclick=function(){
+   var k=n.dataset.k,f=n.dataset.f,l=n.dataset.l;
+   var has=function(key){var hit=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
+    if(d.querySelectorAll("input")[0].value===key)hit=true});return hit};
+   var set=function(key,val){var done=false;el("kvs").querySelectorAll(".kv").forEach(function(d){
+    var ins=d.querySelectorAll("input");if(ins[0].value===key){ins[1].value=val;done=true}});
+    if(!done)addKv(key,val)};
+   if(k==="file"){set("file",f);el("ufile").value=f;}
+   else if(k==="class"||k==="interface"||k==="enum"||k==="record"){set("type",n.dataset.n)}
+   else if(k==="method"||k==="func"){set("method",n.dataset.n);el("umethod").value=n.dataset.n;}
+   set("file",f);if(has("line"))set("line",l);
+   el("usr").value=el("sr").value;el("ufile").value=f;
+   flash("filled "+f+":"+l);};});
+ });}
+el("sgo").onclick=search;el("sq").addEventListener("keydown",function(e){if(e.key==="Enter")search()});
+var stimer=null;el("sq").addEventListener("input",function(){clearTimeout(stimer);stimer=setTimeout(search,180)});
+el("sr").addEventListener("input",function(){el("usr").value=el("sr").value;clearTimeout(stimer);stimer=setTimeout(search,220)});
+
+var PANES={unroll:["tunroll","unrollpane"],prev:["tprev","prevpane"],cfg:["tcfg","cfgpane"]};
+function tab(name){for(var k in PANES){var on=k===name;el(PANES[k][0]).classList.toggle("on",on);el(PANES[k][1]).style.display=on?"":"none";}}
+el("tunroll").onclick=function(){tab("unroll")};el("tprev").onclick=function(){tab("prev")};el("tcfg").onclick=function(){tab("cfg")};
+
+// ---- Fix (unroll): discover branches -> choose inputs -> edit (two-way sync) ----
+function ufields(){return {SourceRoot:el("usr").value||el("sr").value,File:el("ufile").value,Method:el("umethod").value,Inputs:el("uinputs").value};}
+function renderProg(d){
+ var prog=el("uprog");prog.innerHTML="";
+ (d.lines||[]).forEach(function(l){
+  var row=document.createElement("div");row.className="pl"+(l.branch?" branch":"");
+  row.innerHTML='<span class=ln>'+l.n+'</span><span class=code></span><span class=org>'+(l.origin||"")+'</span>';
+  row.querySelector(".code").textContent=l.code.trim();
+  row.onclick=function(){editRow(row,l)};prog.appendChild(row);
+ });
+ var b=el("ubanner");
+ if(d.unresolved){
+  b.style.display="";b.className="banner";
+  if(d.inputs)b.innerHTML="⚠ Some branches can't be decided from these inputs — they depend on <b>runtime</b> values (a call result, a field, or a possibly-null value), so <b>both</b> paths are shown (highlighted). Only runtime can tell which actually runs.";
+  else b.innerHTML="① Unresolved branches (highlighted). The outcome depends on the inputs — type them above and <b>Apply inputs</b> to collapse to the one path that runs.";
+ }
+ else if((d.lines||[]).length){b.style.display="";b.className="banner ok";
+  var dec=(d.decisions&&d.decisions.length)?"<br><span>"+d.decisions.join("<br>")+"</span>":"";
+  b.innerHTML="✓ Single concrete path"+(d.inputs?" for inputs <code>"+d.inputs+"</code>":"")+". Click any line to edit — your change is written back to the source file shown on its right."+dec;}
+ else b.style.display="none";
+}
+function discover(inputs){
+ if(!el("ufile").value||!el("umethod").value){el("ustatus").textContent="set entry file + method first (use Search symbols on the left)";return;}
+ el("ustatus").textContent="running…";var body=ufields();body.Inputs=inputs;
+ fetch("/api/unroll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+  .then(function(r){return r.json()}).then(function(d){
+   if(d.error){el("ustatus").textContent="error: "+d.error;return;}
+   el("uinputs").value=inputs;renderProg(d);el("ustatus").textContent="";});
+}
+el("udiscover").onclick=function(){discover("")};
+el("uapply").onclick=function(){discover(el("uinputs").value)};
+el("uinputs").addEventListener("keydown",function(e){if(e.key==="Enter")discover(el("uinputs").value)});
+function editRow(row,l){
+ if(row.querySelector(".edit"))return;row.classList.add("editing");
+ var ed=document.createElement("div");ed.className="edit";
+ ed.innerHTML="<input><button>Save &amp; sync</button><button class=ghost>×</button>";
+ var inp=ed.querySelector("input");inp.value=l.code.trim();
+ var bs=ed.querySelectorAll("button");
+ bs[0].onclick=function(e){e.stopPropagation();saveEdit(l.n,inp.value)};
+ bs[1].onclick=function(e){e.stopPropagation();row.classList.remove("editing");ed.remove()};
+ inp.onclick=function(e){e.stopPropagation()};
+ inp.onkeydown=function(e){if(e.key==="Enter"){e.stopPropagation();saveEdit(l.n,inp.value)}};
+ row.appendChild(ed);inp.focus();
+}
+function saveEdit(line,code){
+ el("ustatus").textContent="syncing…";var body=ufields();body.Line=line;body.NewCode=code;
+ return fetch("/api/unroll/edit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+  .then(function(r){return r.json()}).then(function(d){
+   if(d.error){el("ustatus").textContent="error: "+d.error;return;}
+   renderProg(d);
+   var rows=el("uprog").querySelectorAll(".pl");if(rows[line-1])rows[line-1].classList.add("flash");
+   el("ustatus").innerHTML="✓ wrote line "+line+" → "+(d.origin||"")+" ("+d.synced+")";flash("synced to source");});
+}
+
+// Deep link / autoplay: ?do=discover|apply|edit drives the unroll tab from URL params, so a
+// particular view (or a walkthrough frame) is shareable. Harmless without the params.
+(function(){
+ var q=new URLSearchParams(location.search);
+ if(!q.get("do"))return;
+ setTimeout(function(){
+  tab("unroll");
+  if(q.get("sr"))el("usr").value=q.get("sr");
+  if(q.get("file"))el("ufile").value=q.get("file");
+  if(q.get("method"))el("umethod").value=q.get("method");
+  var inputs=q.get("inputs")||"";if(inputs)el("uinputs").value=inputs;
+  var d=q.get("do");
+  if(d==="discover")discover("");
+  else if(d==="apply")discover(inputs);
+  else if(d==="edit"){
+   var body=ufields();body.Inputs=inputs;
+   fetch("/api/unroll",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+    .then(function(r){return r.json()}).then(function(dd){renderProg(dd);return saveEdit(parseInt(q.get("line")),q.get("code")||"");});
+  }
+ },120);
+})();
+el("savecfg").onclick=function(){
+ var body;try{body=JSON.parse(el("cfg").value)}catch(e){el("cfgmsg").textContent="invalid JSON: "+e;el("cfgmsg").className="note err";return;}
+ fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body,null,2)})
+ .then(function(r){return r.json()}).then(function(d){
+  if(d.error){el("cfgmsg").textContent=d.error;el("cfgmsg").className="note err";}
+  else{el("cfgmsg").textContent="saved · "+d.lenses+" lenses";el("cfgmsg").className="note ok";flash("config saved");}});};
+</script></body></html>`

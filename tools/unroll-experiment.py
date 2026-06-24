@@ -219,90 +219,56 @@ def find_file(wd, rel):
             return os.path.join(dp, base)
     return None
 
-# ---- unrolled-program lens (proj variant): flatten the cross-file/branched execution into
-# one straight-line program that reads like ordinary source. Each line is inlined from its
-# real location; edits to the program are written straight back there (two-way), so the agent
-# only ever reads/edits the program — never the files, and never hops between them.
-def _method_body(path):
-    """[(lineno, code, indent)] for the first apply/build method body in a file."""
-    if not os.path.isfile(path):
-        return []
-    lines = open(path).read().split("\n")
-    bi = next((i for i, l in enumerate(lines) if re.search(r'\b(apply|build)\s*\(', l)), None)
-    if bi is None:
-        return []
-    while bi < len(lines) and "{" not in lines[bi]:
-        bi += 1
-    depth, out = 0, []
-    for i in range(bi, len(lines)):
-        depth += lines[i].count("{") - lines[i].count("}")
-        if i > bi and lines[i].strip():
-            if depth <= 0:
-                break
-            out.append((i + 1, lines[i].strip(), lines[i][:len(lines[i]) - len(lines[i].lstrip())]))
-    return out
+# ---- unrolled-program lens (proj variant) ------------------------------------------------
+# The straight-line program and its two-way sync are produced by the REAL binary, not Python:
+#   view  = `file-projections -analyzer unrolled-program -file <entry> -method <m> -inputs ...`
+#           — the generic Go analyzer inlines the cross-file/branched execution and records,
+#             per program line, its true source origin (file:line) in the projection footer.
+#   edit  = rewrite one line in the .projection block, then `file-projections sync <proj>` —
+#           the binary's scattered two-way sync writes each changed line back to its origin
+#           file (the same engine `watch` uses). No fixture-specific Python regex anywhere.
+ENTRY_FILE, ENTRY_METHOD = "sample/App.java", "summary"   # the failing test's entry point
+FPCFG_NAME = "fp.config.json"
 
-def _test_inputs(wd):
-    """The concrete arguments the failing test passes to App.summary, mapped to param names —
-    so we can unroll the ONE path that test actually executes (no need to show every branch)."""
-    t = open(os.path.join(wd, "src/test/java/sample/AppTest.java")).read()
-    app = open(os.path.join(wd, SRC, "sample", "App.java")).read()
-    am = re.search(r'\.summary\(([^)]*)\)', t)
-    pm = re.search(r'\bsummary\(([^)]*)\)', app)
-    if not am or not pm:
-        return {}
-    args = [a.strip() for a in am.group(1).split(",")]
-    params = [p.strip().split()[-1] for p in pm.group(1).split(",")]
-    env = {}
-    for p, a in zip(params, args):
-        env[p] = a.strip('"') if a.startswith('"') else (int(a) if re.fullmatch(r'-?\d+', a) else a)
-    return env
+def _fp_config(wd):
+    p = os.path.join(wd, FPCFG_NAME)
+    if not os.path.isfile(p):
+        json.dump({"root": ".", "projections_dir": ".projections"}, open(p, "w"))
+    return FPCFG_NAME
 
-def _eval_cond(cond, env):
-    expr = cond
-    for k, v in env.items():
-        expr = re.sub(rf'\b{re.escape(k)}\b', repr(v), expr)
-    expr = expr.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
-    try:
-        return bool(eval(expr, {"__builtins__": {}}, {}))
-    except Exception:
-        return None
+def _inputs_str(env):
+    return ",".join(f"{k}={v}" for k, v in env.items())
 
-def _branch_points(wd):
-    """The branch conditions and entry signature, so the caller knows which inputs select a path."""
-    app = open(os.path.join(wd, SRC, "sample", "App.java")).read().split("\n")
-    conds = [m.group(1) for l in app if (m := re.search(r'if\s*\((.*)\)\s*\{', l))]
-    sig = next((l.strip() for l in app if "summary(" in l and "(" in l), "summary(...)")
-    return conds, sig
+def _parse_projection(text):
+    """(body_lines, origins) from a rendered projection: the block's code lines in order and,
+    per line, (src_file, src_line) parsed from the `=> id: origin N src=f:l ...` footer."""
+    body, origins, in_block = [], {}, False
+    for l in text.split("\n"):
+        if l.startswith("@@ "):
+            in_block = True; continue
+        if l == "@@":
+            in_block = False; continue
+        if in_block:
+            body.append(l)
+        m = re.match(r'=> \S+: origin (\d+) src=(.+):(\d+) srchash=', l)
+        if m:
+            origins[int(m.group(1))] = (m.group(2), int(m.group(3)))
+    return body, origins
 
-def _path_stages(wd, env):
-    """Stage classes on the path selected by `env` (the inputs the caller chose) — branch
-    conditions in the orchestrator are evaluated against those inputs, so exactly that branch
-    is unrolled. Nothing magical: a different env yields a different straight-line program."""
-    app = open(os.path.join(wd, SRC, "sample", "App.java")).read().split("\n")
-    stages, mode, cond = [], None, None
-    for l in app:
-        s = l.strip()
-        m = re.match(r'if\s*\((.*)\)\s*\{', s)
-        if m: cond = _eval_cond(m.group(1), env); mode = "if"; continue
-        if s.startswith("} else"): mode = "else"; continue
-        if s == "}" and mode: mode = cond = None; continue
-        sm = re.search(r'new (\w+Stage)\(\)\.apply', s)
-        if sm:
-            take = mode is None or (mode == "if" and cond) or (mode == "else" and cond is False)
-            if take:
-                stages.append(sm.group(1))
-    return stages
-
-def build_unrolled(wd, env):
-    """Return the straight-line program [(code, file_rel, lineno, indent)] for inputs `env`."""
-    base = os.path.join(wd, SRC, "sample")
-    prog = [("Receipt r = new Receipt();", "sample/App.java", 5, "")]
-    for stage in _path_stages(wd, env):
-        for ln, code, indent in _method_body(os.path.join(base, stage + ".java")):
-            prog.append((code, f"sample/{stage}.java", ln, indent))
-    prog.append(('return r.getCode() + "/" + r.getLabel() + "/" + r.getTier();', "sample/App.java", 14, ""))
-    return prog
+def gen_unrolled(wd, env):
+    """Run the real analyzer; return (projection_path, body_lines, origins) or (None, err, {})."""
+    cfg = _fp_config(wd)
+    proj = ".projections/unrolled.projection"
+    cmd = [FPBIN, "-config", cfg, "-analyzer", "unrolled-program", "-source-root", SRC,
+           "-file", ENTRY_FILE, "-method", ENTRY_METHOD, "-out", proj]
+    if env:
+        cmd += ["-inputs", _inputs_str(env)]
+    r = subprocess.run(cmd, cwd=wd, capture_output=True, text=True)
+    full = os.path.join(wd, proj)
+    if not os.path.isfile(full):
+        return None, (r.stderr or r.stdout).strip()[-200:], {}
+    body, origins = _parse_projection(open(full).read())
+    return proj, body, origins
 
 def make_tools(variant, wd, state):
     def read_file(args):
@@ -343,22 +309,28 @@ def make_tools(variant, wd, state):
 
     def view_program(args):
         env = _env_from(args)
+        proj, body, origins = gen_unrolled(wd, env)
+        if proj is None:
+            return f"unrolled-program failed: {body}"
+        state["proj"] = proj; state["body"] = body; state["origins"] = origins; state["env"] = env
         if not env:
-            conds, sig = _branch_points(wd)
-            msg = ("This routine's result depends on a branch: " +
-                   ("; ".join(f"if ({c})" for c in conds) if conds else "(no branches)") +
-                   f". Entry: {sig}. Call view_program again with the failing test's inputs to "
-                   'see the exact path it runs, e.g. inputs={"amount": 50, "coupon": "save"}.')
-            state["inspect"] += len(msg); state["icalls"] += 1
-            return msg
-        prog = build_unrolled(wd, env); state["prog"] = prog; state["env"] = env
-        text = "\n".join(f"{i+1}: {code}" for i, (code, _, _, _) in enumerate(prog))
+            # Honest branch discovery from the real tool: with no inputs the analyzer keeps the
+            # unresolved `if (...)` headers inline, so the agent sees exactly which inputs decide
+            # the path before committing to one.
+            text = "\n".join(f"{i+1}: {code.strip()}" for i, code in enumerate(body))
+            note = ('\n\nThis path still contains unresolved branch conditions (the `if (...)` '
+                    'lines above). Call view_program again with the failing test\'s inputs to '
+                    'collapse it to the exact straight-line path, e.g. inputs={"coupon": "save", '
+                    '"amount": 50}.')
+            state["inspect"] += len(text) + len(note); state["icalls"] += 1
+            return text + note
+        text = "\n".join(f"{i+1}: {code.strip()}" for i, code in enumerate(body))
         state["inspect"] += len(text); state["icalls"] += 1
         return text
 
     def edit_program(args):
-        prog = state.get("prog")
-        if not prog:
+        body = state.get("body"); proj = state.get("proj"); origins = state.get("origins")
+        if not body:
             return "call view_program with inputs first"
         try:
             line = int(args.get("line", args.get("lineno", args.get("n", 0))))
@@ -366,16 +338,25 @@ def make_tools(variant, wd, state):
             line = 0
         new = (args.get("new_code") or args.get("new_string") or args.get("code")
                or args.get("new") or args.get("content") or "")
-        if not (1 <= line <= len(prog)):
-            return f"line must be 1..{len(prog)} (the number shown by view_program)"
-        _, frel, lineno, indent = prog[line - 1]
-        full = find_file(wd, frel)
-        lines = open(full).read().split("\n")
-        repl = [indent + nl.strip() if nl.strip() else nl for nl in new.split("\n")]
-        lines = lines[:lineno-1] + repl + lines[lineno:]
-        open(full, "w").write("\n".join(lines))
-        state["prog"] = build_unrolled(wd, state.get("env", {}))   # re-read: offset-safe
-        return f"edited line {line}"
+        if not (1 <= line <= len(body)):
+            return f"line must be 1..{len(body)} (the number shown by view_program)"
+        # Edit the line IN THE PROJECTION (preserving indentation), then let the real binary's
+        # two-way `sync` push it back to the line's origin file — no Python source-writing.
+        orig = body[line - 1]
+        indent = orig[:len(orig) - len(orig.lstrip())]
+        body[line - 1] = indent + new.strip()
+        full = os.path.join(wd, proj)
+        text = open(full).read().split("\n")
+        bi = next(i for i, l in enumerate(text) if l.startswith("@@ "))
+        for off, code in enumerate(body):
+            text[bi + 1 + off] = code
+        open(full, "w").write("\n".join(text))
+        r = subprocess.run([FPBIN, "sync", "-config", _fp_config(wd), proj],
+                           cwd=wd, capture_output=True, text=True)
+        # regenerate so subsequent views/edits see fresh origins (offset-safe)
+        _, state["body"], state["origins"] = gen_unrolled(wd, state.get("env", {}))
+        src = origins.get(line, ("?", 0))
+        return f"edited line {line} -> {src[0].split('/')[-1]}:{src[1]} ({r.stdout.strip()})"
 
     def edit_lines(args):
         full = find_file(wd, args.get("path", ""))
@@ -494,14 +475,28 @@ def start_server():
 def write_report(initial="null"):
     open(f"{OUT}/report.html", "w").write(REPORT_HTML.replace("__INITIAL__", initial))
 
+# base/graph are reference baselines: they don't depend on the projection lens, so we run
+# them ONCE and cache the run under tools/benchmark/. `run` reuses the cache and only re-runs
+# `proj` (the variant under development). Force a fresh base/graph with FRESH=base,graph (or
+# FRESH=all). Cached runs are committed so the comparison is reproducible without Ollama.
+CACHE = os.path.join(ROOT, "tools", "benchmark")
+FRESH = set(filter(None, os.environ.get("FRESH", "").replace("all", "base,graph,proj").split(",")))
+
 def cmd_run():
-    os.makedirs(OUT, exist_ok=True)
+    os.makedirs(OUT, exist_ok=True); os.makedirs(CACHE, exist_ok=True)
     write_report("null"); publish(); start_server()
     url = f"http://127.0.0.1:{PORT}/report.html"; subprocess.run(["open", url]); print("live report:", url, flush=True)
     LIVE["status"] = "preparing"; publish(); prepare()
     LIVE["status"] = "running"; publish()
     for v in ("base", "graph", "proj"):
-        print(f"=== {v} ===", flush=True)
+        cache_f = os.path.join(CACHE, f"{v}.json")
+        reuse = v != "proj" and v not in FRESH and os.path.isfile(cache_f)
+        print(f"=== {v} ==={' (cached)' if reuse else ''}", flush=True)
+        if reuse:
+            e = json.load(open(cache_f)); LIVE["variants"].append(e); publish()
+            json.dump(e, open(f"{OUT}/{v}.json", "w"), indent=2)
+            print(f"  reused cache: passed={e['passed']} turns={e['turns']} tokens={e['tokens']}", flush=True)
+            continue
         e = {"variant": v, "passed": False, "turns": 0, "tool_calls": 0, "tokens": 0,
              "inspect_chars": 0, "inspect_calls": 0, "done": False, "messages": []}
         LIVE["variants"].append(e); publish()
@@ -509,6 +504,8 @@ def cmd_run():
         except Exception as ex:
             e.update(done=True, error=str(ex)); publish()
         json.dump(e, open(f"{OUT}/{v}.json", "w"), indent=2)
+        if v != "proj":                      # persist the reference baseline for reuse
+            json.dump(e, open(cache_f, "w"), indent=2)
         print(f"  passed={e['passed']} turns={e['turns']} tokens={e['tokens']} inspect={e['inspect_chars']}c/{e['inspect_calls']}", flush=True)
     LIVE["status"] = "done"; publish(); write_report(json.dumps(LIVE)); time.sleep(3)
 

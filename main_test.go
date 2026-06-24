@@ -754,6 +754,7 @@ public class TierStage {
 		"r.setLabel(t);",
 		"=> summary: origin ",
 		"src=src/main/java/sample/TierStage.java:5",
+		"=> unrolled-program.branch-1: sample/App.java:7 if (amount >= 100) -> else (decided from inputs)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q\n%s", want, got)
@@ -780,6 +781,79 @@ public class TierStage {
 	tier := read(t, filepath.Join(src, "TierStage.java"))
 	if !strings.Contains(tier, "r.setTier(t);") {
 		t.Fatalf("TierStage was not updated:\n%s", tier)
+	}
+}
+
+func TestUnrolledProgramGoAdapterSyncsHelperLine(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	write(t, filepath.Join(src, "main.go"), `package sample
+
+func Summary(coupon string, amount int) string {
+	code := codeStage(coupon)
+	label := labelStage(amount)
+	tier := tierStage(amount)
+	return code + "/" + label + "/" + tier
+}
+
+func codeStage(coupon string) string {
+	return "SAVE"
+}
+
+func labelStage(amount int) string {
+	net := amount - amount/10
+	return "$" + "amount"
+}
+
+func tierStage(amount int) string {
+	return "SILVER"
+}
+`)
+
+	projPath := filepath.Join(dir, ".projections/go.projection")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", Lenses: []LensConfig{{
+		Name:       "go-unrolled",
+		Out:        ".projections/go.projection",
+		Analyzer:   "unrolled-program",
+		SourceRoot: "src",
+		Params: map[string]string{
+			"file":   "main.go",
+			"method": "Summary",
+		},
+	}}}
+	if _, err := Run(cfg, DefaultRegistry()); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, projPath)
+	for _, want := range []string{
+		"# analyzer: unrolled-program",
+		"return \"SAVE\"",
+		"net := amount - amount/10",
+		"return \"$\" + \"amount\"",
+		"src=src/main.go:15",
+		"=> unrolled-program.scope: go adapter:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q\n%s", want, got)
+		}
+	}
+	edited := strings.Replace(got, `	return "$" + "amount"`, `	return "$45"`, 1)
+	if edited == got {
+		t.Fatal("test did not edit projection")
+	}
+	if err := os.WriteFile(projPath, []byte(edited), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := SyncProjection(cfg, projPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ToSource != 1 || len(res.Conflicts) != 0 {
+		t.Fatalf("sync result = %#v", res)
+	}
+	srcAfter := read(t, filepath.Join(src, "main.go"))
+	if !strings.Contains(srcAfter, `return "$45"`) {
+		t.Fatalf("go helper was not updated:\n%s", srcAfter)
 	}
 }
 

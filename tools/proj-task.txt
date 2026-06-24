@@ -1,0 +1,1 @@
+A JUnit test in this project is failing: App.summary("save", 50) should return "SAVE/$45/SILVER" but does not. A Receipt object is assembled across several stage classes before App reads its fields, and two of those stages mutate it incorrectly. Find and fix the two faulty mutations, then run the tests until they pass.

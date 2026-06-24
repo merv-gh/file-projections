@@ -29,9 +29,45 @@ make build                 # -> bin/file-projections
 make run                   # generate every lens in config.json into .projections/
 make menu                  # interactively add a view (control-flow, data-flow, ...)
 make watch                 # regenerate on change + sync two-way edits back to source
+./bin/file-projections ui  # local web UI: edit config, preview any lens, search symbols
+make ui-self               # dogfood the UI on this repo (override UI_ADDR=:7780)
 make test                  # full test suite
 make cross                 # mac (amd64/arm64) + linux + windows binaries
 ```
+
+### `ui` — preview lenses and pick params from real symbols
+
+`file-projections ui` (default `http://localhost:7777`, override with `-addr`) serves a single
+self-contained page (stdlib `net/http`, no assets) over the **same analyzer registry the CLI
+uses** — it is a thin shell over `ExecuteLens`/`SyncProjection`, never a parallel implementation:
+
+- **Fix (unroll) — discover → choose → edit.** Flatten a method's cross-file, branched execution
+  into one straight-line program; **discover** the branches (run with no inputs and the `if (…)`
+  headers stay visible, highlighted), **choose** a path by typing the inputs, then **edit** any
+  line — the change is written back to the real source file that line came from (the same
+  scattered two-way `sync` the CLI uses). Each line shows its true `file:line` origin.
+
+  ![UI: discover → choose → edit](tools/benchmark/ui-unroll-demo.gif)
+
+- **Preview a lens on the fly.** Pick an analyzer, a `source_root`, and params; it runs the lens
+  ad-hoc and shows the exact projection body that would be written (plus any `control-flow`
+  branch files). Try different lenses/params against a real project before committing them to
+  `config.json` — useful because most lenses need real args (`file`/`line`/`var`/`method`/`type`).
+- **Search symbols.** Query Java classes/methods and Go funcs/types under the source root; click
+  a result to fill the lens's `file`/`line`/`method`/`type` params from real `file:line` — the
+  way an MCP symbol search would, so you never guess a locator.
+- **Edit config.** Load/validate/save `config.json` in the browser.
+
+The unroll tab is also deep-linkable: `?do=discover|apply|edit&sr=…&file=…&method=…&inputs=…`
+drives the view from the URL, so a particular branch/path (or a walkthrough frame) is shareable.
+
+### `sync` — one-shot two-way reconcile
+
+`file-projections sync <file.projection>` runs the same engine `watch` uses, once: edits inside a
+two-way block (a `bookmark`, or a scattered-origin `unrolled-program` view) are written back to
+each line's origin source file; source-side changes refresh the projection; simultaneous edits are
+reported as conflicts. This is the programmatic entry point external tools drive (e.g. the
+benchmark harness edits an `unrolled-program` line, then `sync`s it back to source).
 
 ## Lenses (analyzers)
 
@@ -48,7 +84,8 @@ Each lens is one entry in `config.json` with an `analyzer` and `params`. Lenses 
 | `bookmark` | a verbatim source span — **two-way**: edits sync back to source; supports single-line drop-ins | — |
 | `flow` | generic "annotated entry reaches a sink" (config regexes); `java-post-to-save` is an alias | stdlib Java |
 | `joern-var-flow` | interprocedural var data-flow (CPG) with Java fallback | joern → stdlib |
-| `unrolled-program` | editable straight-line Java path assembled from cross-file calls; each line syncs back to its origin | stdlib Java |
+| `cpg-methods` | language-neutral CPG method/call surface for Java or Go source roots | joern |
+| `unrolled-program` | editable straight-line Java/Go path assembled from calls; each line syncs back to its origin | stdlib adapter |
 | `ast-grep` | structural pattern matches | ast-grep → docker |
 | `go-symbols` / `js-events` / `jsonl` | Go symbol map / JS event surface / generic tool adapter | stdlib |
 
@@ -124,7 +161,7 @@ Emits only the lines that shape the variable, each with a right-padded trailing 
 (`order.setShipping("express");          // <- mutates order`) so the code stays scannable.
 Set `mode: joern` to use a Joern CPG slice instead of the static fallback.
 
-### unrolled-program — editable straight-line Java path
+### unrolled-program — editable straight-line Java/Go path
 
 ```json
 { "name": "receipt-summary", "analyzer": "unrolled-program",
@@ -133,12 +170,31 @@ Set `mode: joern` to use a Joern CPG slice instead of the static fallback.
               "inputs": "coupon=save,amount=50" } }
 ```
 
-Builds one readable program from the selected Java method by inlining same-class calls and
-`new Helper().method(...)` calls, then evaluating simple branch conditions from
-`params.inputs`. The rendered lines are real source lines from their original files. Editing
-one line in the projection under `watch` writes that line back to its source origin, even when
-adjacent projection lines came from different files. If `inputs` is omitted, unknown branches
-are shown together and a fact calls out that no concrete path was selected.
+Builds one readable program from the selected method/function by inlining local calls, then
+evaluating simple branch conditions from `params.inputs` where the adapter can prove them. The
+rendered lines are real source lines from their original files. Editing one line in the projection
+under `watch` writes that line back to its source origin, even when adjacent projection lines came
+from different files. If `inputs` is omitted, unknown branches are shown together and branch facts
+call out whether a condition was decided from inputs or is runtime-dependent. Java and Go use
+language adapters behind the same lens; graph-level Joern views use the same source-root CPG cache.
+
+```json
+{ "name": "go-summary", "analyzer": "unrolled-program",
+  "source_root": ".",
+  "params": { "file": "main.go", "method": "Run", "lang": "go" } }
+```
+
+### cpg-methods — language-neutral CPG method surface
+
+```json
+{ "name": "go-cpg-methods", "analyzer": "cpg-methods",
+  "source_root": ".",
+  "params": { "file": "main.go", "method": "Run" } }
+```
+
+Runs a small Joern query over the cached source-root CPG and lists matching methods plus direct
+call names. The CPG build chooses `javasrc2cpg` or `gosrc2cpg` from the source root, so the query
+is language-neutral and lens adapters can share the same CPG plumbing.
 
 ### bookmark — two-way sync
 

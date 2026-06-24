@@ -1,0 +1,133 @@
+{
+  "runs": [
+    {
+      "id": "claude-base",
+      "harness": "claude",
+      "variant": "base",
+      "model": "qwen3-coder:latest",
+      "tools_supplied": [
+        "read_file",
+        "edit_lines",
+        "run_tests"
+      ],
+      "status": "done",
+      "started": "2026-06-24T11:54:22.049Z",
+      "tool_calls": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "edit_lines",
+        "edit_lines",
+        "run_tests"
+      ],
+      "tokens": 38659,
+      "gradle": {
+        "pass": true,
+        "detail": ""
+      },
+      "graph_leak": false,
+      "workdir": "/tmp/fp-harness/claude-base",
+      "jsonl": "harness/claude-base.jsonl",
+      "finished": "2026-06-24T11:57:32.474Z",
+      "seconds": 190,
+      "tools_used": [
+        "read_file",
+        "edit_lines",
+        "run_tests"
+      ],
+      "exit_code": 0,
+      "final": "I've successfully identified and fixed the two faulty mutations in the receipt assembly process:\n\n1. **Fixed `LabelStage.java`**: The label was incorrectly using the original amount instead of the net amount. I changed it to use `net = amount - amount / 10` and set the label to `\"$\" + net` instead of `\"$\" + amount`.\n\n2. **Fixed `TierStage.java`**: The tier stage was incorrectly setting the label i",
+      "stderr_tail": "Permission deny rule \"MultiEdit\" matches no known tool \u2014 check for typos. | Permission deny rule \"SlashCommand\" matches no known tool \u2014 check for typos."
+    },
+    {
+      "id": "claude-graph",
+      "harness": "claude",
+      "variant": "graph",
+      "model": "qwen3-coder:latest",
+      "tools_supplied": [
+        "semantic_search_nodes",
+        "query_graph",
+        "traverse_graph",
+        "get_architecture_overview",
+        "list_flows",
+        "read_file",
+        "edit_lines",
+        "run_tests"
+      ],
+      "status": "done",
+      "started": "2026-06-24T11:57:47.098Z",
+      "tool_calls": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "edit_lines",
+        "edit_lines",
+        "run_tests"
+      ],
+      "tokens": 43255,
+      "gradle": {
+        "pass": true,
+        "detail": ""
+      },
+      "graph_leak": false,
+      "workdir": "/tmp/fp-harness/claude-graph",
+      "jsonl": "harness/claude-graph.jsonl",
+      "finished": "2026-06-24T12:00:27.756Z",
+      "seconds": 161,
+      "tools_used": [
+        "read_file",
+        "edit_lines",
+        "run_tests"
+      ],
+      "exit_code": 0,
+      "final": "I've successfully identified and fixed the two faulty mutations in the Receipt object that were causing the JUnit test to fail.\n\n## Problem Analysis\n\nThe issue was in two stage classes that were incorrectly mutating the Receipt object:\n\n1. **LabelStage.java**: Was setting the label to \"$amount\" instead of \"$net\" \n2. **TierStage.java**: Was setting the label instead of the tier\n\n## Fixes Applied\n\n1",
+      "stderr_tail": "Permission deny rule \"MultiEdit\" matches no known tool \u2014 check for typos. | Permission deny rule \"SlashCommand\" matches no known tool \u2014 check for typos."
+    },
+    {
+      "id": "claude-proj",
+      "harness": "claude",
+      "variant": "proj",
+      "model": "qwen3-coder:latest",
+      "tools_supplied": [
+        "view_program",
+        "edit_program",
+        "run_tests"
+      ],
+      "status": "done",
+      "started": "2026-06-24T12:00:27.854Z",
+      "tool_calls": [
+        "view_program",
+        "view_program",
+        "edit_program",
+        "edit_program",
+        "run_tests"
+      ],
+      "tokens": 18681,
+      "gradle": {
+        "pass": true,
+        "detail": ""
+      },
+      "graph_leak": false,
+      "workdir": "/tmp/fp-harness/claude-proj",
+      "jsonl": "harness/claude-proj.jsonl",
+      "finished": "2026-06-24T12:02:11.694Z",
+      "seconds": 104,
+      "tools_used": [
+        "view_program",
+        "edit_program",
+        "run_tests"
+      ],
+      "exit_code": 0,
+      "final": "I've successfully identified and fixed the two faulty mutations in the Receipt object that were causing the JUnit test to fail.\n\n## Issues Found and Fixed:\n\n1. **In LabelStage.java**: The code was calculating the correct net amount (`net = amount - amount / 10`) but then incorrectly setting the label to the original `amount` instead of the calculated `net` value. This was causing the label to show",
+      "stderr_tail": "Permission deny rule \"MultiEdit\" matches no known tool \u2014 check for typos. | Permission deny rule \"SlashCommand\" matches no known tool \u2014 check for typos."
+    }
+  ]
+}

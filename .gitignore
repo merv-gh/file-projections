@@ -15,3 +15,16 @@ workspace/
 .code-review-graph
 .lock
 build/
+
+# editor / tooling
+.vscode/
+.claude/
+__pycache__/
+*.pyc
+
+# local working notes (not part of the repo)
+handoff.md
+
+# benchmark run artifacts (regenerable; keep results.json + report.png + READMEs)
+tools/benchmark/harness/*.jsonl
+tools/benchmark/harness/mcp-*.json

@@ -2,11 +2,12 @@
 BIN          := file-projections
 BINDIR       := bin
 CONFIG       ?= config.json
+UI_ADDR      ?= :7777
 PKG          := .
 VERSION_FILE := VERSION
 VERSION      := $(shell cat $(VERSION_FILE) 2>/dev/null || echo 0.0.0)
 
-.PHONY: all help build run cpg bookmarks menu watch test eval perf farm-up farm-down fmt vet clean cross \
+.PHONY: all help build run cpg bookmarks menu watch ui-self test eval perf farm-up farm-down fmt vet clean cross \
         version release-patch release-minor release-major
 
 all: build
@@ -42,6 +43,10 @@ menu: build
 ## watch: regenerate on source change + sync two-way extract edits back to source
 watch: build
 	./$(BINDIR)/$(BIN) watch -config $(CONFIG)
+
+## ui-self: dogfood the web UI on this repo (override UI_ADDR=:7780)
+ui-self: build
+	./$(BINDIR)/$(BIN) ui -config $(CONFIG) -addr $(UI_ADDR)
 
 ## test: gofmt + vet + the test suite (lens output, control-flow branches, round-trip sync)
 test:

@@ -1,0 +1,198 @@
+{
+  "model": "qwen3-coder:latest",
+  "generated": "2026-06-24T21:46:10.451Z",
+  "turnCap": 8,
+  "task": "The Java method Loyalty.points(spend, member) awards too many points for ordinary repeat purchases. The calculation is spread across Loyalty, Tier and Promo. Exactly one line adds a bonus under a condition that is true for almost every purchase (it should only apply in a special case). Find it. Answer with: BUG LINE <n>, the code, and REACHED-WHEN <condition>.",
+  "fixture": "fixtures/xfile-sample/src/main/java/sample/Loyalty.java",
+  "method": "points",
+  "bug": "In `Promo.apply`, `points = points + 5;` runs whenever `spend > 0` — so the \"first purchase\" bonus is added on every purchase, doubling points for repeat buyers. The call chain Loyalty.points → tier → promo spreads it across 3 files.",
+  "variants": [
+    {
+      "variant": "lens",
+      "tools": [
+        "view_program",
+        "line_assumptions"
+      ],
+      "turns": [
+        {
+          "n": 1,
+          "text": "",
+          "tools": [
+            {
+              "name": "view_program",
+              "input": {
+                "inline": 2
+              },
+              "result": "BRANCHES undecided; choose inputs from the failing call, then call view_program again.\n1 Loyalty.java:15 | points = spend / 10;\n2 Tier.java:5 | if (member) {\n3 Tier.java:6 | points = points + 5;\n4 Promo.java:8 | if (spend > 0) {\n5 Promo.java:9 | points = points + 5;\n6 Loyalty.java:11 | return points;"
+            }
+          ]
+        },
+        {
+          "n": 2,
+          "text": "",
+          "tools": [
+            {
+              "name": "view_program",
+              "input": {
+                "inputs": "spend=50,member=true",
+                "inline": 2
+              },
+              "result": "BRANCHES runtime-dependent; both sides remain visible.\n1 Loyalty.java:15 | points = spend / 10;\n2 Tier.java:5 | if (member) {\n3 Tier.java:6 | points = points + 5;\n4 Promo.java:9 | points = points + 5;\n5 Loyalty.java:11 | return points;"
+            }
+          ]
+        },
+        {
+          "n": 3,
+          "text": "",
+          "tools": [
+            {
+              "name": "line_assumptions",
+              "input": {
+                "line": 4
+              },
+              "result": "LINE 4 Promo.java:9 | points = points + 5;\nREACHED-WHEN spend > 0\nVALUES-IN points — trace any of these with view_program at higher inline depth.\nWRITES points (this is write 3 of 3 on this path: L1, L3, L4)"
+            }
+          ]
+        },
+        {
+          "n": 4,
+          "text": "",
+          "tools": [
+            {
+              "name": "line_assumptions",
+              "input": {
+                "line": 3
+              },
+              "result": "LINE 3 Tier.java:6 | points = points + 5;\nREACHED-WHEN member\nVALUES-IN points — trace any of these with view_program at higher inline depth.\nWRITES points (this is write 2 of 3 on this path: L1, L3, L4)"
+            }
+          ]
+        },
+        {
+          "n": 5,
+          "text": "",
+          "tools": [
+            {
+              "name": "line_assumptions",
+              "input": {
+                "line": 1
+              },
+              "result": "LINE 1 Loyalty.java:15 | points = spend / 10;\nREACHED-WHEN (always — no branch guards on this line)\nVALUES-IN points, spend — trace any of these with view_program at higher inline depth.\nWRITES points (this is write 1 of 3 on this path: L1, L3, L4)"
+            }
+          ]
+        },
+        {
+          "n": 6,
+          "text": "",
+          "tools": [
+            {
+              "name": "view_program",
+              "input": {
+                "inputs": "spend=5,member=false",
+                "inline": 2
+              },
+              "result": "BRANCHES runtime-dependent; both sides remain visible.\n1 Loyalty.java:15 | points = spend / 10;\n2 Tier.java:5 | if (member) {\n3 Tier.java:6 | points = points + 5;\n4 Promo.java:9 | points = points + 5;\n5 Loyalty.java:11 | return points;"
+            }
+          ]
+        },
+        {
+          "n": 7,
+          "text": "",
+          "tools": [
+            {
+              "name": "line_assumptions",
+              "input": {
+                "line": 4
+              },
+              "result": "LINE 4 Promo.java:9 | points = points + 5;\nREACHED-WHEN spend > 0\nVALUES-IN points — trace any of these with view_program at higher inline depth.\nWRITES points (this is write 3 of 3 on this path: L1, L3, L4)"
+            }
+          ]
+        },
+        {
+          "n": 8,
+          "text": "",
+          "tools": [
+            {
+              "name": "line_assumptions",
+              "input": {
+                "line": 2
+              },
+              "result": "LINE 2 Tier.java:5 | if (member) {\nREACHED-WHEN (always — no branch guards on this line)\nVALUES-IN member — trace any of these with view_program at higher inline depth."
+            }
+          ]
+        },
+        {
+          "n": 9,
+          "text": "BUG LINE 4, the code `points = points + 5;`, and REACHED-WHEN `spend > 0`.",
+          "tools": [],
+          "forced": true
+        }
+      ],
+      "calls": 8,
+      "callsToSignal": 1,
+      "turnCount": 9,
+      "inTok": 10861,
+      "outTok": 243,
+      "finalText": "BUG LINE 4, the code `points = points + 5;`, and REACHED-WHEN `spend > 0`.",
+      "correct": true
+    },
+    {
+      "variant": "base",
+      "tools": [
+        "read_file"
+      ],
+      "turns": [
+        {
+          "n": 1,
+          "text": "I need to find the bug in the Loyalty.points() method where too many points are awarded for ordinary repeat purchases. The bug is in a line that adds a bonus under a condition that is true for almost every purchase, but should only apply in a special case.\n\nLet me first look at the Loyalty class to understand the structure:",
+          "tools": [
+            {
+              "name": "read_file",
+              "input": {
+                "path": "Loyalty.java"
+              },
+              "result": "src/main/java/sample/Loyalty.java\n1: package sample;\n2: \n3: public class Loyalty {\n4:     // Total loyalty points for a purchase. The points come out too high for\n5:     // ordinary repeat purchases, but the logic is spread across Base, Tier and\n6:     // Promo — you can't see the whole calculation in one file.\n7:     public int points(int spend, boolean member) {\n8:         int points = base(spend);\n9:         points = tier(points, member);\n10:         points = promo(points, spend);\n11:         return points;\n12:     }\n13: \n14:     int base(int spend) {\n15:         return spend / 10;\n16:     }\n17: \n18:     int tier(int points, boolean member) {\n19:         return new Tier().bonus(points, member);\n20:     }\n21: \n22:     int promo(int points, int spend) {\n23:         return new Promo().apply(points, spend);\n24:     }\n25: }\n26: "
+            }
+          ]
+        },
+        {
+          "n": 2,
+          "text": "Now I need to look at the Tier class to see the bonus calculation:",
+          "tools": [
+            {
+              "name": "read_file",
+              "input": {
+                "path": "Tier.java"
+              },
+              "result": "src/main/java/sample/Tier.java\n1: package sample;\n2: \n3: public class Tier {\n4:     int bonus(int points, boolean member) {\n5:         if (member) {\n6:             points = points + 5;\n7:         }\n8:         return points;\n9:     }\n10: }\n11: "
+            }
+          ]
+        },
+        {
+          "n": 3,
+          "text": "Now let me check the Promo class:",
+          "tools": [
+            {
+              "name": "read_file",
+              "input": {
+                "path": "Promo.java"
+              },
+              "result": "src/main/java/sample/Promo.java\n1: package sample;\n2: \n3: public class Promo {\n4:     // \"First purchase\" bonus — but the guard checks spend, not whether this is the\n5:     // customer's first order, so the bonus is applied on EVERY purchase. This is the\n6:     // bug that doubles the points for repeat buyers.\n7:     int apply(int points, int spend) {\n8:         if (spend > 0) {\n9:             points = points + 5;\n10:         }\n11:         return points;\n12:     }\n13: }\n14: "
+            }
+          ]
+        },
+        {
+          "n": 4,
+          "text": "I found the bug! Looking at the Promo.java file, line 8 has the condition `if (spend > 0)` which is true for almost every purchase (except when spend is 0). This condition should check if it's the customer's first purchase, not whether the spend amount is greater than 0. This causes a bonus of 5 points to be added to every purchase, not just the first one.\n\nThe bug is in the Promo class where it incorrectly applies a \"first purchase\" bonus to every purchase instead of only the first purchase.\n\nBUG LINE 8\npublic class Promo {\n    // \"First purchase\" bonus — but the guard checks spend, not whether this is the\n    // customer's first order, so the bonus is applied on EVERY purchase. This is the\n    // bug that doubles the points for repeat buyers.\n    int apply(int points, int spend) {\n        if (spend > 0) {  // <-- This is the bug\n            points = points + 5;\n        }\n        return points;\n    }\n}\n\nREACHED-WHEN spend > 0 (which is true for almost every purchase except when spend = 0)",
+          "tools": []
+        }
+      ],
+      "calls": 3,
+      "callsToSignal": 3,
+      "turnCount": 4,
+      "inTok": 3452,
+      "outTok": 403,
+      "finalText": "I found the bug! Looking at the Promo.java file, line 8 has the condition `if (spend > 0)` which is true for almost every purchase (except when spend is 0). This condition should check if it's the customer's first purchase, not whether the spend amount is greater than 0. This causes a bonus of 5 points to be added to every purchase, not just the first one.\n\nThe bug is in the Promo class where it incorrectly applies a \"first purchase\" bonus to every purchase instead of only the first purchase.\n\nBUG LINE 8\npublic class Promo {\n    // \"First purchase\" bonus — but the guard checks spend, not whether this is the\n    // customer's first order, so the bonus is applied on EVERY purchase. This is the\n    // bug that doubles the points for repeat buyers.\n    int apply(int points, int spend) {\n        if (spend > 0) {  // <-- This is the bug\n            points = points + 5;\n        }\n        return points;\n    }\n}\n\nREACHED-WHEN spend > 0 (which is true for almost every purchase except when spend = 0)",
+      "correct": true
+    }
+  ]
+}

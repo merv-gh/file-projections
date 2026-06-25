@@ -10,15 +10,15 @@
       "name": "self-model",
       "out": ".projections/self-model.projection",
       "analyzer": "go-symbols",
-      "source_root": ".",
-      "include": ["main.go"]
+      "source_root": "src",
+      "include": ["registry.go", "projection.go"]
     },
     {
       "name": "self-helpers-bookmark",
       "out": ".projections/self-helpers-bookmark.projection",
       "analyzer": "bookmark",
-      "source_root": ".",
-      "params": { "file": "main.go", "lines": "1227-1232" }
+      "source_root": "src",
+      "params": { "file": "joern.go", "lines": "1-12" }
     },
     {
       "name": "js-sample-event-surface",

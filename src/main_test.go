@@ -13,6 +13,18 @@ import (
 	"time"
 )
 
+// TestMain runs from the package dir (src/), but the fixtures and the project's
+// own sources live at the repo root. Hop up one level so the repo-root-relative
+// paths the tests use keep resolving after the main.go split into src/.
+func TestMain(m *testing.M) {
+	if _, err := os.Stat("fixtures"); os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join("..", "fixtures")); err == nil {
+			_ = os.Chdir("..")
+		}
+	}
+	os.Exit(m.Run())
+}
+
 const sampleRoot = "fixtures/spring-sample/src/main/java"
 
 const samplePatterns = "kafka-listener=@KafkaListener;scheduled=@Scheduled;event-listener=@EventListener;http-mapping=@(Get|Post|Put|Delete|Patch|Request)Mapping"
@@ -1006,8 +1018,8 @@ func TestGoSymbolsSelfLensIsGeneric(t *testing.T) {
 			Name:       "self",
 			Out:        filepath.Join(dir, "self.projection"),
 			Analyzer:   "go-symbols",
-			SourceRoot: ".",
-			Include:    []string{"main.go"},
+			SourceRoot: "src",
+			Include:    []string{"registry.go", "projection.go"},
 		}},
 	}
 	results, err := Run(cfg, DefaultRegistry())
@@ -1020,7 +1032,7 @@ func TestGoSymbolsSelfLensIsGeneric(t *testing.T) {
 	got := read(t, filepath.Join(dir, "self.projection"))
 	for _, want := range []string{
 		"# analyzer: go-symbols",
-		"@@ main.go#functions [go-symbols.functions hash=",
+		"@@ src/registry.go#functions [go-symbols.functions hash=",
 		"func Run(cfg Config, registry Registry) ([]Projection, error)",
 		"func ExecuteLens(cfg Config, registry Registry, lens LensConfig) (Projection, error)",
 		"func RenderProjection(path string, p Projection) error",

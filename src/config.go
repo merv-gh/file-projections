@@ -34,6 +34,43 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+func (l *LensConfig) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Name       string         `json:"name"`
+		Out        string         `json:"out,omitempty"`
+		Analyzer   string         `json:"analyzer"`
+		SourceRoot string         `json:"source_root,omitempty"`
+		Include    []string       `json:"include,omitempty"`
+		Input      string         `json:"input,omitempty"`
+		Params     map[string]any `json:"params,omitempty"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	l.Name = raw.Name
+	l.Out = raw.Out
+	l.Analyzer = raw.Analyzer
+	l.SourceRoot = raw.SourceRoot
+	l.Include = raw.Include
+	l.Input = raw.Input
+	if raw.Params != nil {
+		l.Params = map[string]string{}
+		for k, v := range raw.Params {
+			switch t := v.(type) {
+			case string:
+				l.Params[k] = t
+			default:
+				j, err := json.Marshal(t)
+				if err != nil {
+					return fmt.Errorf("lens %q param %q: %w", raw.Name, k, err)
+				}
+				l.Params[k] = string(j)
+			}
+		}
+	}
+	return nil
+}
+
 func defaultExcludeDirs() []string {
 	return []string{".git", ".gocache", ".gomodcache", ".projections", "node_modules", "target", "build", "dist", "vendor", "__MACOSX"}
 }

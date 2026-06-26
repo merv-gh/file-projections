@@ -45,6 +45,9 @@ func main() {
 		case "perf":
 			must(RunPerf(os.Args[2:], os.Stdout))
 			return
+		case "clone":
+			must(RunClone(os.Args[2:], os.Stdout))
+			return
 		case "sync":
 			// Reconcile a two-way projection with its source files (the same engine
 			// `watch` uses, exposed as a one-shot command so external tools can drive
@@ -220,13 +223,14 @@ COMMANDS
   bookmarks     expand single-line drop-in .projection files into two-way bookmarks
   sync          reconcile a two-way projection with its source (one-shot, like watch)
   ui            serve a local web UI to edit config, preview lenses, search symbols (-addr :7777)
+  clone         shallow-clone a GitHub repo (owner/repo or URL) into a local working dir
   perf          benchmark all-to-all entry→exit on a repo, with a wall-clock cap
   version       print the version
   help          show this help
 
 FLAGS (run one ad-hoc lens without a config)
   -config <path>       config file (default config.json)
-  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow|object-flow|cpg-methods|unrolled-program
+  -analyzer <name>     entrypoints|exitpoints|control-flow|data-flow|entry-to-exit|bookmark|flow|ast-grep|joern-var-flow|object-flow|cpg-methods|unrolled-program|postgres-watch
   -source-root <dir>   source root for the ad-hoc lens
   -file -line -var -method -type -inputs -mode -out   lens parameters
 
@@ -239,6 +243,7 @@ LENSES
   object-flow    how target-type instances are assembled across files (joern)
   cpg-methods    language-neutral CPG method/call surface (joern; Java/Go)
   unrolled-program editable straight-line Java/Go path with scattered two-way sync
+  postgres-watch poll Postgres tables by id into a rolling CSV projection
   bookmark       two-way verbatim span; or drop in 'pkg/Foo.java:17'
   flow           generic "annotated entry reaches a sink"
 
@@ -255,6 +260,33 @@ EXAMPLES
 DOCS
   README.md — full reference   ·   skill.md — agent usage   ·   RELEASE_NOTES.md
 `, version)
+}
+
+// RunClone shallow-clones a GitHub repo (full URL or owner/repo slug) into a local
+// working dir and prints the path. Shares clone logic with the UI's /api/clone so every
+// surface clones the same way. Default dest keeps clones beside the repo so the UI
+// can use the result directly as a source root.
+func RunClone(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("clone", flag.ContinueOnError)
+	fs.SetOutput(out)
+	dest := fs.String("dest", "workspace/clones", "directory to clone into (relative to cwd)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: file-projections clone <owner/repo | git-url> [-dest dir]")
+	}
+	url, name, err := normalizeGitURL(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "cloning %s (shallow) ...\n", url)
+	target, err := cloneRepo(url, name, *dest, os.Stdout)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "cloned into %s\n", target)
+	return nil
 }
 
 // RunPerf benchmarks the Joern path end-to-end: build the CPG for a (large) repo and run an

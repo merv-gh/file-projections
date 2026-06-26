@@ -66,6 +66,7 @@ func DefaultRegistry() Registry {
 		"bookmark":          AnalyzerFunc{"bookmark", AnalyzeBookmark},
 		"extract":           AnalyzerFunc{"extract", AnalyzeBookmark}, // back-compat alias
 		"service-graph":     AnalyzerFunc{"service-graph", AnalyzeServiceGraph},
+		"postgres-watch":    AnalyzerFunc{"postgres-watch", AnalyzePostgresWatch},
 	}
 }
 

@@ -1247,3 +1247,80 @@ func read(t *testing.T, path string) string {
 	}
 	return string(b)
 }
+
+func TestTSUnrolledProgramInlinesCrossFunctionAndSyncsBack(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	// Two functions in one module: the entry calls a local helper, and a guard
+	// governs a throw. Exercises arrow + named func parsing, cross-function inline,
+	// brace-depth guard tracking, and scattered two-way sync of an edited line.
+	write(t, filepath.Join(src, "cmd.ts"), `export function loadConfig(env: Env): Config {
+  const listener = env["KIND"]
+  if (listener === "unix") {
+    const path = env["SOCK"]
+    if (!path) {
+      throw new Error("SOCK required")
+    }
+    return { listener, path }
+  }
+  return fallback(env)
+}
+
+const fallback = (env: Env): Config => {
+  const host = env["HOST"]
+  return { listener: "tcp", host }
+}
+`)
+
+	projPath := filepath.Join(dir, ".projections/ts-unrolled.projection")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", Lenses: []LensConfig{{
+		Name:       "ts-unrolled",
+		Out:        ".projections/ts-unrolled.projection",
+		Analyzer:   "unrolled-program",
+		SourceRoot: "src",
+		Params: map[string]string{
+			"file":         "cmd.ts",
+			"method":       "loadConfig",
+			"lang":         "js",
+			"inline_depth": "2",
+		},
+	}}}
+	if _, err := Run(cfg, DefaultRegistry()); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, projPath)
+	for _, want := range []string{
+		"# sync: two-way",
+		"unrolled-program:ts",
+		`const listener = env["KIND"]`,
+		`throw new Error("SOCK required")`,
+		`const host = env["HOST"]`, // inlined from fallback()
+		`unrolled-program.lguard`,  // nested guard set tracked by brace depth
+		`listener === "unix" && !path`,
+		"=> loadConfig: origin ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q\n%s", want, got)
+		}
+	}
+
+	// Edit an inlined line and confirm the change syncs back to the helper's origin file.
+	edited := strings.Replace(got, `  const host = env["HOST"]`, `  const host = env["HOSTNAME"]`, 1)
+	if edited == got {
+		t.Fatal("test did not edit projection")
+	}
+	if err := os.WriteFile(projPath, []byte(edited), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := SyncProjection(cfg, projPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ToSource != 1 || len(res.Conflicts) != 0 {
+		t.Fatalf("sync result = %#v", res)
+	}
+	cmd := read(t, filepath.Join(src, "cmd.ts"))
+	if !strings.Contains(cmd, `env["HOSTNAME"]`) {
+		t.Fatalf("fallback() origin line was not updated:\n%s", cmd)
+	}
+}

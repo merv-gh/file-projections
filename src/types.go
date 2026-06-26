@@ -1,7 +1,7 @@
 package main
 
 import (
-	_ "embed" // for the //go:embed VERSION and ui.html string vars below
+	"embed" // for the //go:embed VERSION and ui/ asset vars below
 	"regexp"
 	"strings"
 	"time"
@@ -249,5 +249,5 @@ type SyncResult struct {
 
 var idRangeRE = regexp.MustCompile(`:(\d+)-(\d+)$`)
 
-//go:embed ui.html
-var uiHTML string
+//go:embed ui
+var uiFS embed.FS

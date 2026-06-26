@@ -353,6 +353,9 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	if lang == "go" {
 		return AnalyzeGoUnrolledProgram(cfg, lens)
 	}
+	if lang == "js" {
+		return AnalyzeTSUnrolledProgram(cfg, lens)
+	}
 	file := lens.Params["file"]
 	method := lens.Params["method"]
 	if file == "" {

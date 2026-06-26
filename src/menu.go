@@ -42,8 +42,9 @@ func RunMenu(cfg Config, configPath string, in io.Reader, out io.Writer) error {
 		fmt.Fprintln(out, "  4) add entrypoints view")
 		fmt.Fprintln(out, "  5) add exitpoints view")
 		fmt.Fprintln(out, "  6) add bookmark view (two-way)")
-		fmt.Fprintf(out, "  7) toggle watch (regenerate + sync on change) [%s]\n", watchState)
-		fmt.Fprintln(out, "  8) quit")
+		fmt.Fprintln(out, "  7) add postgres-watch view")
+		fmt.Fprintf(out, "  8) toggle watch (regenerate + sync on change) [%s]\n", watchState)
+		fmt.Fprintln(out, "  9) quit")
 		choice := prompt("choice")
 		switch choice {
 		case "1":
@@ -87,6 +88,19 @@ func RunMenu(cfg Config, configPath string, in io.Reader, out io.Writer) error {
 			}
 			cfg = addLens(cfg, configPath, lens, out)
 		case "7":
+			lens := LensConfig{
+				Name:     prompt("name"),
+				Analyzer: "postgres-watch",
+				Params: map[string]string{
+					"connections":    prompt(`connections JSON (e.g. {"dev":"postgres://user:pass@localhost:5432/app?sslmode=disable"})`),
+					"tables":         prompt("tables (comma list, each with integer id column)"),
+					"window_minutes": coalesce(prompt("rolling window minutes"), "10"),
+					"poll_seconds":   coalesce(prompt("poll seconds"), "30"),
+					"bootstrap":      coalesce(prompt("bootstrap latest|all"), "latest"),
+				},
+			}
+			cfg = addLens(cfg, configPath, lens, out)
+		case "8":
 			if watchStop == nil {
 				watchStop = make(chan struct{})
 				go RunWatchUntil(cfg, out, watchStop)
@@ -96,7 +110,7 @@ func RunMenu(cfg Config, configPath string, in io.Reader, out io.Writer) error {
 				watchStop = nil
 				fmt.Fprintln(out, "watch stopped")
 			}
-		case "8", "q", "quit", "":
+		case "9", "q", "quit", "":
 			return nil
 		default:
 			fmt.Fprintln(out, "unknown choice")
@@ -225,9 +239,15 @@ func RunWatch(cfg Config) error {
 // background watch toggle.
 func RunWatchUntil(cfg Config, out io.Writer, stop <-chan struct{}) error {
 	mtimes := map[string]time.Time{}
+	pgLenses := postgresWatchLenses(cfg)
+	pgEvery := postgresPollEvery(pgLenses)
+	pgNext := time.Now()
 	snapshot := func() map[string]time.Time {
 		m := map[string]time.Time{}
 		for _, lens := range cfg.Lenses {
+			if lens.Analyzer == "postgres-watch" {
+				continue
+			}
 			base := filepath.Join(cfg.Root, lens.SourceRoot)
 			filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
@@ -264,6 +284,17 @@ func RunWatchUntil(cfg Config, out io.Writer, stop <-chan struct{}) error {
 		case <-stop:
 			return nil
 		case <-time.After(time.Second):
+		}
+		if len(pgLenses) > 0 && !time.Now().Before(pgNext) {
+			pgCfg := cfg
+			pgCfg.Lenses = pgLenses
+			if _, err := Run(pgCfg, DefaultRegistry()); err != nil {
+				fmt.Fprintln(out, "postgres poll error:", err)
+			} else {
+				fmt.Fprintf(out, "polled postgres lenses (%s)\n", pgEvery)
+			}
+			pgNext = time.Now().Add(pgEvery)
+			mtimes = snapshot()
 		}
 		cur := snapshot()
 		srcChanged := false

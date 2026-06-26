@@ -14,7 +14,7 @@ projection is a generated file that answers exactly one such question, pulling t
 relevant slices out of however many source files are involved — so you (or an agent)
 read one focused file instead of scanning ten, at a fraction of the tokens.
 
-Single binary (`main.go`, stdlib-only), single config (`config.json`). External engines
+Single binary, single config (`config.json`), small dependency footprint. External engines
 (`rg`, `ast-grep`, `joern`) are used when present and fall back to a Docker image or a
 built-in scanner when not.
 
@@ -32,6 +32,7 @@ make run                   # generate every lens in config.json into .projection
 make menu                  # interactively add a view (control-flow, data-flow, ...)
 make watch                 # regenerate on change + sync two-way edits back to source
 ./bin/file-projections ui  # local web UI: edit config, preview any lens, search symbols
+./bin/file-projections clone owner/repo   # shallow-clone a GitHub repo to work on
 make ui-self               # dogfood the UI on this repo (override UI_ADDR=:7780)
 make test                  # full test suite
 make cross                 # mac (amd64/arm64) + linux + windows binaries
@@ -39,25 +40,30 @@ make cross                 # mac (amd64/arm64) + linux + windows binaries
 
 ### `ui` — preview lenses and pick params from real symbols
 
-`file-projections ui` (default `http://localhost:7777`, override with `-addr`) serves a single
-self-contained page (stdlib `net/http`, no assets) over the **same analyzer registry the CLI
-uses** — it is a thin shell over `ExecuteLens`/`SyncProjection`, never a parallel implementation:
+`file-projections ui` (default `http://localhost:7777`, override with `-addr`) serves a small
+set of embedded assets (`ui/index.html` + `app.css` + `core.js`/`unroll.js`/`graph.js`/`studio.js`,
+stdlib `net/http`) over the **same analyzer registry the CLI uses** — it is a thin shell over
+`ExecuteLens`/`SyncProjection`, never a parallel implementation:
 
 - **Fix (unroll) — discover → choose → edit.** Flatten a method's cross-file, branched execution
   into one straight-line program; **discover** the branches (run with no inputs and the `if (…)`
   headers stay visible, highlighted), **choose** a path by typing the inputs, then **edit** any
   line — the change is written back to the real source file that line came from (the same
-  scattered two-way `sync` the CLI uses). Each line shows its true `file:line` origin.
+  scattered two-way `sync` the CLI uses). Each line shows its true `file:line` origin. Works for
+  Java, Go and TS/JS source.
 
   ![UI: discover → choose → edit](tools/benchmark/ui-unroll-demo.gif)
 
+- **Clone a GitHub repo.** Paste an `owner/repo` slug or git URL into the header and the server
+  shallow-clones it into `workspace/clones/…`, then sets it as the source root so you can run any
+  lens against a fresh checkout without leaving the UI (same logic as the `clone` CLI command).
 - **Preview a lens on the fly.** Pick an analyzer, a `source_root`, and params; it runs the lens
   ad-hoc and shows the exact projection body that would be written (plus any `control-flow`
   branch files). Try different lenses/params against a real project before committing them to
   `config.json` — useful because most lenses need real args (`file`/`line`/`var`/`method`/`type`).
-- **Search symbols.** Query Java classes/methods and Go funcs/types under the source root; click
-  a result to fill the lens's `file`/`line`/`method`/`type` params from real `file:line` — the
-  way an MCP symbol search would, so you never guess a locator.
+- **Search symbols.** Query Java classes/methods, Go funcs/types and TS/JS functions under the
+  source root; click a result to fill the lens's `file`/`line`/`method`/`type` params from real
+  `file:line` — the way an MCP symbol search would, so you never guess a locator.
 - **Edit config.** Load/validate/save `config.json` in the browser.
 
 The unroll tab is also deep-linkable: `?do=discover|apply|edit&sr=…&file=…&method=…&inputs=…`
@@ -87,8 +93,9 @@ Each lens is one entry in `config.json` with an `analyzer` and `params`. Lenses 
 | `flow` | generic "annotated entry reaches a sink" (config regexes); `java-post-to-save` is an alias | stdlib Java |
 | `joern-var-flow` | interprocedural var data-flow (CPG) with Java fallback | joern → stdlib |
 | `cpg-methods` | language-neutral CPG method/call surface for Java or Go source roots | joern |
-| `unrolled-program` | editable straight-line Java/Go path assembled from calls; each line syncs back to its origin | stdlib adapter |
+| `unrolled-program` | editable straight-line Java/Go/TS path assembled from calls; each line syncs back to its origin | stdlib adapter |
 | `ast-grep` | structural pattern matches | ast-grep → docker |
+| `postgres-watch` | poll Postgres tables by integer `id` into a rolling CSV window | Postgres |
 | `go-symbols` / `js-events` / `jsonl` | Go symbol map / JS event surface / generic tool adapter | stdlib |
 
 ### entrypoints / exitpoints
@@ -163,7 +170,7 @@ Emits only the lines that shape the variable, each with a right-padded trailing 
 (`order.setShipping("express");          // <- mutates order`) so the code stays scannable.
 Set `mode: joern` to use a Joern CPG slice instead of the static fallback.
 
-### unrolled-program — editable straight-line Java/Go path
+### unrolled-program — editable straight-line Java/Go/TS path
 
 ```json
 { "name": "receipt-summary", "analyzer": "unrolled-program",
@@ -177,14 +184,26 @@ evaluating simple branch conditions from `params.inputs` where the adapter can p
 rendered lines are real source lines from their original files. Editing one line in the projection
 under `watch` writes that line back to its source origin, even when adjacent projection lines came
 from different files. If `inputs` is omitted, unknown branches are shown together and branch facts
-call out whether a condition was decided from inputs or is runtime-dependent. Java and Go use
-language adapters behind the same lens; graph-level Joern views use the same source-root CPG cache.
+call out whether a condition was decided from inputs or is runtime-dependent. Java, Go and TS/JS
+use language adapters behind the same lens; graph-level Joern views use the same source-root CPG
+cache. The Go and TS adapters track per-line guard sets but do not yet evaluate `inputs` (they show
+both branches); only the Java adapter collapses to a single input-decided path.
 
 ```json
 { "name": "go-summary", "analyzer": "unrolled-program",
   "source_root": ".",
   "params": { "file": "main.go", "method": "Run", "lang": "go" } }
 ```
+
+```json
+{ "name": "ts-loadconfig", "analyzer": "unrolled-program",
+  "source_root": "apps/sheets/src",
+  "params": { "file": "cmd.ts", "method": "loadConfig", "lang": "js" } }
+```
+
+The TS/JS adapter parses named functions, `const fn = (…) => …` arrows and class methods,
+inlines locally-defined calls across the file/module, and tracks the conditions guarding each
+line by brace depth. `lang` auto-detects from the source root; pass `lang: "js"` to force it.
 
 ### cpg-methods — language-neutral CPG method surface
 
@@ -197,6 +216,34 @@ language adapters behind the same lens; graph-level Joern views use the same sou
 Runs a small Joern query over the cached source-root CPG and lists matching methods plus direct
 call names. The CPG build chooses `javasrc2cpg` or `gosrc2cpg` from the source root, so the query
 is language-neutral and lens adapters can share the same CPG plumbing.
+
+### postgres-watch — rolling table window
+
+```json
+{ "name": "db-events", "analyzer": "postgres-watch",
+  "params": {
+    "connections": { "dev": "postgres://user:pass@localhost:5432/app?sslmode=disable" },
+    "tables": ["orders", "audit_events"],
+    "window_minutes": "10",
+    "poll_seconds": "30",
+    "bootstrap": "latest"
+  } }
+```
+
+Polls each configured environment/table by integer `id`, persists the biggest id seen per
+environment/table, and renders rows observed during the rolling `window_minutes` period as CSV.
+`watch` runs these lenses every `poll_seconds` seconds (default 30); a normal one-shot run performs
+one poll. The first run defaults to `bootstrap: "latest"` so existing history is marked as seen
+without flooding the projection; use `bootstrap: "all"` to replay rows from id 0.
+
+Params:
+
+- `connections`: JSON object mapping environment name to Postgres connection string. The config
+  loader accepts this as a real object; `-params-json` works the same way for ad-hoc CLI runs.
+- `tables`: JSON array or comma-separated list. Each table must be `table` or `schema.table` and
+  have an integer `id` column.
+- `id_column`: optional id column name, default `id`.
+- `state`: optional state file path; default is `.projections/.postgres-watch/<lens>.json`.
 
 ### bookmark — two-way sync
 

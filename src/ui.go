@@ -45,7 +45,7 @@ func uiAnalyzerLanguages() map[string][]string {
 		"control-flow":      {"java"},
 		"data-flow":         {"java"},
 		"object-flow":       {"java"},
-		"unrolled-program":  {"java", "go"},
+		"unrolled-program":  {"java", "go", "js"},
 		"entry-to-exit":     {"java"},
 		"cpg-methods":       {"java"},
 		"joern-var-flow":    {"java"},
@@ -60,6 +60,7 @@ func uiAnalyzerLanguages() map[string][]string {
 		"extract":           {"java", "go", "js"},
 		"ast-grep":          {"java", "go", "js"},
 		"service-graph":     {"any"},
+		"postgres-watch":    {"any"},
 	}
 }
 
@@ -69,14 +70,22 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	}
 	s := &uiServer{cfg: cfg, configPath: configPath, registry: DefaultRegistry()}
 	mux := http.NewServeMux()
+	// Serve the composable UI assets (HTML shell + css + js modules) from the
+	// embedded ui/ directory. "/" serves the shell; "/ui/*" serves the rest.
+	assets, err := fs.Sub(uiFS, "ui")
+	if err != nil {
+		return err
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, uiHTML)
+		shell, _ := uiFS.ReadFile("ui/index.html")
+		w.Write(shell)
 	})
+	mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.FS(assets))))
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/preview", s.handlePreview)
 	mux.HandleFunc("/api/symbols", s.handleSymbols)
@@ -87,6 +96,7 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/detect", s.handleDetect)
 	mux.HandleFunc("/api/unroll", s.handleUnroll)
 	mux.HandleFunc("/api/unroll/edit", s.handleUnrollEdit)
+	mux.HandleFunc("/api/clone", s.handleClone)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
 	return http.ListenAndServe(addr, mux)
 }
@@ -746,6 +756,45 @@ func (s *uiServer) handleUnrollEdit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleClone shallow-clones a GitHub repo into a working dir under the repo root and
+// returns a source-root-relative path the UI can immediately detect/run lenses against.
+// Same clone logic the `clone` CLI command uses.
+func (s *uiServer) handleClone(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	url, name, err := normalizeGitURL(req.URL)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	// Clone under <root>/workspace/clones so the result is a path relative to cfg.Root,
+	// which is exactly what every source-root-based handler (detect/symbols/...) expects.
+	destAbs := filepath.Join(cfg.Root, "workspace", "clones")
+	target, err := cloneRepo(url, name, destAbs, nil)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	rel, err := filepath.Rel(cfg.Root, target)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	// Invalidate detection cache so the new root is re-scanned.
+	s.mu.Lock()
+	s.detectCache = nil
+	s.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"root": filepath.ToSlash(rel), "url": url})
+}
+
 func collectSymbols(cfg Config, root, q string, limit int) ([]uiSymbol, error) {
 	base := filepath.Join(cfg.Root, root)
 	var out []uiSymbol
@@ -805,6 +854,19 @@ func collectSymbols(cfg Config, root, q string, limit int) ([]uiSymbol, error) {
 					if match(name) {
 						out = append(out, uiSymbol{Name: name, Kind: kind, File: rel, Line: i + 1})
 					}
+				}
+			}
+		case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+			if match(rel) || match(filepath.Base(rel)) {
+				out = append(out, uiSymbol{Name: rel, Kind: "file", File: rel, Line: 1})
+			}
+			lines, err := readLines(path)
+			if err != nil {
+				return nil
+			}
+			for _, fn := range parseTSFuncs(rel, lines) {
+				if match(fn.name) {
+					out = append(out, uiSymbol{Name: fn.name, Kind: "func", File: rel, Line: fn.line})
 				}
 			}
 		}

@@ -1,0 +1,77 @@
+<!doctype html><html><head><meta charset=utf-8>
+<title>file-projections · lens studio</title>
+<link rel=stylesheet href="/ui/app.css">
+</head><body>
+<header>
+ <b>file-projections</b>
+ <span class=chip><span class=lbl>source</span><span class=val id=srval>.</span><button class=ghost id=srchange>Change…</button></span>
+ <span class=clonebar><input id=cloneurl placeholder="github.com/owner/repo to clone" autocomplete=off><button class=ghost id=clonebtn>Clone</button></span>
+ <span class=langtag id=langtag>—</span>
+ <span class=note id=cfgpath style=color:var(--mut)></span>
+ <span style=margin-left:auto id=msg></span>
+</header>
+<div class=wrap id=wrap>
+ <div class="col left">
+  <h2>Lens</h2>
+  <select id=an></select>
+  <p class=hint id=anhint></p>
+  <div class=row style="gap:.3rem;margin:.2rem 0 .1rem">
+   <select id=savedlenses style=flex:1><option value="">★ saved lenses…</option></select>
+   <button class=ghost id=savelens title="Bookmark this lens + its config">★ Save</button>
+   <button class=ghost id=dellens title="Delete the selected saved lens">×</button>
+  </div>
+  <div id=params></div>
+  <div id=unrollctl style=display:none>
+   <label>entry — file › method</label>
+   <div class=field><input id=uentry placeholder="App.java › summary" autocomplete=off><div id=entryac class=ac></div></div>
+   <label>inputs <span style=color:var(--mut)>(optional — collapse to one path)</span></label>
+   <input id=uinputs placeholder="coupon=save,amount=50">
+   <label style="display:flex;justify-content:space-between">inline depth <b id=uinlinelabel>0</b></label>
+   <input id=uinline type=range min=0 max=10 value=0 step=1>
+   <p class=hint>Branches discover automatically as you change entry, inputs or depth.</p>
+  </div>
+ </div>
+ <div class=col>
+  <div class=tabs><button class=on id=tresult>Result</button><button id=tgraph>Service graph</button><button id=tcfg>config.json</button></div>
+
+  <div id=graphpane style=display:none>
+   <div class=graphctl>
+    <select id=graphlens></select>
+    <label class=gchk><input type=checkbox id=gcross> cross-service only</label>
+    <button class=ghost id=gmermaid>Copy mermaid</button>
+    <span class=note id=gstatus></span>
+   </div>
+   <div id=graphwrap><div id=graphhint class=note>Pick a <code>service-graph</code> lens. Click a node to drill into its assumptions &amp; object timeline.</div></div>
+   <div id=mermaidbox style=display:none><div class=row style="justify-content:space-between"><h2 style=margin:0>mermaid</h2><button class=ghost id=gmclose>close</button></div><textarea id=mermaidtext rows=14 readonly></textarea></div>
+  </div>
+
+  <div id=resultpane>
+   <div id=lensview>
+    <pre id=out>Pick a lens — it runs automatically.</pre>
+    <div id=extra></div>
+   </div>
+   <div id=unrollview style=display:none>
+    <div id=ubanner class=banner style=display:none></div>
+    <div class=progctl>
+     <button class=ghost id=foldtc>Hide try/catch</button>
+     <span class=legend><i class=lx>early return / throw</i><i class=lg>guard</i><i class=lw>writes (✎ click=timeline)</i><i class=ll>loop body</i></span>
+    </div>
+    <div id=unrollbody class="unrollbody no-side">
+     <div id=uprog class=prog></div>
+     <div id=branchbar class=branchbar></div>
+    </div>
+    <div class=row style=margin-top:.5rem><button id=usync disabled>Sync changes</button><span class=note id=ustatus style=margin-left:.6rem></span></div>
+   </div>
+  </div>
+
+  <div id=cfgpane style=display:none>
+   <textarea id=cfg rows=28></textarea>
+   <div style=margin-top:.5rem><button id=savecfg>Save config.json</button><span class=note id=cfgmsg></span></div>
+  </div>
+ </div>
+</div>
+<script src="/ui/core.js"></script>
+<script src="/ui/unroll.js"></script>
+<script src="/ui/graph.js"></script>
+<script src="/ui/studio.js"></script>
+</body></html>

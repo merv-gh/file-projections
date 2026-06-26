@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -29,6 +30,9 @@ type sgNode struct {
 	Line    int    `json:"line,omitempty"`
 	Op      string `json:"op,omitempty"`     // operation id for entrypoints
 	Method  string `json:"method,omitempty"` // handler/func name for drill-in
+	// Effects are the distinct side-effect kinds (io-read/io-write/network/db/process)
+	// this file performs, so the graph can highlight what each node actually touches.
+	Effects []string `json:"effects,omitempty"`
 }
 
 type sgEdge struct {
@@ -73,6 +77,24 @@ func AnalyzeServiceGraph(cfg Config, lens LensConfig) (Projection, error) {
 	g := sgGraph{Services: services}
 	nodeByFile := map[string]string{} // source_root-relative file -> node id
 	tsFilesByService := map[string][]string{}
+	// Precompile side-effect markers per service language so each file node can be
+	// tagged with what it touches (io/network/db/process) — first-class in the graph.
+	seByLang := map[string][]compiledMarker{}
+	for _, svc := range services {
+		lid := sgLangID(svc.Lang)
+		if _, done := seByLang[lid]; done {
+			continue
+		}
+		if l := languageByID(lid); l != nil {
+			var cms []compiledMarker
+			for _, m := range l.SideEffects {
+				if re, err := regexp.Compile(m.Regex); err == nil {
+					cms = append(cms, compiledMarker{kind: m.Kind, label: m.Label, re: re})
+				}
+			}
+			seByLang[lid] = cms
+		}
+	}
 	addNode := func(n sgNode) {
 		if _, ok := nodeByFile[n.File]; ok {
 			return
@@ -106,7 +128,8 @@ func AnalyzeServiceGraph(cfg Config, lens LensConfig) (Projection, error) {
 			rel, _ := filepath.Rel(base, p)
 			rel = filepath.ToSlash(rel)
 			id := svc.Name + "::" + rel
-			addNode(sgNode{ID: id, Label: trimServiceLabel(svc, rel), Service: svc.Name, Lang: svc.Lang, Kind: "file", File: rel})
+			effects := fileEffectKinds(p, seByLang[sgLangID(svc.Lang)])
+			addNode(sgNode{ID: id, Label: trimServiceLabel(svc, rel), Service: svc.Name, Lang: svc.Lang, Kind: "file", File: rel, Effects: effects})
 			if isTS {
 				tsFilesByService[svc.Name] = append(tsFilesByService[svc.Name], rel)
 			}
@@ -257,7 +280,7 @@ func trimServiceLabel(svc sgService, rel string) string {
 // resolveTSImport maps a TS import specifier to a known file node. Returns the
 // node id, whether the edge crosses a service boundary, and ok.
 func resolveTSImport(from sgService, fromRel, spec string, nodeByFile map[string]string, pkgMap map[string]string, services []sgService) (string, bool, bool) {
-	// workspace package (e.g. "@recurring/shared-ts" or a subpath import)
+	// workspace package (e.g. "@myorg/shared" or a subpath import)
 	for pkg, root := range pkgMap {
 		if spec == pkg || strings.HasPrefix(spec, pkg+"/") {
 			// resolve to that package's index, else any file under its root
@@ -340,4 +363,40 @@ func findGoHandler(cfg Config, base string, svc sgService, handler string, nodeB
 		return nil
 	})
 	return found, ok
+}
+
+// sgLangID maps a service-graph lang ("ts"/"go") to a Language registry id.
+func sgLangID(lang string) string {
+	if lang == "ts" {
+		return "js"
+	}
+	return lang
+}
+
+// fileEffectKinds returns the distinct side-effect kinds a file performs, using the
+// precompiled language markers — so service-graph nodes know what they touch.
+func fileEffectKinds(path string, markers []compiledMarker) []string {
+	if len(markers) == 0 {
+		return nil
+	}
+	lines, err := readLines(path)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range lines {
+		code := stripLineComment(raw)
+		if strings.TrimSpace(code) == "" {
+			continue
+		}
+		for _, m := range markers {
+			if !seen[m.kind] && m.re.MatchString(code) {
+				seen[m.kind] = true
+				out = append(out, m.kind)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }

@@ -20,7 +20,7 @@ import (
 // PostgreSQL analyzer: stateful high-water polling for append-heavy tables.
 
 type postgresWatchState struct {
-	Version int                                                 `json:"version"`
+	Version int                                                `json:"version"`
 	Env     map[string]map[string]map[string]postgresTableMark `json:"env"`
 	Rows    []postgresSeenRow                                  `json:"rows"`
 }

@@ -48,6 +48,9 @@ func main() {
 		case "clone":
 			must(RunClone(os.Args[2:], os.Stdout))
 			return
+		case "report":
+			must(RunReport(os.Args[2:], os.Stdout))
+			return
 		case "sync":
 			// Reconcile a two-way projection with its source files (the same engine
 			// `watch` uses, exposed as a one-shot command so external tools can drive
@@ -224,8 +227,8 @@ COMMANDS
   sync          reconcile a two-way projection with its source (one-shot, like watch)
   ui            serve a local web UI to edit config, preview lenses, search symbols (-addr :7777)
   clone         shallow-clone a GitHub repo (owner/repo or URL) into a local working dir
-  perf          benchmark all-to-all entry→exit on a repo, with a wall-clock cap
-  version       print the version
+  report        bake a service-graph + side-effects + findings into one shareable HTML file
+  perf          benchmark all-to-all entry→exit on a repo, with a wall-clock cap  version       print the version
   help          show this help
 
 FLAGS (run one ad-hoc lens without a config)

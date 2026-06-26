@@ -667,38 +667,35 @@ func plural(n int) string {
 	return "es"
 }
 
-// Language-appropriate defaults for the wizard's suggested lenses.
+// Language-appropriate defaults for the wizard's suggested lenses. These now live
+// on the Language registry (language.go) so a new language ships its own; these
+// helpers are thin lookups kept for call-site brevity.
 func entrypointPatternsFor(lang string) string {
-	switch lang {
-	case "java":
-		return "kafka-listener=@KafkaListener;scheduled=@Scheduled;event-listener=@EventListener;http-mapping=@(Get|Post|Put|Delete|Patch|Request)Mapping"
-	case "go":
-		return `http-handler=func .*http\.ResponseWriter;route=\.(GET|POST|PUT|DELETE|HandleFunc)\(`
-	default:
-		return `route=\.(get|post|put|delete)\(;listener=addEventListener\(;handler=\.on\(`
+	if l := languageByID(lang); l != nil {
+		return l.EntrypointPatterns
 	}
+	return languageByID("js").EntrypointPatterns
 }
 
 func exitSinksFor(lang string) string {
-	switch lang {
-	case "go":
-		return "*repo*.Save,*.Exec,*.Publish"
-	default: // java + js share the bean-ish convention well enough
-		return "*repository*.save,*kafka*.send,*.publish"
+	if l := languageByID(lang); l != nil {
+		return l.ExitSinks
 	}
+	return languageByID("js").ExitSinks
 }
 
 func entryRegexFor(lang string) string {
-	switch lang {
-	case "java":
-		return "@(KafkaListener|Scheduled|EventListener|PostMapping|GetMapping)"
-	default:
-		return "@(KafkaListener|Scheduled|PostMapping|GetMapping)"
+	if l := languageByID(lang); l != nil {
+		return l.EntryRegex
 	}
+	return languageByID("js").EntryRegex
 }
 
 func exitRegexFor(lang string) string {
-	return `\.(save|send|publish|Save|Exec)\s*\(`
+	if l := languageByID(lang); l != nil {
+		return l.ExitRegex
+	}
+	return languageByID("js").ExitRegex
 }
 
 // ============================================================================
@@ -737,3 +734,6 @@ func clampInt(n, lo, hi int) int {
 	}
 	return n
 }
+
+// regexpCompile is a thin wrapper used by tests/markers to compile a pattern.
+func regexpCompile(p string) (*regexp.Regexp, error) { return regexp.Compile(p) }

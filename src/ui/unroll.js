@@ -159,6 +159,9 @@ function renderProg(d){
   var code=document.createElement("div");code.className="code";code.contentEditable="true";code.spellcheck=false;code.textContent=l.code;
   code.oninput=function(){markDirty(row,l.n,code.textContent)};
   code.onkeydown=function(e){if(e.key==="Enter"){e.preventDefault();code.blur()}if(e.key==="Tab"){e.preventDefault();document.execCommand("insertText",false,"    ")}};
+  if(l.effect){row.classList.add("haseff");row.dataset.eff=l.effect;
+   var badge=document.createElement("span");badge.className="effbadge eff-"+l.effect;badge.textContent=l.effect;badge.title="side effect: "+l.effect;
+   code.appendChild(badge);}
   row.appendChild(org);row.appendChild(code);prog.appendChild(row);
   items.push({row:row,code:l.code});
  });

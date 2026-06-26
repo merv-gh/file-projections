@@ -420,6 +420,7 @@ func AnalyzeUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("call-%d", i+1), Tool: "unrolled-program", Text: string(b)})
 		}
 	}
+	appendUnrollSideEffectFacts(&p, "java", body, origins)
 	return p, nil
 }
 
@@ -984,8 +985,6 @@ var uiJavaLocalRE = regexp.MustCompile(`^\s*(?:final\s+)?[A-Z][A-Za-z0-9_<>\[\].
 var uiGoLocalRE = regexp.MustCompile(`^\s*([a-z][A-Za-z0-9_]*)\s*:?=`)
 
 var uiJavaClassRE = regexp.MustCompile(`^\s*(?:public\s+|final\s+|abstract\s+)*(class|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)`)
-
-var uiGoDeclRE = regexp.MustCompile(`^func(?:\s+\([^)]*\))?\s+([A-Za-z_][A-Za-z0-9_]*)|^type\s+([A-Za-z_][A-Za-z0-9_]*)`)
 
 func scanJavaFiles(cfg Config, lens LensConfig) ([]JavaFile, error) {
 	root := filepath.Join(cfg.Root, lens.SourceRoot)

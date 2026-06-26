@@ -37,33 +37,6 @@ type uiDefaults struct {
 	ExampleType string `json:"example_type"`
 }
 
-// uiAnalyzerLanguages maps each analyzer to the languages it can meaningfully run
-// on, so the UI hides lenses that don't apply to the detected language. "any"
-// means language-agnostic (text/data lenses).
-func uiAnalyzerLanguages() map[string][]string {
-	return map[string][]string{
-		"control-flow":      {"java"},
-		"data-flow":         {"java"},
-		"object-flow":       {"java"},
-		"unrolled-program":  {"java", "go", "js"},
-		"entry-to-exit":     {"java"},
-		"cpg-methods":       {"java"},
-		"joern-var-flow":    {"java"},
-		"entrypoints":       {"java"},
-		"exitpoints":        {"java"},
-		"flow":              {"java"},
-		"java-post-to-save": {"java"},
-		"go-symbols":        {"go"},
-		"js-events":         {"js"},
-		"jsonl":             {"any"},
-		"bookmark":          {"java", "go", "js"},
-		"extract":           {"java", "go", "js"},
-		"ast-grep":          {"java", "go", "js"},
-		"service-graph":     {"any"},
-		"postgres-watch":    {"any"},
-	}
-}
-
 func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	if configPath == "" {
 		configPath = "config.json"
@@ -140,15 +113,12 @@ func (s *uiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	def := suggestUIDefaults(s.cfg)
 	s.mu.Unlock()
-	analyzers := make([]string, 0, len(s.registry))
-	for name := range s.registry {
-		analyzers = append(analyzers, name)
-	}
-	sort.Strings(analyzers)
+	analyzers := sortedAnalyzerNames(s.registry)
 	writeJSON(w, 200, map[string]any{
 		"config":        json.RawMessage(raw),
 		"analyzers":     analyzers,
-		"applicability": uiAnalyzerLanguages(),
+		"applicability": analyzerApplicability(),
+		"specs":         analyzerSpecs(),
 		"path":          s.configPath,
 		"defaults":      def,
 	})
@@ -394,77 +364,43 @@ func suggestUIDefaults(cfg Config) uiDefaults {
 	return def
 }
 
+// suggestUIMethod picks a sensible default entry function/method under a source
+// root using the language-neutral symbol index, so it works for every registered
+// language (including TS) without a per-language walk here.
 func suggestUIMethod(cfg Config, sourceRoot, lang string) (file, method string, line int) {
-	base := filepath.Join(cfg.Root, sourceRoot)
-	type cand struct {
-		file   string
-		method string
-		score  int
-		line   int
+	syms, err := allSymbols(cfg, sourceRoot, "", 0)
+	if err != nil {
+		return "", "", 0
 	}
-	var cands []cand
 	preferred := map[string]int{"summary": 100, "main": 90, "handle": 80, "process": 70, "checkout": 60, "build": 50, "run": 40}
 	if lang == "go" {
 		preferred = map[string]int{"run": 120, "main": 100, "executelens": 90, "analyze": 80, "handle": 70, "build": 60}
 	}
-	_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	type cand struct {
+		file, method string
+		score, line  int
+	}
+	var cands []cand
+	for _, s := range syms {
+		if s.Kind != "func" && s.Kind != "method" {
+			continue
 		}
-		if shouldSkipDir(cfg, path, d) {
-			return filepath.SkipDir
+		if strings.Contains(s.File, "/test/") || strings.Contains(strings.ToLower(s.File), "_test.") || strings.Contains(strings.ToLower(s.File), ".test.") {
+			continue
 		}
-		if d.IsDir() || strings.Contains(filepath.ToSlash(path), "/test/") {
-			return nil
+		score := preferred[strings.ToLower(s.Name)]
+		base := strings.ToLower(filepath.Base(s.File))
+		if strings.Contains(base, "controller") {
+			score += 10
 		}
-		lines, err := readLines(path)
-		if err != nil {
-			return nil
+		if base == "main.go" {
+			score += 20
 		}
-		rel, _ := filepath.Rel(base, path)
-		rel = filepath.ToSlash(rel)
-		switch filepath.Ext(path) {
-		case ".java":
-			if lang != "" && lang != "java" {
-				return nil
-			}
-			methods, err := parseJavaMethods(lines)
-			if err != nil {
-				return nil
-			}
-			for _, m := range methods {
-				score := preferred[strings.ToLower(m.Name)]
-				for _, a := range m.Annotations {
-					if strings.Contains(a, "Mapping") || strings.Contains(a, "Listener") || strings.Contains(a, "Scheduled") {
-						score += 30
-					}
-				}
-				if strings.Contains(strings.ToLower(filepath.Base(rel)), "controller") {
-					score += 10
-				}
-				cands = append(cands, cand{file: rel, method: m.Name, score: score, line: m.Start})
-			}
-		case ".go":
-			if lang != "" && lang != "go" {
-				return nil
-			}
-			gf, err := parseGoFile(base, path)
-			if err != nil {
-				return nil
-			}
-			for _, fn := range gf.Funcs {
-				score := preferred[strings.ToLower(fn.Name)]
-				if strings.EqualFold(filepath.Base(rel), "main.go") {
-					score += 20
-				}
-				if strings.HasSuffix(fn.Name, "Handler") || strings.HasPrefix(fn.Name, "Handle") {
-					score += 15
-				}
-				cands = append(cands, cand{file: rel, method: fn.Name, score: score, line: fn.Line})
-			}
+		if strings.HasPrefix(s.Name, "Handle") || strings.HasSuffix(s.Name, "Handler") {
+			score += 15
 		}
-		return nil
-	})
+		cands = append(cands, cand{file: s.File, method: s.Name, score: score, line: s.Line})
+	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if cands[i].score == cands[j].score {
 			if cands[i].file == cands[j].file {
@@ -571,23 +507,18 @@ func (s *uiServer) handlePreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type uiSymbol struct {
-	Name string `json:"name"`
-	Kind string `json:"kind"`
-	File string `json:"file"`
-	Line int    `json:"line"`
-}
-
-// handleSymbols searches source under a root for declarations (java classes/methods,
-// go funcs/types) matching q — so a user picking control-flow/data-flow/object-flow
+// handleSymbols searches source under a root for declarations (functions, methods,
+// types/classes) matching q — so a user picking control-flow/data-flow/object-flow
 // params has the real file:line/type to fill in, the way an MCP symbol search would.
+// Languages are pluggable via the Language registry (language.go), so this handler
+// is language-agnostic.
 func (s *uiServer) handleSymbols(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(r.URL.Query().Get("q"))
 	root := r.URL.Query().Get("root")
 	s.mu.Lock()
 	cfg := s.cfg
 	s.mu.Unlock()
-	syms, err := collectSymbols(cfg, root, q, 200)
+	syms, err := allSymbols(cfg, root, q, 200)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
 		return
@@ -793,90 +724,4 @@ func (s *uiServer) handleClone(w http.ResponseWriter, r *http.Request) {
 	s.detectCache = nil
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"root": filepath.ToSlash(rel), "url": url})
-}
-
-func collectSymbols(cfg Config, root, q string, limit int) ([]uiSymbol, error) {
-	base := filepath.Join(cfg.Root, root)
-	var out []uiSymbol
-	match := func(name string) bool { return q == "" || strings.Contains(strings.ToLower(name), q) }
-	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip unreadable entries rather than abort the whole walk
-		}
-		if d.IsDir() {
-			if shouldSkipDir(cfg, path, d) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if len(out) >= limit {
-			return filepath.SkipAll
-		}
-		rel, _ := filepath.Rel(base, path)
-		rel = filepath.ToSlash(rel)
-		ext := filepath.Ext(path)
-		switch ext {
-		case ".java":
-			if match(rel) || match(filepath.Base(rel)) {
-				out = append(out, uiSymbol{Name: rel, Kind: "file", File: rel, Line: 1})
-			}
-			lines, err := readLines(path)
-			if err != nil {
-				return nil
-			}
-			for i, l := range lines {
-				if m := uiJavaClassRE.FindStringSubmatch(l); m != nil && match(m[2]) {
-					out = append(out, uiSymbol{Name: m[2], Kind: m[1], File: rel, Line: i + 1})
-				}
-			}
-			if methods, err := parseJavaMethods(lines); err == nil {
-				for _, m := range methods {
-					if match(m.Name) {
-						out = append(out, uiSymbol{Name: m.Name, Kind: "method", File: rel, Line: m.Start})
-					}
-				}
-			}
-		case ".go":
-			if match(rel) || match(filepath.Base(rel)) {
-				out = append(out, uiSymbol{Name: rel, Kind: "file", File: rel, Line: 1})
-			}
-			lines, err := readLines(path)
-			if err != nil {
-				return nil
-			}
-			for i, l := range lines {
-				if m := uiGoDeclRE.FindStringSubmatch(l); m != nil {
-					name := m[1]
-					kind := "func"
-					if name == "" {
-						name, kind = m[2], "type"
-					}
-					if match(name) {
-						out = append(out, uiSymbol{Name: name, Kind: kind, File: rel, Line: i + 1})
-					}
-				}
-			}
-		case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
-			if match(rel) || match(filepath.Base(rel)) {
-				out = append(out, uiSymbol{Name: rel, Kind: "file", File: rel, Line: 1})
-			}
-			lines, err := readLines(path)
-			if err != nil {
-				return nil
-			}
-			for _, fn := range parseTSFuncs(rel, lines) {
-				if match(fn.name) {
-					out = append(out, uiSymbol{Name: fn.name, Kind: "func", File: rel, Line: fn.line})
-				}
-			}
-		}
-		return nil
-	})
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].File == out[j].File {
-			return out[i].Line < out[j].Line
-		}
-		return out[i].File < out[j].File
-	})
-	return out, err
 }

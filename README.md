@@ -33,6 +33,7 @@ make menu                  # interactively add a view (control-flow, data-flow, 
 make watch                 # regenerate on change + sync two-way edits back to source
 ./bin/file-projections ui  # local web UI: edit config, preview any lens, search symbols
 ./bin/file-projections clone owner/repo   # shallow-clone a GitHub repo to work on
+./bin/file-projections report -lens svc-graph -findings notes.md -out report.html  # shareable HTML
 make ui-self               # dogfood the UI on this repo (override UI_ADDR=:7780)
 make test                  # full test suite
 make cross                 # mac (amd64/arm64) + linux + windows binaries
@@ -86,6 +87,7 @@ Each lens is one entry in `config.json` with an `analyzer` and `params`. Lenses 
 |----------|---------|--------|
 | `entrypoints` | where does control enter? (`@KafkaListener`, `@Scheduled`, `@*Mapping`, `@EventListener`) | rg → stdlib |
 | `exitpoints` | where does control leave? (`*kafka*.send`, `*repository*.save`, any glob) | rg → stdlib |
+| `side-effects` | what does this code touch? IO read/write, network, db, process — language-aware default markers | stdlib |
 | `control-flow` | all ways from a method entry to a target line — **one file per branch**; `mode: joern` handles else-if/switch/loops | stdlib CFG / joern |
 | `data-flow` | only the lines that shape a variable, annotated as **trailing comments** | fallback slicer / joern |
 | `entry-to-exit` | all control flows from entrypoints to exitpoints over the call graph (all-to-all or 1-to-1) | joern |
@@ -124,6 +126,30 @@ this.orderRepository.save(order);                                   OrderEventSe
 ```
 
 Set `params.line_format` (`{file}/{line}/{label}/{code}`) to override.
+
+### side-effects — what does this code touch?
+
+```json
+{ "name": "svc-side-effects", "analyzer": "side-effects", "source_root": "src" }
+```
+
+A first-class, **language-aware** companion to entrypoints/exitpoints: where those
+answer "where does control enter/leave", this answers "what does this code actually
+touch". Each registered language ships default markers (`language.go`) over common
+stdlib/framework idioms, classified into a small neutral taxonomy:
+
+- `io-read` / `io-write` — filesystem reads/writes
+- `network` — http clients, fetch/axios, sockets, messaging
+- `db` — sql/orm/codegen query calls
+- `process` — env reads, `exec`, `process.exit`
+
+It emits one block per kind (code first, `file:line` second column) plus a per-kind
+count fact, so the CLI/MCP get a summary without parsing blocks. Override or extend
+the defaults per project with `params.markers` (`kind=regex;kind=regex`) and pin the
+language with `params.lang`. The same markers tag **service-graph** nodes (colored
+dots = what each file touches) and **unrolled-program** lines (a badge on the exact
+line that hits IO/network/db) — so side effects are visible in every view, not a
+separate report.
 
 ### control-flow — "ways from entry to a line", branch per file
 

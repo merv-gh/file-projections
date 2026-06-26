@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
@@ -207,152 +205,57 @@ func goCallGraph(files []GoFile) []string {
 // lens (assumptions + object timeline) for that file — cross-service.
 // ---------------------------------------------------------------------------
 
-type goUnroller struct {
-	cfg         Config
-	lens        LensConfig
-	functions   map[string]goFuncRef
-	inlineDepth int
-	inlineSkips map[string]bool
-	calls       []inlineCallChoice
-	callSeen    map[string]bool
-}
-
 type goFuncRef struct {
 	file string
 	fn   GoFunc
 }
 
-func AnalyzeGoUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
-	file := lens.Params["file"]
-	method := lens.Params["method"]
-	if file == "" {
-		return Projection{}, errors.New("unrolled-program go: params.file is required")
-	}
-	if method == "" {
-		return Projection{}, errors.New("unrolled-program go: params.method is required")
-	}
-	u, err := newGoUnroller(cfg, lens)
-	if err != nil {
-		return Projection{}, err
-	}
-	lines, err := u.unroll(file, method, 0, nil)
-	if err != nil {
-		return Projection{}, err
-	}
-	var body []string
-	var origins []LineOrigin
-	var lineGuards [][]string
-	for _, line := range lines {
-		body = append(body, line.code)
-		src := filepath.ToSlash(filepath.Join(lens.SourceRoot, line.file))
-		origins = append(origins, LineOrigin{SrcFile: src, Line: line.line, SrcHash: hash(line.code + "\n")})
-		lineGuards = append(lineGuards, line.guards)
-	}
-	p := Projection{Sync: "two-way"}
-	p.Blocks = append(p.Blocks, ProjectionBlock{
-		ID: method, File: file, Mode: "unrolled", Tool: "unrolled-program:go",
-		Lines: body, LineOrigins: origins, LineGuards: lineGuards, Sync: "two-way",
-	})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "go adapter: editable straight-line function path; each line syncs back to its original source line"})
-	for n, gd := range lineGuards {
-		if len(gd) > 0 {
-			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("lguard-%d", n+1), Tool: "unrolled-program", Text: strings.Join(gd, " && ")})
-		}
-	}
-	for i, c := range u.calls {
-		if b, err := json.Marshal(c); err == nil {
-			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("call-%d", i+1), Tool: "unrolled-program", Text: string(b)})
-		}
-	}
-	return p, nil
+// goLexAdapter adapts Go to the shared lexical unroller (unroll_lexical.go). All
+// the walk/guard/inline machinery lives there; this only answers Go-specific
+// questions (find a func, recognize a guard header, recognize a local call).
+type goLexAdapter struct {
+	lens      LensConfig
+	functions map[string]goFuncRef
 }
 
-func newGoUnroller(cfg Config, lens LensConfig) (*goUnroller, error) {
+func (a *goLexAdapter) lookup(name, file string) (lexFunc, bool) {
+	ref, ok := a.functions[name]
+	if !ok {
+		return lexFunc{}, false
+	}
+	if file != "" && ref.file != file {
+		for _, r := range a.functions {
+			if r.file == file && r.fn.Name == name {
+				ref = r
+				break
+			}
+		}
+	}
+	// GoFunc.Line is the 1-based signature line; body runs from that index (the line
+	// after the signature, 0-based == Line) to End-2 (the line before the close brace).
+	return lexFunc{Rel: ref.file, BodyStart: ref.fn.Line, BodyEnd: ref.fn.End - 2}, true
+}
+func (a *goLexAdapter) guardCond(trim string) (string, bool) { return goGuardCond(trim) }
+func (a *goLexAdapter) callName(trim string) string          { return simpleGoCall(trim) }
+func (a *goLexAdapter) known(name string) bool               { _, ok := a.functions[name]; return ok }
+func (a *goLexAdapter) tool() string                         { return "unrolled-program:go" }
+func (a *goLexAdapter) scope() string {
+	return "go adapter: editable straight-line function path; each line syncs back to its original source line"
+}
+
+func AnalyzeGoUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
 	files, err := scanGoFiles(cfg, lens)
 	if err != nil {
-		return nil, err
+		return Projection{}, err
 	}
-	u := &goUnroller{
-		cfg: cfg, lens: lens, functions: map[string]goFuncRef{},
-		inlineDepth: parseInlineDepth(lens.Params["inline_depth"]),
-		inlineSkips: parseIDSet(lens.Params["inline_skips"]),
-		callSeen:    map[string]bool{},
-	}
+	ad := &goLexAdapter{lens: lens, functions: map[string]goFuncRef{}}
 	for _, f := range files {
 		rel := strings.TrimPrefix(strings.TrimPrefix(f.Rel, filepath.ToSlash(lens.SourceRoot)+"/"), "./")
 		for _, fn := range f.Funcs {
-			u.functions[fn.Name] = goFuncRef{file: rel, fn: fn}
+			ad.functions[fn.Name] = goFuncRef{file: rel, fn: fn}
 		}
 	}
-	return u, nil
-}
-
-func (u *goUnroller) unroll(file, name string, depth int, callerGuards []string) ([]unrollLine, error) {
-	if depth > 10 {
-		return nil, fmt.Errorf("unrolled-program go: recursion limit while inlining %s", name)
-	}
-	ref, ok := u.functions[name]
-	if !ok {
-		return nil, fmt.Errorf("unrolled-program go: function %q not found", name)
-	}
-	if file != "" && ref.file != file {
-		if byFile, ok := u.findGoFunc(file, name); ok {
-			ref = byFile
-		}
-	}
-	path := filepath.Join(u.cfg.Root, u.lens.SourceRoot, filepath.FromSlash(ref.file))
-	lines, err := readLines(path)
-	if err != nil {
-		return nil, err
-	}
-	var out []unrollLine
-	// Per-line assumptions: track enclosing if/for conditions by indentation so each
-	// line carries the guard set that must hold to reach it (cross-service drill-in).
-	type gframe struct {
-		indent int
-		cond   string
-	}
-	var stack []gframe
-	curGuards := func() []string {
-		g := append([]string{}, callerGuards...)
-		for _, f := range stack {
-			g = append(g, f.cond)
-		}
-		return g
-	}
-	for i := ref.fn.Line; i <= ref.fn.End-2 && i < len(lines); i++ {
-		raw := lines[i]
-		trim := strings.TrimSpace(stripLineComment(raw))
-		if trim == "" || trim == "{" || trim == "}" {
-			continue
-		}
-		indent := len(raw) - len(strings.TrimLeft(raw, " \t"))
-		for len(stack) > 0 && stack[len(stack)-1].indent >= indent {
-			stack = stack[:len(stack)-1]
-		}
-		guards := curGuards()
-		if called := simpleGoCall(trim); called != "" && called != name {
-			if _, ok := u.functions[called]; ok {
-				expanded := depth < u.inlineDepth && !u.inlineSkips[fmt.Sprintf("%s:%d", ref.file, i+1)]
-				u.recordCall(ref.file, i+1, called, expanded, depth)
-				if !expanded {
-					out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: ref.file, line: i + 1, guards: guards})
-					continue
-				}
-				part, err := u.unroll("", called, depth+1, guards)
-				if err != nil {
-					return nil, err
-				}
-				out = append(out, part...)
-				continue
-			}
-		}
-		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: ref.file, line: i + 1, guards: guards})
-		if cond, ok := goGuardCond(trim); ok {
-			stack = append(stack, gframe{indent: indent, cond: cond})
-		}
-	}
-	return out, nil
+	return runLexicalUnroll(cfg, lens, ad)
 }
 
 // goGuardCond extracts the condition a Go `if`/`for`/`else if` header introduces so
@@ -381,25 +284,6 @@ func goCondAfterInit(s string) string {
 		return strings.TrimSpace(s[i+1:])
 	}
 	return strings.TrimSpace(s)
-}
-
-func (u *goUnroller) recordCall(file string, line int, name string, expanded bool, depth int) {
-	id := fmt.Sprintf("%s:%d", file, line)
-	if u.callSeen[id] {
-		return
-	}
-	u.callSeen[id] = true
-	origin := filepath.ToSlash(filepath.Join(u.lens.SourceRoot, file)) + fmt.Sprintf(":%d", line)
-	u.calls = append(u.calls, inlineCallChoice{ID: id, Name: name, Origin: origin, Expanded: expanded, Depth: depth})
-}
-
-func (u *goUnroller) findGoFunc(file, name string) (goFuncRef, bool) {
-	for _, ref := range u.functions {
-		if ref.file == file && ref.fn.Name == name {
-			return ref, true
-		}
-	}
-	return goFuncRef{}, false
 }
 
 func simpleGoCall(trim string) string {

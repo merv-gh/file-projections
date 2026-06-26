@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -167,12 +166,7 @@ func scanJSFiles(cfg Config, lens LensConfig) ([]JSFile, error) {
 }
 
 func isJSFile(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx":
-		return true
-	default:
-		return false
-	}
+	return languageForPath(path) == "js"
 }
 
 func parseJSFile(root, path string) (JSFile, error) {
@@ -256,105 +250,82 @@ type tsFunc struct {
 	bodyB int // 1-based line of the closing "}"
 }
 
-type tsUnroller struct {
-	cfg         Config
-	lens        LensConfig
-	funcs       map[string]tsFunc // name -> function (last one wins; file-qualified lookup refines)
-	inlineDepth int
-	inlineSkips map[string]bool
-	calls       []inlineCallChoice
-	callSeen    map[string]bool
+// tsLexAdapter adapts TS/JS to the shared lexical unroller (unroll_lexical.go);
+// the walk/guard/inline machinery lives there, this only answers TS-specific
+// questions. Same shared core as the Go adapter — the two languages no longer
+// duplicate the unroll loop.
+type tsLexAdapter struct {
+	lens  LensConfig
+	funcs map[string]tsFunc
+}
+
+func (a *tsLexAdapter) lookup(name, file string) (lexFunc, bool) {
+	fn, ok := a.funcs[name]
+	if !ok {
+		return lexFunc{}, false
+	}
+	if file != "" && fn.rel != file {
+		for _, f := range a.funcs {
+			if f.rel == file && f.name == name {
+				fn = f
+				break
+			}
+		}
+	}
+	// bodyA/bodyB are 1-based; the shared core wants 0-based inclusive [start,end].
+	return lexFunc{Rel: fn.rel, BodyStart: fn.bodyA - 1, BodyEnd: fn.bodyB - 2}, true
+}
+func (a *tsLexAdapter) guardCond(trim string) (string, bool) { return tsGuardCond(trim) }
+func (a *tsLexAdapter) callName(trim string) string          { return simpleTSCall(trim) }
+func (a *tsLexAdapter) known(name string) bool               { _, ok := a.funcs[name]; return ok }
+func (a *tsLexAdapter) tool() string                         { return "unrolled-program:ts" }
+func (a *tsLexAdapter) scope() string {
+	return "ts adapter: editable straight-line function path; each line syncs back to its original source line"
 }
 
 func AnalyzeTSUnrolledProgram(cfg Config, lens LensConfig) (Projection, error) {
-	file := lens.Params["file"]
-	method := lens.Params["method"]
-	if file == "" {
-		return Projection{}, errors.New("unrolled-program ts: params.file is required")
-	}
-	if method == "" {
-		return Projection{}, errors.New("unrolled-program ts: params.method is required")
-	}
-	u, err := newTSUnroller(cfg, lens)
-	if err != nil {
-		return Projection{}, err
-	}
-	lines, err := u.unroll(file, method, 0, nil)
-	if err != nil {
-		return Projection{}, err
-	}
-	var body []string
-	var origins []LineOrigin
-	var lineGuards [][]string
-	for _, line := range lines {
-		body = append(body, line.code)
-		src := filepath.ToSlash(filepath.Join(lens.SourceRoot, line.file))
-		origins = append(origins, LineOrigin{SrcFile: src, Line: line.line, SrcHash: hash(line.code + "\n")})
-		lineGuards = append(lineGuards, line.guards)
-	}
-	if len(body) == 0 {
-		body = append(body, "// no executable path found")
-		lineGuards = append(lineGuards, nil)
-	}
-	p := Projection{Sync: "two-way"}
-	p.Blocks = append(p.Blocks, ProjectionBlock{
-		ID: method, File: file, Mode: "unrolled", Tool: "unrolled-program:ts",
-		Lines: body, LineOrigins: origins, LineGuards: lineGuards, Sync: "two-way",
-	})
-	p.Facts = append(p.Facts, ProjectionFact{ID: "scope", Tool: "unrolled-program", Text: "ts adapter: editable straight-line function path; each line syncs back to its original source line"})
-	for n, gd := range lineGuards {
-		if len(gd) > 0 {
-			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("lguard-%d", n+1), Tool: "unrolled-program", Text: strings.Join(gd, " && ")})
-		}
-	}
-	for i, c := range u.calls {
-		if b, err := json.Marshal(c); err == nil {
-			p.Facts = append(p.Facts, ProjectionFact{ID: fmt.Sprintf("call-%d", i+1), Tool: "unrolled-program", Text: string(b)})
-		}
-	}
-	return p, nil
-}
-
-func newTSUnroller(cfg Config, lens LensConfig) (*tsUnroller, error) {
 	files, err := scanJSFiles(cfg, lens)
 	if err != nil {
-		return nil, err
+		return Projection{}, err
 	}
-	u := &tsUnroller{
-		cfg: cfg, lens: lens, funcs: map[string]tsFunc{},
-		inlineDepth: parseInlineDepth(lens.Params["inline_depth"]),
-		inlineSkips: parseIDSet(lens.Params["inline_skips"]),
-		callSeen:    map[string]bool{},
-	}
+	ad := &tsLexAdapter{lens: lens, funcs: map[string]tsFunc{}}
 	prefix := filepath.ToSlash(lens.SourceRoot) + "/"
 	for _, f := range files {
 		rel := strings.TrimPrefix(strings.TrimPrefix(f.Rel, prefix), "./")
 		for _, fn := range parseTSFuncs(rel, f.Lines) {
-			u.funcs[fn.name] = fn
+			ad.funcs[fn.name] = fn
 		}
 	}
-	return u, nil
+	return runLexicalUnroll(cfg, lens, ad)
 }
 
 var (
 	tsNamedFuncRE = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]`)
 	tsArrowRE     = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:<[^>]*>\s*)?\([^)]*\)[^=]*=>`)
 	tsMethodRE    = regexp.MustCompile(`^\s*(?:public\s+|private\s+|protected\s+|static\s+|async\s+|get\s+|set\s+)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^={]+)?\{`)
+	// tsArrowOpenRE matches the opener of a multi-line arrow function whose params
+	// (and the `=>`) spill onto following lines: `const exchange = async (`.
+	tsArrowOpenRE = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:<[^>]*>\s*)?\(\s*$`)
 )
 
 // parseTSFuncs finds top-levelish functions in a TS/JS file: named declarations,
-// arrow functions bound to const/let/var, and (best-effort) class methods. For each
-// it records the body span using brace matching from the line that opens the body.
+// arrow functions bound to const/let/var (single- or multi-line signatures), and
+// (best-effort) class methods. For each it records the body span using brace
+// matching from the line that opens the body.
 func parseTSFuncs(rel string, lines []string) []tsFunc {
 	var out []tsFunc
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		var name string
+		multilineArrow := false
 		switch {
 		case tsNamedFuncRE.MatchString(line):
 			name = tsNamedFuncRE.FindStringSubmatch(line)[1]
 		case tsArrowRE.MatchString(line):
 			name = tsArrowRE.FindStringSubmatch(line)[1]
+		case tsArrowOpenRE.MatchString(line):
+			name = tsArrowOpenRE.FindStringSubmatch(line)[1]
+			multilineArrow = true
 		case tsMethodRE.MatchString(line) && !tsControlHeader(line):
 			name = tsMethodRE.FindStringSubmatch(line)[1]
 		default:
@@ -371,6 +342,20 @@ func parseTSFuncs(rel string, lines []string) []tsFunc {
 		}
 		if open < 0 {
 			continue
+		}
+		// A multi-line arrow opener is only a function if a `=>` appears before the
+		// body brace (else `const x = (` was just a parenthesized expression).
+		if multilineArrow {
+			sawArrow := false
+			for j := i; j <= open; j++ {
+				if strings.Contains(lines[j], "=>") {
+					sawArrow = true
+					break
+				}
+			}
+			if !sawArrow {
+				continue
+			}
 		}
 		close, err := findClosingBrace(lines, open)
 		if err != nil {
@@ -392,86 +377,6 @@ func tsControlHeader(line string) bool {
 		}
 	}
 	return false
-}
-
-func (u *tsUnroller) unroll(file, name string, depth int, callerGuards []string) ([]unrollLine, error) {
-	if depth > 10 {
-		return nil, fmt.Errorf("unrolled-program ts: recursion limit while inlining %s", name)
-	}
-	fn, ok := u.funcs[name]
-	if !ok {
-		return nil, fmt.Errorf("unrolled-program ts: function %q not found", name)
-	}
-	if file != "" && fn.rel != file {
-		if byFile, ok := u.findTSFunc(file, name); ok {
-			fn = byFile
-		}
-	}
-	path := filepath.Join(u.cfg.Root, u.lens.SourceRoot, filepath.FromSlash(fn.rel))
-	lines, err := readLines(path)
-	if err != nil {
-		return nil, err
-	}
-	var out []unrollLine
-	// Guard stack keyed by brace depth: each if/for/while header pushes its condition
-	// at the depth its body occupies, so a line names every condition guarding it.
-	type gframe struct {
-		depth int
-		cond  string
-	}
-	var stack []gframe
-	curGuards := func() []string {
-		g := append([]string{}, callerGuards...)
-		for _, f := range stack {
-			g = append(g, f.cond)
-		}
-		return g
-	}
-	braceDepth := 0
-	for i := fn.bodyA - 1; i <= fn.bodyB-2 && i < len(lines); i++ {
-		raw := lines[i]
-		trim := strings.TrimSpace(stripLineComment(raw))
-		if trim == "" {
-			continue
-		}
-		// Pop guards whose block we have left (a line that closes more braces than it opens).
-		opens := strings.Count(trim, "{")
-		closes := strings.Count(trim, "}")
-		if strings.HasPrefix(trim, "}") {
-			for len(stack) > 0 && stack[len(stack)-1].depth >= braceDepth {
-				stack = stack[:len(stack)-1]
-			}
-		}
-		if trim == "{" || trim == "}" || trim == "})" || trim == "});" {
-			braceDepth += opens - closes
-			continue
-		}
-		guards := curGuards()
-		if called := simpleTSCall(trim); called != "" && called != name {
-			if _, known := u.funcs[called]; known {
-				expanded := depth < u.inlineDepth && !u.inlineSkips[fmt.Sprintf("%s:%d", fn.rel, i+1)]
-				u.recordCall(fn.rel, i+1, called, expanded, depth)
-				if expanded {
-					part, err := u.unroll("", called, depth+1, guards)
-					if err != nil {
-						return nil, err
-					}
-					out = append(out, part...)
-					braceDepth += opens - closes
-					continue
-				}
-			}
-		}
-		out = append(out, unrollLine{code: strings.TrimRight(raw, " \t"), file: fn.rel, line: i + 1, guards: guards})
-		if cond, ok := tsGuardCond(trim); ok {
-			stack = append(stack, gframe{depth: braceDepth + 1, cond: cond})
-		}
-		braceDepth += opens - closes
-		if braceDepth < 0 {
-			braceDepth = 0
-		}
-	}
-	return out, nil
 }
 
 // tsGuardCond extracts the condition a TS `if`/`for`/`while`/`else if` header
@@ -496,27 +401,6 @@ func tsGuardCond(trim string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// matchParen lives in util.go (shared paren matcher).
-
-func (u *tsUnroller) recordCall(file string, line int, name string, expanded bool, depth int) {
-	id := fmt.Sprintf("%s:%d", file, line)
-	if u.callSeen[id] {
-		return
-	}
-	u.callSeen[id] = true
-	origin := filepath.ToSlash(filepath.Join(u.lens.SourceRoot, file)) + fmt.Sprintf(":%d", line)
-	u.calls = append(u.calls, inlineCallChoice{ID: id, Name: name, Origin: origin, Expanded: expanded, Depth: depth})
-}
-
-func (u *tsUnroller) findTSFunc(file, name string) (tsFunc, bool) {
-	for _, fn := range u.funcs {
-		if fn.rel == file && fn.name == name {
-			return fn, true
-		}
-	}
-	return tsFunc{}, false
 }
 
 // simpleTSCall returns the name of a locally-defined function called on a line of

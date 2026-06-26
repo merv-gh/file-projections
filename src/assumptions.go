@@ -95,6 +95,7 @@ type unrollLineView struct {
 	Origin string   `json:"origin"`           // file:line, the real source the line came from
 	Branch bool     `json:"branch"`           // an unresolved `if (...)` / `switch` header
 	Guards []string `json:"guards,omitempty"` // conditions that must hold to reach this line
+	Effect string   `json:"effect,omitempty"` // side-effect kind this line performs (io/network/db/process)
 }
 
 // unrollChoices pulls the per-conditional toggle metadata the analyzer recorded.
@@ -128,6 +129,19 @@ func unrollCalls(p Projection) []inlineCallChoice {
 var uiBranchRE = regexp.MustCompile(`^\s*(if|else if|switch|while|for|case)\b`)
 
 func unrollViewLines(p Projection) []unrollLineView {
+	// Map se-line-<n> facts (kind label origin) -> kind, keyed by 1-based line.
+	effOf := map[int]string{}
+	for _, f := range p.Facts {
+		if f.Tool == "unrolled-program" && strings.HasPrefix(f.ID, "se-line-") {
+			if n := atoi(strings.TrimPrefix(f.ID, "se-line-")); n > 0 {
+				kind := f.Text
+				if i := strings.Index(kind, " "); i >= 0 {
+					kind = kind[:i]
+				}
+				effOf[n] = kind
+			}
+		}
+	}
 	var out []unrollLineView
 	for _, b := range p.Blocks {
 		for i, code := range b.Lines {
@@ -141,6 +155,7 @@ func unrollViewLines(p Projection) []unrollLineView {
 			if i < len(b.LineGuards) {
 				lv.Guards = b.LineGuards[i]
 			}
+			lv.Effect = effOf[lv.N]
 			out = append(out, lv)
 		}
 	}

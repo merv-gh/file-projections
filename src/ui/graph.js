@@ -16,14 +16,30 @@ function loadGraph(lens){
 }
 el("graphlens").onchange=function(){GRAPH=null;loadGraph(el("graphlens").value)};
 el("gcross").onchange=function(){if(GRAPH)renderGraph(GRAPH)};
+el("geffonly").onchange=function(){if(GRAPH)renderGraph(GRAPH)};
+// legend chips toggle individual effect kinds on/off
+Array.prototype.forEach.call(document.querySelectorAll("#efflegend .effk"),function(chip){
+ chip.onclick=function(){
+  var k=chip.dataset.k;EFF_OFF[k]=!EFF_OFF[k];chip.classList.toggle("off",!!EFF_OFF[k]);
+  if(GRAPH)renderGraph(GRAPH);
+ };
+});
+var EFF_OFF={}; // effect kinds toggled off via the legend
 function graphNodesEdges(g){
  var crossOnly=el("gcross").checked;
+ var effOnly=el("geffonly")&&el("geffonly").checked;
  var edges=g.edges,nodes=g.nodes;
  if(crossOnly){
   edges=edges.filter(function(e){return e.cross});
   var keep={};edges.forEach(function(e){keep[e.from]=1;keep[e.to]=1});
   nodes=nodes.filter(function(n){return keep[n.id]});
  }
+ // effect filters: hide nodes whose effects are all toggled off; "side-effects only"
+ // restricts to nodes that perform at least one (still-enabled) effect.
+ function visibleEffects(n){return (n.effects||[]).filter(function(k){return !EFF_OFF[k]})}
+ if(effOnly){nodes=nodes.filter(function(n){return visibleEffects(n).length>0})}
+ var ids={};nodes.forEach(function(n){ids[n.id]=1});
+ edges=edges.filter(function(e){return ids[e.from]&&ids[e.to]});
  return {nodes:nodes,edges:edges};
 }
 function renderGraph(g){
@@ -61,13 +77,19 @@ function renderGraph(g){
   if(e.label&&e.kind==="api-call"){svg.push('<text class=gedgelabel x="'+(mx)+'" y="'+((a.y+b.y)/2-2)+'" text-anchor=middle>'+esc(e.label)+'</text>')}
  });
  // nodes
+ var EFFCOLOR={"db":"#b07a2b","network":"#3f6f9f","io-write":"#b54848","io-read":"#7a8a3a","process":"#7a4fa0"};
  nodes.forEach(function(n){
   var p=pos[n.id];if(!p)return;
-  var label=n.label.length>30?"…"+n.label.slice(-29):n.label;
-  var sub=n.op?(" · "+n.op):"";
-  svg.push('<g class="gnode k'+n.kind+'" data-id="'+esc(n.id)+'" transform="translate('+p.x+','+p.y+')">'+
+  var effs=(n.effects||[]).filter(function(k){return !EFF_OFF[k]});
+  var maxLabel=effs.length?24:30;
+  var label=n.label.length>maxLabel?"…"+n.label.slice(-(maxLabel-1)):n.label;
+  var dots="";
+  effs.forEach(function(k,i){
+   dots+='<circle class=geff cx="'+(NODEW-9-i*11)+'" cy="'+(NODEH/2)+'" r="4" fill="'+(EFFCOLOR[k]||"#888")+'"><title>'+esc(k)+'</title></circle>';
+  });
+  svg.push('<g class="gnode k'+n.kind+(effs.length?" haseff":"")+'" data-id="'+esc(n.id)+'" data-eff="'+esc(effs.join(","))+'" transform="translate('+p.x+','+p.y+')">'+
    '<rect width="'+NODEW+'" height="'+NODEH+'" rx="5"></rect>'+
-   '<text x="7" y="14">'+esc(label)+'</text></g>');
+   '<text x="7" y="14">'+esc(label)+'</text>'+dots+'</g>');
  });
  svg.push('</svg>');
  el("graphwrap").innerHTML=svg.join("");

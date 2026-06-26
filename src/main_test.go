@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1322,5 +1323,218 @@ const fallback = (env: Env): Config => {
 	cmd := read(t, filepath.Join(src, "cmd.ts"))
 	if !strings.Contains(cmd, `env["HOSTNAME"]`) {
 		t.Fatalf("fallback() origin line was not updated:\n%s", cmd)
+	}
+}
+
+func TestLanguageRegistryMapsExtensionsAndDefaults(t *testing.T) {
+	cases := map[string]string{
+		"Foo.java": "java", "main.go": "go", "app.ts": "js",
+		"app.tsx": "js", "x.mjs": "js", "y.cjs": "js", "z.jsx": "js",
+		"notes.md": "", "data.csv": "",
+	}
+	for path, want := range cases {
+		if got := languageForPath(path); got != want {
+			t.Errorf("languageForPath(%q) = %q, want %q", path, got, want)
+		}
+	}
+	// Every registered language must supply wizard defaults + a joern frontend lookup
+	// (empty frontend is allowed, meaning joern-parse autodetect).
+	for _, l := range languageRegistry {
+		if l.EntrypointPatterns == "" || l.ExitSinks == "" {
+			t.Errorf("language %q is missing wizard defaults", l.ID)
+		}
+		if entrypointPatternsFor(l.ID) != l.EntrypointPatterns {
+			t.Errorf("entrypointPatternsFor(%q) drifted from registry", l.ID)
+		}
+		if joernFrontend(l.ID) != l.JoernFrontend {
+			t.Errorf("joernFrontend(%q) drifted from registry", l.ID)
+		}
+	}
+}
+
+func TestSymbolIndexIsLanguageNeutralAndIncremental(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "src/A.java"), "public class A { void hello() {} }")
+	write(t, filepath.Join(dir, "src/b.go"), "package b\nfunc Greet() {}\n")
+	write(t, filepath.Join(dir, "src/c.ts"), "export function compute() { return 1 }\n")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+
+	idx1, err := symbolIndexFor(cfg, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, s := range idx1.Symbols {
+		names[s.Name] = s.Kind
+	}
+	for _, want := range []string{"hello", "Greet", "compute"} {
+		if _, ok := names[want]; !ok {
+			t.Fatalf("symbol index missing %q across languages: %#v", want, names)
+		}
+	}
+
+	// Second call with no changes must reuse the cached per-file scan (same pointers).
+	idx2, err := symbolIndexFor(cfg, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if &idx1.byFile == &idx2.byFile {
+		t.Fatal("expected a fresh index struct each call")
+	}
+	// Changing one file must refresh only that file's symbols.
+	write(t, filepath.Join(dir, "src/c.ts"), "export function recompute() { return 2 }\n")
+	idx3, err := symbolIndexFor(cfg, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, s := range idx3.Symbols {
+		got[s.Name] = true
+	}
+	if got["compute"] || !got["recompute"] {
+		t.Fatalf("incremental refresh failed: %#v", got)
+	}
+	if !got["Greet"] || !got["hello"] {
+		t.Fatalf("unchanged files were dropped: %#v", got)
+	}
+}
+
+func TestAnalyzerSpecsCoverRegistryAndAreConsistent(t *testing.T) {
+	reg := DefaultRegistry()
+	specs := analyzerSpecs()
+	applic := analyzerApplicability()
+	for name := range reg {
+		spec, ok := specs[name]
+		if !ok {
+			t.Errorf("analyzer %q has no spec (UI would not know its params/langs)", name)
+			continue
+		}
+		if len(spec.Langs) == 0 {
+			t.Errorf("analyzer %q spec has no applicable languages", name)
+		}
+		if _, ok := applic[name]; !ok {
+			t.Errorf("analyzer %q missing from applicability map", name)
+		}
+		for _, l := range spec.Langs {
+			if l != "any" && languageByID(l) == nil {
+				t.Errorf("analyzer %q references unknown language %q", name, l)
+			}
+		}
+	}
+	// ast-grep's required lang param must be present (the drift that motivated this).
+	var hasLang bool
+	for _, p := range specs["ast-grep"].Params {
+		if p.Key == "lang" {
+			hasLang = true
+		}
+	}
+	if !hasLang {
+		t.Error("ast-grep spec is missing the required lang param")
+	}
+}
+
+func TestSideEffectsDetectsLanguageDefaults(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "src/app.ts"), `export async function handler() {
+  const r = await fetch("https://api.example.com/x")
+  await fs.writeFile("/tmp/out", "data")
+  const env = process.env.SECRET
+  return r
+}
+`)
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs(),
+		Lenses: []LensConfig{{Name: "se", Out: ".projections/se.projection", Analyzer: "side-effects", SourceRoot: "src"}}}
+	res, err := Run(cfg, DefaultRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := res[0]
+	kinds := map[string]bool{}
+	for _, b := range p.Blocks {
+		kinds[b.ID] = true
+	}
+	for _, want := range []string{SENetwork, SEFileWrite, SEProcess} {
+		if !kinds[want] {
+			t.Errorf("side-effects missed kind %q; got %v", want, kinds)
+		}
+	}
+}
+
+func TestEveryLanguageHasSideEffectMarkers(t *testing.T) {
+	for _, l := range languageRegistry {
+		if len(l.SideEffects) == 0 {
+			t.Errorf("language %q has no default side-effect markers", l.ID)
+		}
+		// Markers must compile and carry a known kind.
+		for _, m := range l.SideEffects {
+			if _, err := regexpCompile(m.Regex); err != nil {
+				t.Errorf("language %q marker %q does not compile: %v", l.ID, m.Label, err)
+			}
+			switch m.Kind {
+			case SEFileRead, SEFileWrite, SENetwork, SEDatabase, SEProcess:
+			default:
+				t.Errorf("language %q marker %q has unknown kind %q", l.ID, m.Label, m.Kind)
+			}
+		}
+	}
+}
+
+func TestServiceGraphTagsNodeSideEffects(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "web/api.ts"), "export const call = async () => { return fetch(\"http://x\") }\n")
+	write(t, filepath.Join(dir, "web/pure.ts"), "export const add = (a:number,b:number) => a+b\n")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+	lens := LensConfig{Name: "g", Analyzer: "service-graph", SourceRoot: ".",
+		Params: map[string]string{"services": `[{"name":"web","root":"web","lang":"ts"}]`}}
+	p, err := ExecuteLens(cfg, DefaultRegistry(), lens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graphJSON string
+	for _, f := range p.Facts {
+		if f.ID == "graph" {
+			graphJSON = f.Text
+		}
+	}
+	if !strings.Contains(graphJSON, "\"effects\":[\"network\"]") {
+		t.Fatalf("expected api.ts node tagged with network effect; graph=%s", graphJSON)
+	}
+}
+
+func TestReportBakesSelfContainedHTML(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "web/api.ts"), "export const call = async () => { return fetch(\"http://x\") }\n")
+	write(t, filepath.Join(dir, "findings.md"), "# Title\n\n## F1 — issue\n\nA `code` and **bold** and [a link](https://x).\n\n- one\n- two\n")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+	lens := LensConfig{Name: "g", Analyzer: "service-graph", SourceRoot: ".",
+		Params: map[string]string{"services": `[{"name":"web","root":"web","lang":"ts"}]`}}
+	p, err := ExecuteLens(cfg, DefaultRegistry(), lens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var g sgGraph
+	for _, f := range p.Facts {
+		if f.ID == "graph" {
+			if err := json.Unmarshal([]byte(f.Text), &g); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	md, _ := os.ReadFile(filepath.Join(dir, "findings.md"))
+	html := buildReportHTML("t", lens, g, miniMarkdown(string(md)))
+	for _, want := range []string{
+		"<svg", "fill=\"#3f6f9f\"", // network effect dot color
+		"<code>code</code>", "<strong>bold</strong>", `href="https://x"`,
+		"<li>one</li>", `id="f1"`, // shareable anchor from "F1 — issue"
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("report HTML missing %q", want)
+		}
+	}
+	// Self-contained: no external asset references.
+	for _, bad := range []string{"<link ", "<script src", "url(http"} {
+		if strings.Contains(html, bad) {
+			t.Errorf("report HTML is not self-contained: contains %q", bad)
+		}
 	}
 }

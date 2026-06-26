@@ -5,38 +5,11 @@ function flash(t,bad){msg.textContent=t;msg.className=bad?"err":"ok";setTimeout(
 function esc(s){return String(s||"").replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]})}
 function debounce(fn,ms){var t;return function(){clearTimeout(t);var a=arguments,self=this;t=setTimeout(function(){fn.apply(self,a)},ms)}}
 
-var STATE={lang:"",sourceRoot:".",analyzers:[],applic:{},defaults:{}};
-var SCHEMA={
- "control-flow":[{k:"file",t:"file"},{k:"line",t:"line"}],
- "data-flow":[{k:"file",t:"file"},{k:"line",t:"line"},{k:"var",t:"var"}],
- "object-flow":[{k:"type",t:"type"},{k:"mode",t:"select",opts:["joern","cpg"]}],
- "cpg-methods":[{k:"file",t:"file"},{k:"method",t:"method"}],
- "joern-var-flow":[{k:"file",t:"file"},{k:"var",t:"var"},{k:"mode",t:"select",opts:["joern","cpg"]}],
- "entrypoints":[{k:"patterns",t:"text",ex:"http-mapping=@(Get|Post)Mapping"}],
- "exitpoints":[{k:"sinks",t:"text",ex:"*repository*.save,*kafka*.send"}],
- "flow":[{k:"entry",t:"text",ex:"@PostMapping"},{k:"sink",t:"text",ex:"\\.save\\("}],
- "java-post-to-save":[{k:"entry",t:"text",ex:"@PostMapping"},{k:"sink",t:"text",ex:"\\.save\\("}],
- "bookmark":[{k:"file",t:"file"},{k:"lines",t:"text",ex:"7-12"}],
- "go-symbols":[],"jsonl":[],"js-events":[],"extract":[{k:"file",t:"file"},{k:"lines",t:"text",ex:"7-12"}],
- "ast-grep":[{k:"pattern",t:"text",ex:"$A.save($B)"},{k:"lang",t:"select",opts:["ts","tsx","js","java","go","python"]}],
- "postgres-watch":[
-  {k:"connections",t:"text",ex:"{\"dev\":\"postgres://user:pass@localhost:5432/app?sslmode=disable\"}"},
-  {k:"tables",t:"text",ex:"orders,audit_events"},
-  {k:"window_minutes",t:"text",ex:"10"},
-  {k:"bootstrap",t:"select",opts:["latest","all"]},
-  {k:"poll_seconds",t:"text",ex:"30"}]
-};
-var HINTS={
- "control-flow":"Control-flow graph of a method at file:line.","data-flow":"How a variable flows through a method.",
- "object-flow":"How instances of a type move through the program.","cpg-methods":"Methods reachable in the CPG from file:method.",
- "joern-var-flow":"Joern-backed variable flow.","entrypoints":"Detected app entrypoints (routes, listeners).",
- "exitpoints":"Sinks/exits (saves, sends).","flow":"Paths from an entry pattern to a sink pattern.",
- "java-post-to-save":"Paths from an entry pattern to a sink pattern.","bookmark":"Pin a line range of a file.",
- "extract":"Pin a line range of a file.","go-symbols":"All Go symbols under the source root — no params.",
- "jsonl":"Project the .jsonl data files.","js-events":"JS event surface.","ast-grep":"Structural search by pattern.",
- "postgres-watch":"Poll Postgres tables by id high-water marks into a rolling CSV window.",
- "unrolled-program":"Flatten a method's branched, cross-file execution into one editable straight-line program. Edits sync back to real source."
-};
+var STATE={lang:"",sourceRoot:".",analyzers:[],applic:{},defaults:{},specs:{}};
+// SCHEMA/HINTS are derived from the server's analyzer specs (/api/config -> specs),
+// the single source of truth — no hand-maintained mirror that can drift from Go.
+function schemaFor(a){var s=STATE.specs[a];return (s&&s.params)||[]}
+function hintFor(a){var s=STATE.specs[a];return (s&&s.hint)||""}
 
 // ---- autosuggest combobox ----------------------------------------------------
 function symFetch(kindFilter,q,cb){
@@ -71,12 +44,12 @@ function fieldFetcher(t,getFile){
 function paramVal(k){var i=el("p_"+k);return i?i.value:""}
 function getParamFile(){return paramVal("file")}
 function renderParams(){
- var a=el("an").value,box=el("params");box.innerHTML="";el("anhint").textContent=HINTS[a]||"";
+ var a=el("an").value,box=el("params");box.innerHTML="";el("anhint").textContent=hintFor(a);
  if(a==="unrolled-program"){el("unrollctl").style.display="";return}
  el("unrollctl").style.display="none";
- var schema=SCHEMA[a]||[],d=STATE.defaults;
+ var schema=schemaFor(a),d=STATE.defaults;
  schema.forEach(function(f){
-  var lab=document.createElement("label");lab.textContent=f.k;box.appendChild(lab);
+  var lab=document.createElement("label");lab.textContent=f.k+(f.required?" *":"");box.appendChild(lab);
   if(f.t==="select"){
    var s=document.createElement("select");s.id="p_"+f.k;(f.opts||[]).forEach(function(o){var op=document.createElement("option");op.value=op.textContent=o;s.appendChild(op)});box.appendChild(s);
    s.onchange=autoPreviewD;return;
@@ -100,7 +73,7 @@ function renderParams(){
   box.appendChild(wrap);
  });
 }
-function collectParams(){var a=el("an").value,o={};(SCHEMA[a]||[]).forEach(function(f){var v=paramVal(f.k);if(v!=="")o[f.k]=v});return o}
+function collectParams(){var a=el("an").value,o={};schemaFor(a).forEach(function(f){var v=paramVal(f.k);if(v!=="")o[f.k]=v});return o}
 
 // ---- preview -----------------------------------------------------------------
 function showLensView(){el("lensview").style.display="";el("unrollview").style.display="none"}

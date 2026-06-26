@@ -56,6 +56,7 @@ func DefaultRegistry() Registry {
 		"joern-var-flow":    AnalyzerFunc{"joern-var-flow", AnalyzeJoernVarFlow},
 		"entrypoints":       AnalyzerFunc{"entrypoints", AnalyzeEntrypoints},
 		"exitpoints":        AnalyzerFunc{"exitpoints", AnalyzeExitpoints},
+		"side-effects":      AnalyzerFunc{"side-effects", AnalyzeSideEffects},
 		"ast-grep":          AnalyzerFunc{"ast-grep", AnalyzeAstGrep},
 		"control-flow":      AnalyzerFunc{"control-flow", AnalyzeControlFlow},
 		"entry-to-exit":     AnalyzerFunc{"entry-to-exit", AnalyzeEntryToExit},

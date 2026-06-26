@@ -48,20 +48,51 @@ var LSKEY="fp:last:"+location.host+":"+location.pathname;
 function saveLast(){
  try{localStorage.setItem(LSKEY,JSON.stringify({sourceRoot:STATE.sourceRoot,analyzer:el("an").value,
   file:uFile,method:uMethod,inputs:el("uinputs").value,inline:el("uinline").value}))}catch(e){}
+ try{updateDeepLink()}catch(e){}
 }
 function loadLast(){try{return JSON.parse(localStorage.getItem(LSKEY)||"null")}catch(e){return null}}
+
+// ---- deep links: drive the view from the URL, and keep the URL shareable ------
+// Format: ?do=discover|apply|edit&an=<analyzer>&sr=<source_root>&file=<f>&method=<m>&inputs=<i>&inline=<n>
+// `do` is advisory (the unroll tab is the same regardless of discover/apply/edit);
+// it exists so a particular frame of a walkthrough is linkable.
+function parseDeepLink(){
+ var q=new URLSearchParams(location.search);
+ if(!q.has("do")&&!q.has("file")&&!q.has("sr")&&!q.has("an"))return null;
+ return {
+  do:q.get("do")||"",an:q.get("an")||"",sourceRoot:q.get("sr")||"",
+  file:q.get("file")||"",method:q.get("method")||"",inputs:q.get("inputs")||"",inline:q.get("inline")||""
+ };
+}
+// updateDeepLink rewrites the address bar (no reload) so the current unroll view is
+// copy-pasteable. Only meaningful for the unrolled-program tab; other lenses just
+// record analyzer + source root.
+function updateDeepLink(){
+ var a=el("an").value,q=new URLSearchParams();
+ q.set("an",a);if(STATE.sourceRoot&&STATE.sourceRoot!==".")q.set("sr",STATE.sourceRoot);
+ if(a==="unrolled-program"){
+  q.set("do","edit");
+  if(uFile)q.set("file",uFile);if(uMethod)q.set("method",uMethod);
+  var inp=el("uinputs").value;if(inp)q.set("inputs",inp);
+  var inl=el("uinline").value;if(inl&&inl!=="0")q.set("inline",inl);
+ }
+ history.replaceState(null,"","?"+q.toString());
+}
 
 // ---- boot --------------------------------------------------------------------
 fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
- STATE.analyzers=d.analyzers||[];STATE.applic=d.applicability||{};STATE.defaults=d.defaults||{};
+ STATE.analyzers=d.analyzers||[];STATE.applic=d.applicability||{};STATE.defaults=d.defaults||{};STATE.specs=d.specs||{};
  STATE.lang=STATE.defaults.language||"";
  loadSavedLenses();
- var last=loadLast();
- if(last&&last.sourceRoot){
-  setSourceRoot(last.sourceRoot);
+ var deep=parseDeepLink();
+ var last=deep||loadLast();
+ if(last&&(last.sourceRoot||last.file||last.an)){
+  setSourceRoot(last.sourceRoot||STATE.defaults.source_root||".");
   reDetect(function(){
-   var s=el("an");if(last.analyzer&&Array.from(s.options).some(function(o){return o.value===last.analyzer}))s.value=last.analyzer;
+   var s=el("an"),want=last.analyzer||last.an;
+   if(want&&!Array.from(s.options).some(function(o){return o.value===want})){var o=document.createElement("option");o.value=o.textContent=want;s.appendChild(o)}
+   if(want)s.value=want;
    renderParams();
    if(last.file){uFile=last.file;uMethod=last.method||"";setEntryDisplay()}
    if(last.inputs)el("uinputs").value=last.inputs;

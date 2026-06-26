@@ -356,14 +356,10 @@ func joernSourceRoots(cfg Config) []string {
 // "" to use the generic joern-parse. Invoking the frontend directly (vs joern-parse) avoids
 // spawning a second JVM — what Joern recommends for large/memory-heavy codebases.
 func joernFrontend(lang string) string {
-	switch lang {
-	case "java":
-		return "javasrc2cpg"
-	case "go":
-		return "gosrc2cpg"
-	default:
-		return "" // js/ts/mixed → joern-parse autodetect
+	if l := languageByID(lang); l != nil {
+		return l.JoernFrontend
 	}
+	return "" // unknown → joern-parse autodetect
 }
 
 // execJoernParse builds a cpg.bin. For Java/Go it invokes the language frontend directly

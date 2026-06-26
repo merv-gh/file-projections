@@ -34,16 +34,24 @@
  <div class=col>
   <div class=tabs><button class=on id=tresult>Result</button><button id=tgraph>Service graph</button><button id=tcfg>config.json</button></div>
 
-  <div id=graphpane style=display:none>
-   <div class=graphctl>
-    <select id=graphlens></select>
-    <label class=gchk><input type=checkbox id=gcross> cross-service only</label>
-    <button class=ghost id=gmermaid>Copy mermaid</button>
-    <span class=note id=gstatus></span>
+   <div id=graphpane style=display:none>
+    <div class=graphctl>
+     <select id=graphlens></select>
+     <label class=gchk><input type=checkbox id=gcross> cross-service only</label>
+     <label class=gchk><input type=checkbox id=geffonly> side-effects only</label>
+     <button class=ghost id=gmermaid>Copy mermaid</button>
+     <span class=note id=gstatus></span>
+    </div>
+    <div class=efflegend id=efflegend>
+     <span class=effk data-k=db><i style="background:#b07a2b"></i>db</span>
+     <span class=effk data-k=network><i style="background:#3f6f9f"></i>network</span>
+     <span class=effk data-k=io-write><i style="background:#b54848"></i>io-write</span>
+     <span class=effk data-k=io-read><i style="background:#7a8a3a"></i>io-read</span>
+     <span class=effk data-k=process><i style="background:#7a4fa0"></i>process</span>
+    </div>
+    <div id=graphwrap><div id=graphhint class=note>Pick a <code>service-graph</code> lens. Click a node to drill into its assumptions &amp; object timeline. Colored dots on a node show its side effects (IO/network/db/process).</div></div>
+    <div id=mermaidbox style=display:none><div class=row style="justify-content:space-between"><h2 style=margin:0>mermaid</h2><button class=ghost id=gmclose>close</button></div><textarea id=mermaidtext rows=14 readonly></textarea></div>
    </div>
-   <div id=graphwrap><div id=graphhint class=note>Pick a <code>service-graph</code> lens. Click a node to drill into its assumptions &amp; object timeline.</div></div>
-   <div id=mermaidbox style=display:none><div class=row style="justify-content:space-between"><h2 style=margin:0>mermaid</h2><button class=ghost id=gmclose>close</button></div><textarea id=mermaidtext rows=14 readonly></textarea></div>
-  </div>
 
   <div id=resultpane>
    <div id=lensview>

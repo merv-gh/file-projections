@@ -69,6 +69,11 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
 .loopeff{position:absolute;right:.4rem;top:.24rem;font-size:10px;color:#55663f;background:#eef2e4;border:1px solid #d4ddc3;border-radius:6px;padding:.03rem .42rem}
 .pl.wlit{background:#fbf0d6 !important}
 .legend i.lw::before{background:#2b6a45}.legend i.ll::before{background:#8ab37a}
+/* side-effect badge on an unrolled line */
+.pl .code{position:relative}
+.effbadge{position:absolute;right:.5rem;top:.18rem;font-size:9.5px;font-family:ui-sans-serif,system-ui;color:#fff;border-radius:999px;padding:.02rem .42rem;letter-spacing:.02em;opacity:.92}
+.pl.haseff .code{box-shadow:inset -3px 0 0 currentColor}
+.eff-db{background:#b07a2b}.eff-network{background:#3f6f9f}.eff-io-write{background:#b54848}.eff-io-read{background:#7a8a3a}.eff-process{background:#7a4fa0}
 /* service graph */
 .graphctl{display:flex;align-items:center;gap:.6rem;margin-bottom:.6rem;flex-wrap:wrap}
 .gchk{display:inline-flex;align-items:center;gap:.3rem;color:var(--mut);font-size:.8rem;margin:0}
@@ -92,6 +97,14 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
 .gedge.cross{stroke-dasharray:none}
 .gedge.dim{opacity:.12}
 .gedgelabel{font:9px ui-monospace,Menlo,monospace;fill:#3f6f9f}
+/* side-effect badges + legend */
+.geff{stroke:#fbf8f0;stroke-width:.5}
+.gnode.haseff rect{stroke-width:1.5}
+.efflegend{display:flex;gap:.8rem;margin:.2rem 0 .6rem;font-size:.72rem;color:var(--mut);flex-wrap:wrap}
+.efflegend .effk{display:inline-flex;align-items:center;gap:.3rem;cursor:pointer;padding:.1rem .35rem;border-radius:999px;border:1px solid transparent}
+.efflegend .effk:hover{border-color:var(--line)}
+.efflegend .effk.off{opacity:.35}
+.efflegend .effk i{width:.7rem;height:.7rem;border-radius:50%;display:inline-block}
 /* clone-from-github */
 .clonebar{display:inline-flex;align-items:center;gap:.35rem}
 .clonebar input{width:18rem;font-size:.78rem;padding:.25rem .5rem}

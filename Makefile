@@ -3,7 +3,7 @@ BIN          := file-projections
 BINDIR       := bin
 CONFIG       ?= config.json
 UI_ADDR      ?= :7777
-PKG          := .
+PKG          := ./src
 VERSION_FILE := VERSION
 VERSION      := $(shell cat $(VERSION_FILE) 2>/dev/null || echo 0.0.0)
 

@@ -92,12 +92,7 @@ func shouldSkipDir(cfg Config, path string, d fs.DirEntry) bool {
 }
 
 func isScannableSource(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".java", ".go", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".kt", ".scala", ".py":
-		return true
-	default:
-		return false
-	}
+	return isScannableSourcePath(path)
 }
 
 // projectScan summarizes the source files found during the wizard's auto-detection.
@@ -142,22 +137,14 @@ func scanProject(cfg Config) projectScan {
 }
 
 func wizardLang(path string) string {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".java":
-		return "java"
-	case ".go":
-		return "go"
-	default:
-		return "js" // .js/.ts/.jsx/.tsx/.mjs/.cjs
-	}
+	return langOf(path)
 }
 
 func (s projectScan) summary() string {
 	var parts []string
-	for _, l := range []string{"java", "go", "js"} {
-		if s.lang[l] > 0 {
-			name := map[string]string{"java": ".java", "go": ".go", "js": ".js/.ts"}[l]
-			parts = append(parts, fmt.Sprintf("%d %s", s.lang[l], name))
+	for _, l := range languageRegistry {
+		if s.lang[l.ID] > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", s.lang[l.ID], l.Name))
 		}
 	}
 	return strings.Join(parts, ", ")
@@ -165,32 +152,19 @@ func (s projectScan) summary() string {
 
 func (s projectScan) dominant() string {
 	best, n := "js", -1
-	for _, l := range []string{"java", "go", "js"} {
-		if s.lang[l] > n {
-			best, n = l, s.lang[l]
+	for _, l := range languageRegistry {
+		if s.lang[l.ID] > n {
+			best, n = l.ID, s.lang[l.ID]
 		}
 	}
 	return best
 }
 
 func (s projectScan) suggestRoot(cfg Config, lang string) string {
-	switch lang {
-	case "java":
-		if len(s.srcMainJava) > 0 {
-			return s.srcMainJava[0]
-		}
-		return commonDir(s.files["java"])
-	case "go":
-		if fileExists(filepath.Join(cfg.Root, "go.mod")) {
-			return "."
-		}
-		return commonDir(s.files["go"])
-	default:
-		if fileExists(filepath.Join(cfg.Root, "package.json")) {
-			return "."
-		}
-		return commonDir(s.files["js"])
+	if l := languageByID(lang); l != nil && l.SuggestRoot != nil {
+		return l.SuggestRoot(cfg, s)
 	}
+	return commonDir(s.files[lang])
 }
 
 // commonDir returns the longest common directory of a set of rel file paths.
@@ -291,9 +265,9 @@ func rootLanguage(cfg Config, root string) string {
 		return nil
 	})
 	best, n := "", 0
-	for _, l := range []string{"java", "go", "js"} {
-		if count[l] > n {
-			best, n = l, count[l]
+	for _, l := range languageRegistry {
+		if count[l.ID] > n {
+			best, n = l.ID, count[l.ID]
 		}
 	}
 	return best

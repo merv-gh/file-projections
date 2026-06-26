@@ -404,6 +404,11 @@ func truncate(s string, n int) string {
 	return s
 }
 
+// unixDate formats a unix timestamp as YYYY-MM-DD (used by the git-blame lens).
+func unixDate(ts int64) string {
+	return time.Unix(ts, 0).UTC().Format("2006-01-02")
+}
+
 // codeLoc lays out a row as the exact code left-aligned, padded to locCol, then the
 // "<filename>:<line>" locator. Long code just gets a two-space gap.
 func codeLoc(code, file string, line int) string {
@@ -737,3 +742,15 @@ func clampInt(n, lo, hi int) int {
 
 // regexpCompile is a thin wrapper used by tests/markers to compile a pattern.
 func regexpCompile(p string) (*regexp.Regexp, error) { return regexp.Compile(p) }
+
+// regexpFindAll returns the first submatch of every match of pat in s (test helper).
+func regexpFindAll(s, pat string) []string {
+	re := regexp.MustCompile(pat)
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(s, -1) {
+		if len(m) > 1 {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}

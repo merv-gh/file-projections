@@ -70,6 +70,7 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/unroll", s.handleUnroll)
 	mux.HandleFunc("/api/unroll/edit", s.handleUnrollEdit)
 	mux.HandleFunc("/api/clone", s.handleClone)
+	mux.HandleFunc("/api/ask", s.handleAsk)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
 	return http.ListenAndServe(addr, mux)
 }
@@ -119,6 +120,7 @@ func (s *uiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"analyzers":     analyzers,
 		"applicability": analyzerApplicability(),
 		"specs":         analyzerSpecs(),
+		"questions":     questionRegistry(),
 		"path":          s.configPath,
 		"defaults":      def,
 	})
@@ -504,6 +506,59 @@ func (s *uiServer) handlePreview(w http.ResponseWriter, r *http.Request) {
 		"blocks": len(p.Blocks),
 		"facts":  len(p.Facts),
 		"extra":  extra,
+	})
+}
+
+// handleAsk compiles a Question (id + blank values) into a lens and runs it — the
+// backend of the Questions panel. Same ExecuteLens path as preview; additionally
+// returns the question's confidence badge and any confidence fact the lens emitted,
+// so the UI can tell the user how much to trust the answer.
+func (s *uiServer) handleAsk(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID         string            `json:"id"`
+		SourceRoot string            `json:"source_root"`
+		Values     map[string]string `json:"values"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	lens, conf, ok := compileQuestion(req.ID, req.SourceRoot, req.Values)
+	if !ok {
+		writeJSON(w, 400, map[string]string{"error": "unknown question " + req.ID})
+		return
+	}
+	s.mu.Lock()
+	cfg := s.cfg
+	reg := s.registry
+	s.mu.Unlock()
+	p, err := ExecuteLens(cfg, reg, lens)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error(), "analyzer": lens.Analyzer})
+		return
+	}
+	// A lens may refine the confidence (e.g. side-effects/query lenses emit a
+	// `confidence` fact); prefer it over the question's default badge.
+	confNote := ""
+	for _, f := range p.Facts {
+		if f.ID == "confidence" {
+			if c, note, found := strings.Cut(f.Text, ": "); found {
+				conf, confNote = c, note
+			}
+		}
+	}
+	extra := make([]map[string]any, 0, len(p.Extra))
+	for _, ex := range p.Extra {
+		extra = append(extra, map[string]any{"path": ex.Path, "body": projectionBody(ex.Proj)})
+	}
+	writeJSON(w, 200, map[string]any{
+		"body":       projectionBody(p),
+		"analyzer":   lens.Analyzer,
+		"confidence": conf,
+		"conf_note":  confNote,
+		"blocks":     len(p.Blocks),
+		"facts":      len(p.Facts),
+		"extra":      extra,
 	})
 }
 

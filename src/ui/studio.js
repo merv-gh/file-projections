@@ -83,6 +83,7 @@ function updateDeepLink(){
 fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
  STATE.analyzers=d.analyzers||[];STATE.applic=d.applicability||{};STATE.defaults=d.defaults||{};STATE.specs=d.specs||{};
+ QUESTIONS=d.questions||[];
  STATE.lang=STATE.defaults.language||"";
  loadSavedLenses();
  var deep=parseDeepLink();
@@ -102,7 +103,7 @@ fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  }else{
   setSourceRoot(STATE.defaults.source_root||".");
   el("langtag").textContent=STATE.lang;
-  buildAnalyzerSelect();renderParams();prefillEntry();autoPreview();
+  buildAnalyzerSelect();renderParams();prefillEntry();renderQuestions();autoPreview();
  }
 });
 updateInlineLabel();

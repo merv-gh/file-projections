@@ -68,6 +68,13 @@ func DefaultRegistry() Registry {
 		"extract":           AnalyzerFunc{"extract", AnalyzeBookmark}, // back-compat alias
 		"service-graph":     AnalyzerFunc{"service-graph", AnalyzeServiceGraph},
 		"postgres-watch":    AnalyzerFunc{"postgres-watch", AnalyzePostgresWatch},
+		// Focused single-symbol "where" lenses (lexical/structural; back the Questions panel).
+		"references":    AnalyzerFunc{"references", AnalyzeReferences},
+		"callers":       AnalyzerFunc{"callers", AnalyzeCallers},
+		"constructions": AnalyzerFunc{"constructions", AnalyzeConstructions},
+		"writes-to":     AnalyzerFunc{"writes-to", AnalyzeWritesTo},
+		"sql-tables":    AnalyzerFunc{"sql-tables", AnalyzeSQLTables},
+		"git-blame":     AnalyzerFunc{"git-blame", AnalyzeGitBlame},
 	}
 }
 

@@ -1538,3 +1538,117 @@ func TestReportBakesSelfContainedHTML(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryLensesFindWhereThingsAre(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "src/app.ts"), `import { Helper } from "./helper.ts"
+export function run() {
+  const h = new Helper()
+  let total = 0
+  total = compute(h)
+  total += 1
+  return total
+}
+function compute(h: Helper): number { return 42 }
+`)
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+	run := func(an string, params map[string]string) Projection {
+		p, err := ExecuteLens(cfg, DefaultRegistry(), LensConfig{Name: an, Analyzer: an, SourceRoot: "src", Params: params})
+		if err != nil {
+			t.Fatalf("%s: %v", an, err)
+		}
+		return p
+	}
+	body := func(p Projection) string {
+		var b strings.Builder
+		for _, bl := range p.Blocks {
+			for _, l := range bl.Lines {
+				b.WriteString(l + "\n")
+			}
+		}
+		return b.String()
+	}
+	hasConf := func(p Projection, want string) bool {
+		for _, f := range p.Facts {
+			if f.ID == "confidence" && strings.HasPrefix(f.Text, want) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if got := body(run("callers", map[string]string{"name": "compute"})); !strings.Contains(got, "compute(h)") {
+		t.Errorf("callers missed call site:\n%s", got)
+	}
+	if p := run("callers", map[string]string{"name": "compute"}); !hasConf(p, "lexical") {
+		t.Error("callers missing lexical confidence fact")
+	}
+	if got := body(run("constructions", map[string]string{"type": "Helper"})); !strings.Contains(got, "new Helper()") {
+		t.Errorf("constructions missed new Helper():\n%s", got)
+	}
+	if got := body(run("writes-to", map[string]string{"var": "total"})); !strings.Contains(got, "total = compute(h)") || !strings.Contains(got, "total += 1") {
+		t.Errorf("writes-to missed mutations:\n%s", got)
+	}
+	if got := body(run("references", map[string]string{"name": "Helper"})); !strings.Contains(got, "import") {
+		t.Errorf("references missed import:\n%s", got)
+	}
+}
+
+func TestSQLTablesLens(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "q/x.sql"), "-- name: ListExpenses\nSELECT * FROM expenses JOIN projects ON projects.id = expenses.project_id;\nINSERT INTO audit_events (id) VALUES (1);\n")
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+	p, err := ExecuteLens(cfg, DefaultRegistry(), LensConfig{Name: "sql", Analyzer: "sql-tables", SourceRoot: "q"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := map[string]bool{}
+	for _, f := range p.Facts {
+		if strings.HasPrefix(f.ID, "table-") {
+			tables[strings.TrimPrefix(f.ID, "table-")] = true
+		}
+	}
+	for _, want := range []string{"expenses", "projects", "audit_events"} {
+		if !tables[want] {
+			t.Errorf("sql-tables missed %q; got %v", want, tables)
+		}
+	}
+}
+
+func TestQuestionRegistryCompilesToValidLenses(t *testing.T) {
+	reg := DefaultRegistry()
+	for _, q := range questionRegistry() {
+		if _, ok := reg[q.Analyzer]; !ok {
+			t.Errorf("question %q binds to unknown analyzer %q", q.ID, q.Analyzer)
+		}
+		if q.Intent == "" || q.Template == "" || q.Conf == "" {
+			t.Errorf("question %q missing intent/template/conf", q.ID)
+		}
+		// Every {blank} in the template must have a matching QBlank.
+		for _, m := range regexpFindAll(q.Template, `\{([a-z_]+)\}`) {
+			found := false
+			for _, b := range q.Blanks {
+				if b.Key == m {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("question %q template references {%s} with no blank", q.ID, m)
+			}
+		}
+		// Languages must be known.
+		for _, l := range q.Langs {
+			if l != "any" && languageByID(l) == nil {
+				t.Errorf("question %q references unknown language %q", q.ID, l)
+			}
+		}
+	}
+	// compileQuestion maps blanks into params (including renamed via Map).
+	lens, conf, ok := compileQuestion("ways-to-save", "src", map[string]string{"sink": "*.save"})
+	if !ok || lens.Analyzer != "exitpoints" || lens.Params["sinks"] != "*.save" || conf == "" {
+		t.Fatalf("compileQuestion(ways-to-save) = %#v conf=%q ok=%v", lens, conf, ok)
+	}
+	if _, _, ok := compileQuestion("nope", "src", nil); ok {
+		t.Error("compileQuestion accepted unknown id")
+	}
+}

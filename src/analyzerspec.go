@@ -81,8 +81,20 @@ func analyzerSpecs() map[string]AnalyzerSpec {
 				sel("bootstrap", "latest", "all"),
 				text("poll_seconds", "30", false),
 			}},
+		// Focused single-symbol "where" lenses behind the Questions panel.
+		{"references", []string{"java", "go", "js"}, "Every textual reference to a symbol (lexical).",
+			[]ParamSpec{f("name", "method")}},
+		{"callers", []string{"java", "go", "js"}, "Call sites of a function/method by name (lexical).",
+			[]ParamSpec{f("name", "method")}},
+		{"constructions", []string{"java", "go", "js"}, "Where instances of a type are constructed (new/literal/factory).",
+			[]ParamSpec{f("type", "type")}},
+		{"writes-to", []string{"java", "go", "js"}, "Lines that write/mutate a variable or field (assign, ++/--, setter).",
+			[]ParamSpec{f("var", "var")}},
+		{"sql-tables", []string{"any"}, "Tables referenced by .sql files (FROM/JOIN/INTO/UPDATE).",
+			[]ParamSpec{opt("file", "file")}},
+		{"git-blame", []string{"any"}, "Per-line commit/author/date for a file or span (exact, needs a git checkout).",
+			[]ParamSpec{f("file", "file"), text("lines", "20-40", false)}},
 	}
-	_ = opt
 	out := map[string]AnalyzerSpec{}
 	for _, s := range specs {
 		out[s.Name] = s

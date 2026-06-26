@@ -113,6 +113,7 @@ function reDetect(after){
   STATE.lang=d.language||STATE.lang;STATE.defaults=d.defaults||STATE.defaults;
   el("langtag").textContent=STATE.lang;
   buildAnalyzerSelect();renderParams();prefillEntry();
+  if(typeof renderQuestions==="function")renderQuestions();
   if(after)after();else autoPreview();
  });
 }

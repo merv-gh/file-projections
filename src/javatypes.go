@@ -30,6 +30,10 @@ type JavaType struct {
 	Line       int          // 1-based decl line
 	Methods    []JavaMethod // declared methods (reused parser)
 	Fields     []JavaField  // declared fields (for DI field-type lookup)
+	// DB-aware fields (javadb.go): class-level annotations and the generic supertype
+	// argument, captured so JPA entities/repositories can be resolved to tables.
+	Annotations []string // class-level annotations, e.g. "@Entity", "@Table(name=\"orders\")"
+	ExtendsArgs []string // generic args on extends, e.g. JpaRepository<Order,Long> -> ["Order","Long"]
 }
 
 // JavaField is a field declaration: `private AbstractPaymentService paymentService;`.
@@ -121,6 +125,19 @@ func parseJavaTypes(rel string, lines []string) []*JavaType {
 			File:     rel,
 			Line:     i + 1,
 		}
+		// Class-level annotations: scan the lines immediately above the decl (skipping
+		// blanks), e.g. @Entity / @Table(name="orders"). Captured for JPA detection.
+		for k := i - 1; k >= 0; k-- {
+			tk := strings.TrimSpace(lines[k])
+			if tk == "" {
+				continue
+			}
+			if strings.HasPrefix(tk, "@") {
+				t.Annotations = append([]string{tk}, t.Annotations...)
+				continue
+			}
+			break
+		}
 		// extends/implements may be on the decl line or the next couple (wrapped).
 		header := l
 		for j := i + 1; j < len(lines) && j < i+4 && !strings.Contains(header, "{"); j++ {
@@ -128,6 +145,7 @@ func parseJavaTypes(rel string, lines []string) []*JavaType {
 		}
 		if em := javaExtendsRE.FindStringSubmatch(header); em != nil {
 			t.Extends = simpleTypeName(em[1])
+			t.ExtendsArgs = genericArgs(em[1])
 		}
 		if im := javaImplRE.FindStringSubmatch(header); im != nil {
 			for _, part := range strings.Split(im[1], ",") {
@@ -205,6 +223,23 @@ func simpleTypeName(s string) string {
 		s = s[i+1:]
 	}
 	return strings.TrimSpace(s)
+}
+
+// genericArgs returns the simple names of the generic arguments of a type reference,
+// e.g. "JpaRepository<Order, Long>" -> ["Order","Long"]. Empty when no generics.
+func genericArgs(s string) []string {
+	lt := strings.Index(s, "<")
+	gt := strings.LastIndex(s, ">")
+	if lt < 0 || gt < lt {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(s[lt+1:gt], ",") {
+		if n := simpleTypeName(part); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // indexFrom returns the first line index >= from that contains sub, or -1.

@@ -75,6 +75,7 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/trace", s.handleTrace)
 	mux.HandleFunc("/api/projects", s.handleProjects)
 	mux.HandleFunc("/api/trace-symbols", s.handleTraceSymbols)
+	mux.HandleFunc("/api/lens-templates", s.handleLensTemplates)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
 	return http.ListenAndServe(addr, mux)
 }
@@ -172,7 +173,12 @@ func (s *uiServer) handleDirs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	cfg := s.cfg
 	s.mu.Unlock()
-	base := filepath.Join(cfg.Root, rel)
+	// Absolute paths are allowed so the project folder-chooser can browse anywhere on
+	// disk (repos may live outside cfg.Root); relative paths resolve under cfg.Root.
+	base := rel
+	if !filepath.IsAbs(rel) {
+		base = filepath.Join(cfg.Root, rel)
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"error": err.Error()})
@@ -190,7 +196,11 @@ func (s *uiServer) handleDirs(w http.ResponseWriter, r *http.Request) {
 		dirs = append(dirs, name)
 	}
 	sort.Strings(dirs)
-	writeJSON(w, 200, map[string]any{"path": filepath.ToSlash(rel), "dirs": dirs})
+	out := filepath.ToSlash(rel)
+	if filepath.IsAbs(rel) {
+		out = filepath.ToSlash(base)
+	}
+	writeJSON(w, 200, map[string]any{"path": out, "dirs": dirs, "abs": filepath.IsAbs(rel)})
 }
 
 // handleLenses lets the UI bookmark a *configured lens* (analyzer + source root +
@@ -1205,5 +1215,89 @@ func (s *uiServer) handleTraceSymbols(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// Tables are trace targets too (TABLES.md §C): suggest discovered physical tables.
+	dbm := buildDBModel(cfg, ws, idx)
+	for _, tbl := range dbm.sortedTableNames() {
+		if q == "" || strings.Contains(strings.ToLower(tbl), q) {
+			ti := dbm.Tables[tbl]
+			repo := coalesce(ti.MigRepo, ti.EntityRepo)
+			out = append(out, sym{Name: tbl, Kind: "table", Repo: repo, File: firstStr(ti.Migrations)})
+		}
+	}
 	writeJSON(w, 200, map[string]any{"symbols": out})
+}
+
+func firstStr(ss []string) string {
+	if len(ss) > 0 {
+		return ss[0]
+	}
+	return ""
+}
+
+// handleLensTemplates serves the guided "Add a lens" wizard's catalogue (TABLES.md
+// §E): each template is a lens type with a one-line description and example params
+// prefilled for the active project, so adding a lens to a new project is click-not-type.
+func (s *uiServer) handleLensTemplates(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	proj := activeProject(cfg)
+
+	// Discover the active project's tables so the SQL-watch template can prefill real
+	// table names the user can already see on the graph.
+	var tables []string
+	if proj != nil {
+		ws := workspaceFromProject(cfg, proj, false)
+		idx := buildTypeIndex(cfg, ws)
+		dbm := buildDBModel(cfg, ws, idx)
+		tables = dbm.sortedTableNames()
+	}
+
+	type tmpl struct {
+		ID       string            `json:"id"`
+		Analyzer string            `json:"analyzer"`
+		Title    string            `json:"title"`
+		Intent   string            `json:"intent"`
+		Desc     string            `json:"desc"`
+		Example  map[string]string `json:"example"`
+		Note     string            `json:"note,omitempty"`
+	}
+	tablesCSV := strings.Join(tables, ",")
+	tmpls := []tmpl{
+		{ID: "sql-watch", Analyzer: "postgres-watch", Title: "Watch DB tables (live)", Intent: "observe",
+			Desc: "Poll Postgres tables and stream new rows into a rolling window — the same tables you see on the graph.",
+			Example: map[string]string{
+				"connections":    `{"dev":"postgres://user:pass@localhost:5432/app?sslmode=disable"}`,
+				"tables":         coalesce(tablesCSV, "ledger_entries,orders"),
+				"window_minutes": "10", "bootstrap": "latest", "poll_seconds": "30",
+			},
+			Note: coalesce(tablesPrefillNote(tables), "")},
+		{ID: "table-graph", Analyzer: "service-graph", Title: "Service + table graph (cross-repo)", Intent: "understand",
+			Desc:    "Whole-project graph: services, calls, dependency-inversion hops, and DB tables with reads/writes.",
+			Example: map[string]string{"project": projName(proj)}},
+		{ID: "sql-tables", Analyzer: "sql-tables", Title: "Tables touched by .sql files", Intent: "observe",
+			Desc:    "List the tables referenced (FROM/JOIN/INTO/UPDATE) by SQL files under a source root.",
+			Example: map[string]string{}},
+		{ID: "entrypoints", Analyzer: "entrypoints", Title: "Entrypoints (routes, listeners)", Intent: "change",
+			Desc:    "Where control enters the service — Spring mappings, listeners, schedules.",
+			Example: map[string]string{"patterns": "http-mapping=@(Get|Post|Put|Delete)Mapping;listener=@KafkaListener"}},
+		{ID: "side-effects", Analyzer: "side-effects", Title: "Side effects (IO/net/db)", Intent: "diagnose",
+			Desc:    "What a source root actually touches — database, network, files, process.",
+			Example: map[string]string{}},
+	}
+	writeJSON(w, 200, map[string]any{"templates": tmpls, "tables": tables})
+}
+
+func tablesPrefillNote(tables []string) string {
+	if len(tables) == 0 {
+		return "No tables discovered yet — add your app repo (with JPA entities or migrations) to the project first."
+	}
+	return "Prefilled with tables discovered in this project: " + strings.Join(tables, ", ")
+}
+
+func projName(p *ProjectConfig) string {
+	if p == nil {
+		return ""
+	}
+	return p.Name
 }

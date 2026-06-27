@@ -137,8 +137,29 @@ el("projnewbtn")&&(el("projnewbtn").onclick=function(){ var n=el("projname").val
 el("repadd")&&(el("repadd").onclick=function(){
  if(!PROJ_ADD_TARGET){ flash("create or pick a project first",1); return; }
  postProjects({action:"add-repo",project:PROJ_ADD_TARGET,path:el("reppath").value.trim(),url:el("repurl").value.trim(),role:el("reprole").value},
-  function(){ el("reppath").value="";el("repurl").value=""; });
+  function(){ el("reppath").value="";el("repurl").value=""; el("repbrowser").style.display="none"; });
 });
 el("trrun")&&(el("trrun").onclick=runTrace);
 el("trsym")&&el("trsym").addEventListener("keydown",function(e){if(e.key==="Enter")runTrace()});
 if(el("trsym")){ var ac=el("trsymac"); combobox(el("trsym"),ac,traceSymFetch,function(it){el("trsym").value=it.value}); }
+
+// ---- folder chooser for "Add a repo" (reuses /api/dirs, absolute paths allowed) --
+var REPBROWSE_PATH = "";
+function repBrowse(path){
+ fetch("/api/dirs?path="+encodeURIComponent(path||"")).then(function(r){return r.json()}).then(function(d){
+  if(d.error){ el("repbrowser").innerHTML="<div class=note>"+esc(d.error)+"</div>"; return; }
+  REPBROWSE_PATH = d.path||"";
+  var h="<div class=crumb><span>"+esc(REPBROWSE_PATH||"(root)")+"</span><button class=ghost type=button id=repuse>Use this folder</button></div>";
+  var parent = REPBROWSE_PATH.indexOf("/")>=0 ? REPBROWSE_PATH.slice(0,REPBROWSE_PATH.lastIndexOf("/")) : "";
+  if(REPBROWSE_PATH) h+="<div class=di data-d='"+esc(parent)+"'>↑ ..</div>";
+  (d.dirs||[]).forEach(function(dir){var full=REPBROWSE_PATH?(REPBROWSE_PATH+"/"+dir):dir;h+="<div class=di data-d='"+esc(full)+"'>📁 "+esc(dir)+"</div>"});
+  var box=el("repbrowser"); box.innerHTML=h; box.style.display="";
+  box.querySelector("#repuse").onclick=function(){ el("reppath").value=REPBROWSE_PATH; box.style.display="none"; };
+  box.querySelectorAll(".di").forEach(function(n){n.onclick=function(){repBrowse(n.dataset.d)}});
+ });
+}
+el("repbrowse")&&(el("repbrowse").onclick=function(){
+ var box=el("repbrowser");
+ if(box.style.display!=="none"&&box.innerHTML){ box.style.display="none"; return; }
+ repBrowse(el("reppath").value.trim()||"");
+});

@@ -179,6 +179,88 @@ func typeNames(ts []*JavaType) []string {
 	return out
 }
 
+// TestDBModelResolvesEntityRepoTableMigration covers javadb.go: @Entity/@Table
+// parsing, JpaRepository<Entity> -> entity, entity -> physical table, and the Flyway
+// migration attribution — the join chain tables-as-nodes depends on.
+func TestDBModelResolvesEntityRepoTableMigration(t *testing.T) {
+	cfg := Config{ExcludeDirs: defaultExcludeDirs()}
+	var ws Workspace
+	if err := json.Unmarshal([]byte(fixtureRepos(t)), &ws.Repos); err != nil {
+		t.Fatal(err)
+	}
+	idx := buildTypeIndex(cfg, &ws)
+	m := buildDBModel(cfg, &ws, idx)
+
+	ti := m.Tables["ledger_entries"]
+	if ti == nil {
+		t.Fatalf("ledger_entries table not discovered; tables=%v", m.sortedTableNames())
+	}
+	if ti.Entity != "LedgerEntry" {
+		t.Errorf("entity = %q, want LedgerEntry", ti.Entity)
+	}
+	if ti.mapNote != "@Table(name)" {
+		t.Errorf("mapping note = %q, want @Table(name)", ti.mapNote)
+	}
+	if len(ti.Migrations) == 0 || ti.MigRepo != "shop-app" {
+		t.Errorf("migration not attributed: %+v", ti)
+	}
+	writers, readers := m.accessorsOf("ledger_entries")
+	if len(writers) == 0 || len(readers) == 0 {
+		t.Errorf("expected LedgerEntryRepository to write+read ledger_entries; w=%v r=%v", writers, readers)
+	}
+}
+
+// TestServiceGraphHasTableNodesAndEdges covers TABLES.md §B: the table appears as a
+// node and the repository has writes-to/reads-from edges to it.
+func TestServiceGraphHasTableNodesAndEdges(t *testing.T) {
+	billing, _ := filepath.Abs(filepath.Join("fixtures", "billing-lib"))
+	shop, _ := filepath.Abs(filepath.Join("fixtures", "shop-app"))
+	cfg := Config{ExcludeDirs: defaultExcludeDirs(), Workspace: &WorkspaceConfig{Active: "shop", Projects: []ProjectConfig{{Name: "shop", Repos: []RepoConfig{{Name: "shop-app", Path: shop, Role: "app"}, {Name: "billing-lib", Path: billing, Role: "library"}}}}}}
+	p, err := AnalyzeServiceGraph(cfg, LensConfig{Name: "g", Analyzer: "service-graph"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graph string
+	for _, f := range p.Facts {
+		if f.ID == "graph" {
+			graph = f.Text
+		}
+	}
+	for _, want := range []string{`"kind":"table"`, "table::ledger_entries", `"kind":"writes-to"`, `"kind":"reads-from"`} {
+		if !strings.Contains(graph, want) {
+			t.Errorf("service graph missing %q\n%s", want, graph)
+		}
+	}
+}
+
+// TestTraceToTable covers TABLES.md §C: tracing a physical table name yields the
+// cross-repo, DI-aware paths that end at the repository write.
+func TestTraceToTable(t *testing.T) {
+	cfg := Config{ExcludeDirs: defaultExcludeDirs()}
+	lens := LensConfig{Name: "trace", Analyzer: "trace-to-line", Params: map[string]string{"repos": fixtureRepos(t), "symbol": "ledger_entries"}}
+	p, err := AnalyzeTraceToLine(cfg, lens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Extra) == 0 {
+		t.Fatal("expected at least one path to the table")
+	}
+	var all strings.Builder
+	for _, ex := range p.Extra {
+		for _, bl := range ex.Proj.Blocks {
+			for _, l := range bl.Lines {
+				all.WriteString(l + "\n")
+			}
+		}
+	}
+	got := all.String()
+	for _, want := range []string{"PaymentController", "crosses repo boundary", "ledgerEntryRepository.save", "writes table ledger_entries"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("table trace missing %q\n%s", want, got)
+		}
+	}
+}
+
 // TestTraceBySymbolFromConfigProject covers the Phase 4 UX path: a config workspace
 // project drives the trace, and the target is given as a SYMBOL (no file/line/repo).
 func TestTraceBySymbolFromConfigProject(t *testing.T) {

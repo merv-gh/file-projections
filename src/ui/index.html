@@ -19,6 +19,7 @@
    </div>
    <div id=lenspane style=display:none>
    <h2>Lens</h2>
+   <button class=ghost id=lensadd style="width:100%;margin-bottom:.4rem">＋ Add a lens (guided)</button>
    <select id=an></select>
    <p class=hint id=anhint></p>
    <div class=row style="gap:.3rem;margin:.2rem 0 .1rem">
@@ -55,6 +56,12 @@
      <span class=effk data-k=io-write><i style="background:#b54848"></i>io-write</span>
      <span class=effk data-k=io-read><i style="background:#7a8a3a"></i>io-read</span>
      <span class=effk data-k=process><i style="background:#7a4fa0"></i>process</span>
+    </div>
+    <div class=nodelegend>
+     <span class=nlk><i style="background:#dce8f3;border:1px solid #7fa8cf"></i>entrypoint</span>
+     <span class=nlk><i style="background:#e6dcef;border:1px solid #9a6fd0"></i>table</span>
+     <span class=nlk><span class=el style="background:#b54848"></span>writes-to</span>
+     <span class=nlk><span class=el style="background:#7a8a3a"></span>reads-from</span>
     </div>
     <div id=graphwrap><div id=graphhint class=note>Pick a <code>service-graph</code> lens. Click a node to drill into its assumptions &amp; object timeline. Colored dots on a node show its side effects (IO/network/db/process).</div></div>
     <div id=mermaidbox style=display:none><div class=row style="justify-content:space-between"><h2 style=margin:0>mermaid</h2><button class=ghost id=gmclose>close</button></div><textarea id=mermaidtext rows=14 readonly></textarea></div>
@@ -112,14 +119,24 @@
   <div class=projaddrepo>
    <label>Add a repo to <b id=projaddtarget>—</b></label>
    <div class=row style="gap:.4rem;flex-wrap:wrap;align-items:flex-end">
-    <div style=flex:2><input id=reppath placeholder="/path/to/repo (folder)" autocomplete=off></div>
+    <div style=flex:2><input id=reppath placeholder="/path/to/repo (folder)" autocomplete=off><button class=ghost id=repbrowse type=button>Browse…</button></div>
     <span class=note>or</span>
     <div style=flex:2><input id=repurl placeholder="github.com/org/lib (clone)" autocomplete=off></div>
     <select id=reprole><option value=app>app</option><option value=library>library</option></select>
     <button class=ghost id=repadd>Add</button>
    </div>
+   <div id=repbrowser class=repbrowser style=display:none></div>
   </div>
   <span class=note id=projmsg></span>
+ </div>
+</div>
+<div id=lensmodal class=modal style=display:none>
+ <div class=modalbox>
+  <div class=row style="justify-content:space-between;align-items:center"><h2 style=margin:0>Add a lens</h2><button class=ghost id=lensclose>close</button></div>
+  <p class=hint>Pick what you want to see. Examples are prefilled for the active project — adjust and save. Saved to <code>config.json</code>.</p>
+  <div id=lenstmpls class=lenstmpls></div>
+  <div id=lensform class=lensform style=display:none></div>
+  <span class=note id=lensmsg></span>
  </div>
 </div>
 <script src="/ui/core.js"></script>
@@ -127,5 +144,6 @@
 <script src="/ui/graph.js"></script>
 <script src="/ui/questions.js"></script>
 <script src="/ui/trace.js"></script>
+<script src="/ui/lenswizard.js"></script>
 <script src="/ui/studio.js"></script>
 </body></html>

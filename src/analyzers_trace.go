@@ -254,6 +254,15 @@ func TraceToLine(cfg Config, lens LensConfig, ws *Workspace) (Projection, error)
 	idx := buildTypeIndex(cfg, ws)
 	g := buildTraceGraph(idx)
 
+	// Table-as-target (TABLES.md §C): if the symbol is a known physical table, the
+	// targets are the call sites that write/read it via a Spring Data repository.
+	dbm := buildDBModel(cfg, ws, idx)
+	if symbol != "" {
+		if _, isTable := dbm.Tables[normalizeTableName(symbol)]; isTable {
+			return traceToTable(cfg, lens, g, dbm, normalizeTableName(symbol), maxPaths)
+		}
+	}
+
 	var target *tMethod
 	if symbol != "" {
 		cands := g.methodsBySymbol(symbol)
@@ -317,6 +326,136 @@ func TraceToLine(cfg Config, lens LensConfig, ws *Workspace) (Projection, error)
 	if len(paths) == 0 {
 		p.Facts = append(p.Facts, ProjectionFact{ID: "hint", Tool: "trace", Text: "no entrypoint path found — the method may be an entrypoint itself, dead, or only reached via reflection/proxy"})
 	}
+	return p, nil
+}
+
+// traceToTable answers "how do we end up writing to / reading from <table>?". It
+// finds every method whose body calls a Spring Data repository for the table, traces
+// each to its entrypoints (reusing the path engine), and appends a table terminal
+// marker to each answer.
+func traceToTable(cfg Config, lens LensConfig, g *traceGraph, dbm *DBModel, table string, maxPaths int) (Projection, error) {
+	// Repository type names that manage this table.
+	repoTypes := map[string]bool{}
+	for _, rt := range dbm.RepoTables {
+		if rt.Table == table {
+			repoTypes[rt.RepoType.Name] = true
+		}
+	}
+	// Find call sites: any method calling <repoField>.<writeOrRead>(…) where the
+	// receiver field's declared type is one of the managing repositories.
+	type hit struct {
+		owner *tMethod
+		line  int
+		code  string
+		write bool
+	}
+	var hits []hit
+	for _, m := range g.methods {
+		locals := map[string]string{}
+		for _, l := range m.method.Lines {
+			for _, mm := range tLocalVarRE.FindAllStringSubmatch(stripCallNoise(l), -1) {
+				locals[mm[2]] = mm[1]
+			}
+		}
+		for li, raw := range m.method.Lines {
+			code := stripCallNoise(raw)
+			for _, cm := range tQualCallRE.FindAllStringSubmatch(code, -1) {
+				recv, meth := cm[1], cm[2]
+				rtype := g.resolveReceiver(m, recv, locals)
+				if !repoTypes[rtype] {
+					continue
+				}
+				w, r := repoAccessForCall(meth)
+				if !w && !r {
+					continue
+				}
+				hits = append(hits, hit{owner: m, line: m.method.Start + li, code: strings.TrimSpace(raw), write: w})
+			}
+		}
+	}
+
+	p := Projection{Sync: "view-only"}
+	var summary []string
+	summary = append(summary, fmt.Sprintf("// target table: %s", table))
+	if ti := dbm.Tables[table]; ti != nil {
+		if ti.Entity != "" {
+			summary = append(summary, fmt.Sprintf("// entity %s · mapping: %s", ti.Entity, ti.mapNote))
+		}
+		if len(ti.Migrations) > 0 {
+			summary = append(summary, fmt.Sprintf("// migration: %s (%s)", ti.Migrations[0], ti.MigRepo))
+		}
+	}
+	if len(hits) == 0 {
+		summary = append(summary, "// no repository call sites write/read this table in scope")
+		p.Blocks = append(p.Blocks, ProjectionBlock{ID: "trace", File: "model", Mode: "trace-to-table", Tool: "trace", Lines: summary})
+		p.Facts = append(p.Facts, confidenceFact("structural", "table known from "+coalesce(dbm.Tables[table].mapNote, "schema")+", but no code accesses it in scope"))
+		return p, nil
+	}
+
+	type answer struct {
+		lines []string
+		di    bool
+		cross bool
+		head  string
+	}
+	var answers []answer
+	for _, h := range hits {
+		// Trace from the call-site's owning method back to entrypoints.
+		paths := g.tracePaths(h.owner, maxPaths)
+		verb := "reads"
+		if h.write {
+			verb = "writes"
+		}
+		if len(paths) == 0 {
+			// the owner itself is the only context (entrypoint or unreached)
+			ls := []string{fmt.Sprintf("  %s   %s", h.owner.label(), repoRelPath(h.owner.typ.Repo, h.owner.typ.File))}
+			ls = append(ls, codeLoc("  → "+strings.TrimSuffix(h.code, ";"), h.owner.typ.File, h.line))
+			ls = append(ls, "★ "+verb+" "+table)
+			answers = append(answers, answer{lines: ls, head: h.owner.label() + " → " + verb + " " + table})
+			continue
+		}
+		for _, path := range paths {
+			ls, di, cross := renderTracePath(g, path, h.owner, h.line)
+			// renderTracePath already ends with the call-site line (the ★ target);
+			// append only the table terminal so the path reads …save() → table.
+			ls = append(ls, "      ↳ "+verb+" table "+table)
+			answers = append(answers, answer{lines: ls, di: di, cross: cross, head: pathHeadline(path) + " → " + verb + " " + table})
+		}
+	}
+	if len(answers) > maxPaths {
+		answers = answers[:maxPaths]
+	}
+
+	summary = append(summary, fmt.Sprintf("// %d path(s) reach this table", len(answers)))
+	for i, a := range answers {
+		summary = append(summary, fmt.Sprintf("//   answer %d: %s", i+1, a.head))
+	}
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "trace", File: "model", Mode: "trace-to-table", Tool: "trace", Lines: summary})
+
+	anyDI, anyCross := false, false
+	for i, a := range answers {
+		anyDI = anyDI || a.di
+		anyCross = anyCross || a.cross
+		ep := Projection{Sync: "view-only"}
+		ep.Blocks = append(ep.Blocks, ProjectionBlock{ID: fmt.Sprintf("answer-%d", i+1), File: "model", Mode: "trace-path", Tool: "trace", Lines: a.lines})
+		conf := "structural"
+		if a.di {
+			conf = "structural (di)"
+		}
+		ep.Facts = append(ep.Facts, confidenceFact(conf, a.head))
+		stem := strings.TrimSuffix(LensOut(cfg, lens), ".projection")
+		p.Extra = append(p.Extra, ExtraFile{Path: fmt.Sprintf("%s.answer-%d.projection", stem, i+1), Proj: ep})
+	}
+	conf := "structural"
+	bits := []string{fmt.Sprintf("%d path(s) to table %s", len(answers), table)}
+	if anyDI {
+		conf = "structural (di)"
+		bits = append(bits, "via dependency-inversion hops")
+	}
+	if anyCross {
+		bits = append(bits, "crosses repo boundaries")
+	}
+	p.Facts = append(p.Facts, confidenceFact(conf, strings.Join(bits, "; ")))
 	return p, nil
 }
 

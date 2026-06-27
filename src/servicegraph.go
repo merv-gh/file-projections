@@ -339,6 +339,45 @@ func serviceGraphFromProject(cfg Config, proj *ProjectConfig, appOnly bool) (Pro
 		}
 	}
 
+	// Tables as first-class nodes (TABLES.md §B): each discovered table is a node, and
+	// each repository type gets writes-to / reads-from edges to the table it manages.
+	// Cross=true when the repo and the table's owning migration live in different repos.
+	dbm := buildDBModel(cfg, ws, idx)
+	tableNodeID := func(tbl string) string { return "table::" + tbl }
+	for _, tbl := range dbm.sortedTableNames() {
+		ti := dbm.Tables[tbl]
+		svc := ti.EntityRepo
+		if svc == "" {
+			svc = ti.MigRepo
+		}
+		if svc == "" && len(g.Services) > 0 {
+			svc = g.Services[0].Name
+		}
+		file := ""
+		if len(ti.Migrations) > 0 {
+			file = ti.Migrations[0]
+		}
+		g.Nodes = append(g.Nodes, sgNode{
+			ID: tableNodeID(tbl), Label: "▱ " + tbl, Service: svc, Lang: "sql", Kind: "table",
+			File: file, Effects: []string{"db"}, Method: tbl,
+		})
+	}
+	for _, rt := range dbm.RepoTables {
+		from := nodeID(rt.RepoType)
+		to := tableNodeID(rt.Table)
+		owner := ""
+		if ti := dbm.Tables[rt.Table]; ti != nil {
+			owner = coalesce(ti.MigRepo, ti.EntityRepo)
+		}
+		cross := owner != "" && owner != rt.RepoType.Repo
+		if rt.Writes {
+			g.Edges = append(g.Edges, sgEdge{From: from, To: to, Kind: "writes-to", Label: "writes", Cross: cross})
+		}
+		if rt.Reads {
+			g.Edges = append(g.Edges, sgEdge{From: from, To: to, Kind: "reads-from", Label: "reads", Cross: cross})
+		}
+	}
+
 	cross := 0
 	for _, e := range g.Edges {
 		if e.Cross {

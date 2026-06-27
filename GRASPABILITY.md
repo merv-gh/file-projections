@@ -85,40 +85,94 @@ what makes the whole panel cheap.
 
 ## Roadmap
 
-### Phase 1 — front door, no new engines (THIS PASS)
+### Phase 1 — front door, no new engines (SHIPPED)
 Focused single-file lenses + git + the Questions panel. All lexical/structural.
 
-- [ ] `references` lens — every mention of a symbol (rg-backed), confidence `lexical`
-- [ ] `callers` lens — call sites of a function (ast-grep `name($$$)` → rg fallback), `structural`/`lexical`
-- [ ] `constructions` lens — `new X` / `X{}` / factory calls for a type, `structural`
-- [ ] `writes-to` lens — assignments/setters/mutations of a var (reuse UI `lineWrites` logic), `lexical`
-- [ ] `sql-tables` lens — tables/columns a `.sql`/`.pggen.sql` file touches, `lexical`
-- [ ] `git-blame` lens — annotate a span with commit/author/date, `exact`
-- [ ] Register all + `analyzerSpecs()` entries
-- [ ] `questionspec.go` — question registry (template, blanks, lens binding, confidence, langs)
-- [ ] `/api/ask` — compile question + blank values → `ExecuteLens`; served list in `/api/config`
-- [ ] UI Questions panel (`index.html` + `questions.js`): grouped fill-blank questions, blanks
-      autocomplete from symbol index, confidence badge on each answer, deep-linkable
-- [ ] Tests: query lenses, git-blame, question registry + ask
-- [ ] Docs: README question-panel section
+- [x] `references` lens — every mention of a symbol (rg-backed), confidence `lexical`
+- [x] `callers` lens — call sites of a function (rg call-shape `name(`), `lexical`
+- [x] `constructions` lens — `new X` / `X{}` / `&X{}` / `X.new` for a type, `lexical`
+- [x] `writes-to` lens — assignments/`++`/`--`/setter mutations of a var, `lexical`
+- [x] `sql-tables` lens — tables a `.sql` file touches (FROM/JOIN/INTO/UPDATE), `lexical`
+- [x] `git-blame` lens — annotate a file/span with commit/author/date, `exact`
+- [x] Register all (`registry.go`) + `analyzerSpecs()` entries (`analyzerspec.go`)
+- [x] `questionspec.go` — 12-question registry (template, blanks, lens binding, conf, langs)
+- [x] `/api/ask` — compile question + blank values → `ExecuteLens`; list in `/api/config`
+- [x] UI Questions panel (`index.html` + `questions.js`): grouped fill-blank questions, blanks
+      autocomplete from symbol index, confidence badge on each answer
+- [x] Tests: query lenses, git-blame, question registry + ask (in `main_test.go`)
+- [ ] Docs: README question-panel section (deferred — `done.md` covers it for now)
 
-### Phase 2 — close parity with tree-sitter
-- [ ] Tree-sitter `SymbolScanner` backend (per language) behind the existing seam
-- [ ] Language-neutral call graph → precise `callers`/`references`/impact-set
-- [ ] Lexical control-flow + data-flow for Go/TS (parity with Java's non-joern path)
-- [ ] Drop "lexical" → "structural" confidence where tree-sitter backs the answer
+### Phase 2 — close parity with a structural call graph (SHIPPED, pure-Go)
+Chose a **pure-Go** structural scanner over real tree-sitter: tree-sitter needs CGO +
+grammar packages, which breaks this repo's dependency-free/offline design (verified it
+builds, but rejected the dependency). The `SymbolScanner`/`FuncBodies` seam
+(`language.go`) is exactly where a tree-sitter backend would later slot in with no
+change to the graph or lenses — so this is the same architecture, cheaper backend.
 
-### Phase 3 — "what happened" / runtime
+- [x] `FuncBodies` seam per language (`language.go`) — reuses each language's existing
+      body parser (`parseJavaMethods`/`goFuncBodies`/`parseTSFuncs`) so the graph,
+      unroller and symbol search agree on "what is a function"
+- [x] Structural call graph (`callgraph.go`): scope-resolved edges (a call counts only
+      inside a known body and resolving to a declared function), incremental per-file
+      cache, string/comment scrubbing so mentions in text don't count
+- [x] `call-graph-callers` lens — precise upgrade of lexical `callers`; `who-calls`
+      question now binds to it (`structural`)
+- [x] `impact-set` lens + "If I change {name}, what breaks?" question — transitive
+      callers by BFS depth (the review-graph blast radius)
+- [x] Confidence drops `lexical` → `structural`; honest `ambiguityNote` when a name
+      has >1 declaration (the scope-not-type ceiling, where joern stays the upgrade)
+- [x] Tests: resolution precision (comment/string decoys), impact depths, cycle safety
+- [ ] Lexical control-flow + data-flow for Go/TS (still Java-only via joern — deferred)
+- [ ] Real tree-sitter backend behind the seam (deferred; pure-Go covers the need)
+
+### Phase 3 — "what happened" / runtime &nbsp;·&nbsp; deferred authoring/transactions
 - [ ] OTel/Jaeger trace lens (poll-adapter; target repo already runs Jaeger)
 - [ ] SQL query → call-site linking (sql-tables ↔ db side-effects)
 - [ ] git diff-since-commit question
 - [ ] joern incremental (the long-deferred CPG node-level re-add)
+- [ ] **Write/authoring (deferred, see review-graph.md):** insert/create code (anchor
+      model is replace-only today) + transactional multi-file apply for rename/rewrite.
+      Deferred per YAGNI until a concrete refactor use case needs it; the precise call
+      graph shipped here is the prerequisite that makes safe rewrites *possible*.
 
 ---
 
-## Done (this pass — update as we go)
+## Done (this pass — Phase 1)
 
-- (filled in during Phase 1 implementation)
+Questions panel shipped end-to-end. See `done.md` for the full table; in short:
+
+- 6 lexical/structural lenses: `references`, `callers`, `constructions`, `writes-to`,
+  `sql-tables`, `git-blame` (`analyzers_query.go`, `analyzers_git.go`).
+- 12 questions across Change/Diagnose/Observe (`questionspec.go`), bound to existing
+  lenses, served via `/api/config`, run via `/api/ask` (`ui.go:516`).
+- UI panel (`ui/questions.js`) with symbol-index autocomplete + confidence badges.
+- Every answer carries a `confidence` fact (`lexical` | `structural` | `cpg` | `exact`).
+- Build/vet/tests green; verified live (`who-calls queryRows` → 5 call sites).
+
+Honest note: `constructions` shipped at `lexical` confidence (not `structural` as
+first planned) — it's still rg-backed, not AST-backed. Tree-sitter (Phase 2) is what
+earns the `structural` badge.
+
+## Done (this pass — Phase 2)
+
+Structural call graph shipped end-to-end, **pure-Go** (no CGO/tree-sitter dependency):
+
+- `callgraph.go` — scope-resolved call graph per source root: a call counts only
+  inside a known function body and resolving to a declared function; comments and
+  string literals are scrubbed first. Incremental per-file cache like the symbol index.
+- `FuncBodies` seam (`language.go`) reuses each language's existing body parser, so
+  adding a language stays a one-entry change and a tree-sitter backend can later swap
+  in without touching the graph.
+- `call-graph-callers` lens (precise upgrade of lexical `callers`; `who-calls` now
+  binds to it) and `impact-set` lens ("If I change X, what breaks?" — transitive
+  callers by BFS depth).
+- Confidence `lexical` → `structural`; `ambiguityNote` is honest about the
+  scope-not-type ceiling (joern remains the type-precise upgrade).
+- Tests: comment/string decoy resolution, impact depths, cycle termination. Full
+  suite + vet green.
+- Deferred per YAGNI: write/authoring (insert/create + transactional multi-file
+  apply) and a real tree-sitter backend. See `review-graph.md` for why the call graph
+  was the right next step for both the review graph and write-safety.
 
 ## Risks / honest notes
 

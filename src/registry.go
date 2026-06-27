@@ -75,6 +75,10 @@ func DefaultRegistry() Registry {
 		"writes-to":     AnalyzerFunc{"writes-to", AnalyzeWritesTo},
 		"sql-tables":    AnalyzerFunc{"sql-tables", AnalyzeSQLTables},
 		"git-blame":     AnalyzerFunc{"git-blame", AnalyzeGitBlame},
+		// Structural (scope-resolved) call-graph lenses — precise upgrades of the
+		// lexical callers/references, plus the transitive impact set (Phase 2).
+		"call-graph-callers": AnalyzerFunc{"call-graph-callers", AnalyzeCallGraphCallers},
+		"impact-set":         AnalyzerFunc{"impact-set", AnalyzeImpactSet},
 	}
 }
 

@@ -94,6 +94,11 @@ func analyzerSpecs() map[string]AnalyzerSpec {
 			[]ParamSpec{opt("file", "file")}},
 		{"git-blame", []string{"any"}, "Per-line commit/author/date for a file or span (exact, needs a git checkout).",
 			[]ParamSpec{f("file", "file"), text("lines", "20-40", false)}},
+		// Structural (scope-resolved) call-graph lenses — Phase 2.
+		{"call-graph-callers", []string{"java", "go", "js"}, "Resolved call sites of a function (structural; only calls inside known bodies that resolve to a declaration).",
+			[]ParamSpec{f("name", "method")}},
+		{"impact-set", []string{"java", "go", "js"}, "Transitive set of functions that (in)directly call a function — \"if I change X, what breaks\" (structural).",
+			[]ParamSpec{f("name", "method")}},
 	}
 	out := map[string]AnalyzerSpec{}
 	for _, s := range specs {

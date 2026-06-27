@@ -46,6 +46,13 @@ type Language struct {
 	// Scan extracts symbols from a file. Defaults to a regex scanner per language.
 	Scan SymbolScanner
 
+	// FuncBodies extracts function/method spans (name + line range) from a file.
+	// This is the seam the structural call graph (callgraph.go) builds on: it
+	// reuses each language's existing body parser so the graph, the unroller and
+	// symbol search all agree on what a function is. Like Scan, a tree-sitter/LSP
+	// backend would swap this one function and leave the graph untouched.
+	FuncBodies func(rel string, lines []string) []FuncSpan
+
 	// Wizard/menu defaults — the language-appropriate starting lens params. Kept
 	// here (not in util.go switches) so a new language ships its own conventions.
 	EntrypointPatterns string // entrypoints lens `patterns`
@@ -91,6 +98,7 @@ func buildLanguageRegistry() []*Language {
 		ID: "java", Name: ".java", Exts: []string{".java"},
 		JoernFrontend:      "javasrc2cpg",
 		Scan:               scanJavaSymbols,
+		FuncBodies:         javaFuncBodies,
 		EntrypointPatterns: "kafka-listener=@KafkaListener;scheduled=@Scheduled;event-listener=@EventListener;http-mapping=@(Get|Post|Put|Delete|Patch|Request)Mapping",
 		ExitSinks:          "*repository*.save,*kafka*.send,*.publish",
 		EntryRegex:         "@(KafkaListener|Scheduled|EventListener|PostMapping|GetMapping)",
@@ -107,6 +115,7 @@ func buildLanguageRegistry() []*Language {
 		ID: "go", Name: ".go", Exts: []string{".go"},
 		JoernFrontend:      "gosrc2cpg",
 		Scan:               scanGoSymbols,
+		FuncBodies:         goFuncBodies,
 		EntrypointPatterns: `http-handler=func .*http\.ResponseWriter;route=\.(GET|POST|PUT|DELETE|HandleFunc)\(`,
 		ExitSinks:          "*repo*.Save,*.Exec,*.Publish",
 		EntryRegex:         "@(KafkaListener|Scheduled|PostMapping|GetMapping)",
@@ -123,6 +132,7 @@ func buildLanguageRegistry() []*Language {
 		ID: "js", Name: ".js/.ts", Exts: []string{".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"},
 		JoernFrontend:      "", // joern-parse autodetect
 		Scan:               scanTSSymbols,
+		FuncBodies:         tsFuncBodies,
 		EntrypointPatterns: `route=\.(get|post|put|delete)\(;listener=addEventListener\(;handler=\.on\(`,
 		ExitSinks:          "*repository*.save,*kafka*.send,*.publish",
 		EntryRegex:         "@(KafkaListener|Scheduled|PostMapping|GetMapping)",

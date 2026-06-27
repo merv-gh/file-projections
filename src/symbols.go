@@ -106,6 +106,38 @@ func symbolIndexFor(cfg Config, root string) (*symbolIndex, error) {
 	return cur, nil
 }
 
+// walkSourceFiles walks every known-language source file under base (applying the
+// same dir-skip and macOS-junk filtering as the symbol index) and calls fn with the
+// source-root-relative slash path and the file's lines. Shared by the symbol index
+// and the call graph so the two see exactly the same file set.
+func walkSourceFiles(cfg Config, base string, fn func(rel string, lines []string)) error {
+	return filepath.WalkDir(base, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if shouldSkipDir(cfg, path, d) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if languageForPath(path) == "" {
+			return nil
+		}
+		rel, _ := filepath.Rel(base, path)
+		rel = filepath.ToSlash(rel)
+		if strings.Contains(rel, "__MACOSX/") || strings.HasPrefix(filepath.Base(rel), "._") {
+			return nil
+		}
+		lines, rerr := readLines(path)
+		if rerr != nil {
+			return nil
+		}
+		fn(rel, lines)
+		return nil
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Default (regex) symbol scanners. These are the no-dependency backend; a
 // tree-sitter backend would replace these functions and nothing else.

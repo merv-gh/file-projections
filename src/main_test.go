@@ -1652,3 +1652,93 @@ func TestQuestionRegistryCompilesToValidLenses(t *testing.T) {
 		t.Error("compileQuestion accepted unknown id")
 	}
 }
+
+// TestCallGraphResolvesCallersAndImpact covers the Phase 2 structural call graph:
+// (a) calls are only counted inside known bodies and resolve to a declared function
+// (so a same-named token in a comment/string doesn't count), and (b) the transitive
+// impact set walks edges with correct BFS depths and terminates on cycles.
+func TestCallGraphResolvesCallersAndImpact(t *testing.T) {
+	dir := t.TempDir()
+	// Go source: entry -> mid -> leaf, plus a decoy mention of leaf in a comment and
+	// a string, which the lexical lens would wrongly count but the graph must not.
+	write(t, filepath.Join(dir, "src/app.go"), `package app
+
+func entry() { mid() }
+
+func mid() {
+	// leaf() is mentioned here in a comment
+	s := "call leaf() in a string"
+	_ = s
+	leaf()
+}
+
+func leaf() {}
+
+func unrelated() { other() }
+
+func other() { unrelated() } // cycle: other <-> unrelated
+`)
+	cfg := Config{Root: dir, ProjectionsDir: ".projections", ExcludeDirs: defaultExcludeDirs()}
+
+	g, err := buildCallGraphFor(cfg, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// leaf has exactly one resolved caller: mid (not the comment, not the string).
+	callers := g.CallersOf("leaf")
+	if len(callers) != 1 || callers[0].Caller != "mid" {
+		t.Fatalf("leaf callers = %#v, want exactly [mid]", callers)
+	}
+
+	// Transitive impact of leaf: mid (depth 1) and entry (depth 2).
+	imp := g.ImpactSet("leaf")
+	if imp["mid"] != 1 || imp["entry"] != 2 {
+		t.Errorf("impact depths wrong: %#v (want mid=1 entry=2)", imp)
+	}
+	if _, ok := imp["unrelated"]; ok {
+		t.Errorf("unrelated leaked into leaf impact set: %#v", imp)
+	}
+
+	// Cycle terminates: other<->unrelated both reach each other, no hang/overflow.
+	cyc := g.ImpactSet("other")
+	if cyc["unrelated"] != 1 {
+		t.Errorf("cycle impact wrong: %#v", cyc)
+	}
+
+	// The lens surfaces structural confidence and a blast-radius fact.
+	p, err := ExecuteLens(cfg, DefaultRegistry(), LensConfig{Name: "impact", Analyzer: "impact-set", SourceRoot: "src", Params: map[string]string{"name": "leaf"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conf, blast bool
+	for _, f := range p.Facts {
+		if f.ID == "confidence" && strings.HasPrefix(f.Text, "structural") {
+			conf = true
+		}
+		if f.ID == "blast" {
+			blast = true
+		}
+	}
+	if !conf || !blast {
+		t.Errorf("impact-set missing structural confidence/blast facts: %+v", p.Facts)
+	}
+
+	// call-graph-callers lens distinguishes from the lexical `callers`: the comment
+	// and string mentions of leaf must NOT appear as call sites.
+	cp, err := ExecuteLens(cfg, DefaultRegistry(), LensConfig{Name: "c", Analyzer: "call-graph-callers", SourceRoot: "src", Params: map[string]string{"name": "leaf"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines int
+	for _, bl := range cp.Blocks {
+		for _, l := range bl.Lines {
+			if !strings.HasPrefix(strings.TrimSpace(l), "//") {
+				lines++
+			}
+		}
+	}
+	if lines != 1 {
+		t.Errorf("call-graph-callers returned %d call lines, want 1 (mid only)", lines)
+	}
+}

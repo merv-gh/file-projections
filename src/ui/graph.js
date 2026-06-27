@@ -18,6 +18,18 @@ function loadGraph(lens){
 el("graphlens").onchange=function(){GRAPH=null;loadGraph(el("graphlens").value)};
 el("gcross").onchange=function(){if(GRAPH)renderGraph(GRAPH)};
 el("geffonly").onchange=function(){if(GRAPH)renderGraph(GRAPH)};
+el("gsearch")&&el("gsearch").addEventListener("input",debounce(function(){if(GRAPH&&el("graphwrap").style.display!=="none")renderGraph(GRAPH)},150));
+// graph / tables sub-view toggle within the Service-graph tab.
+function graphSubview(which){
+ var tables=which==="tables";
+ el("gvgraph").classList.toggle("on",!tables);el("gvtables").classList.toggle("on",tables);
+ el("graphwrap").style.display=tables?"none":"";
+ el("tableswrap").style.display=tables?"":"none";
+ el("gsearch").placeholder=tables?"filter tables…":"filter nodes…";
+ if(tables)loadTables();else if(GRAPH)renderGraph(GRAPH);
+}
+el("gvgraph")&&(el("gvgraph").onclick=function(){graphSubview("graph")});
+el("gvtables")&&(el("gvtables").onclick=function(){graphSubview("tables")});
 // legend chips toggle individual effect kinds on/off
 Array.prototype.forEach.call(document.querySelectorAll("#efflegend .effk"),function(chip){
  chip.onclick=function(){
@@ -29,11 +41,22 @@ var EFF_OFF={}; // effect kinds toggled off via the legend
 function graphNodesEdges(g){
  var crossOnly=el("gcross").checked;
  var effOnly=el("geffonly")&&el("geffonly").checked;
+ var q=(el("gsearch")&&el("gsearch").value||"").trim().toLowerCase();
  var edges=g.edges,nodes=g.nodes;
  if(crossOnly){
   edges=edges.filter(function(e){return e.cross});
   var keep={};edges.forEach(function(e){keep[e.from]=1;keep[e.to]=1});
   nodes=nodes.filter(function(n){return keep[n.id]});
+ }
+ // search filter: keep matching nodes + their direct neighbors so an edge still has
+ // both endpoints (so you see who a matched node connects to).
+ if(q){
+  var hit={};
+  nodes.forEach(function(n){if((n.label||"").toLowerCase().indexOf(q)>=0||(n.id||"").toLowerCase().indexOf(q)>=0)hit[n.id]=1});
+  var near={};
+  edges.forEach(function(e){if(hit[e.from]||hit[e.to]){near[e.from]=1;near[e.to]=1}});
+  Object.keys(hit).forEach(function(k){near[k]=1});
+  nodes=nodes.filter(function(n){return near[n.id]});
  }
  // effect filters: hide nodes whose effects are all toggled off; "side-effects only"
  // restricts to nodes that perform at least one (still-enabled) effect.
@@ -155,3 +178,47 @@ el("savecfg").onclick=function(){
   if(d.error){el("cfgmsg").textContent=d.error;el("cfgmsg").className="note err"}
   else{el("cfgmsg").textContent="saved · "+d.lenses+" lenses";el("cfgmsg").className="note ok";flash("config saved")}});
 };
+
+// ---- Tables view: find a table, see who writes/reads it, one-click trace ---------
+var TABLES=null;
+function loadTables(){
+ el("gstatus").textContent="scanning tables…";
+ fetch("/api/tables").then(function(r){return r.json()}).then(function(d){
+  TABLES=d.tables||[];el("gstatus").textContent="";renderTables();
+ }).catch(function(e){el("gstatus").textContent=String(e)});
+}
+function renderTables(){
+ var box=el("tableswrap");box.innerHTML="";
+ var q=(el("gsearch").value||"").trim().toLowerCase();
+ var tables=(TABLES||[]).filter(function(t){return !q||t.name.toLowerCase().indexOf(q)>=0});
+ if(!tables.length){box.innerHTML="<div class=note style=padding:1rem>No tables discovered. Add an app repo with JPA entities or SQL migrations to the project.</div>";return}
+ tables.forEach(function(t){
+  var card=document.createElement("div");card.className="tablecard";
+  var writers=t.writers||[],readers=t.readers||[];
+  var warn=writers.length>1?'<span class=tbug title="more than one place writes this table">⚠ '+writers.length+' writers</span>':'';
+  var mig=(t.migrations&&t.migrations.length)?'<span class=tmig>'+esc(t.migrations[0])+(t.mig_repo?(" · "+esc(t.mig_repo)):"")+'</span>':'';
+  function sites(list,kind){
+   if(!list.length)return '<div class=tnone>no '+kind+'</div>';
+   return list.map(function(s){
+    return '<div class=tsite><span class=tsmethod>'+esc(s.method)+'</span> <span class=tsrepo>'+esc(s.repo)+'</span>'+
+     '<span class=tsloc>'+esc(s.file.split("/").pop())+':'+s.line+'</span>'+
+     '<button class=ghost data-trace="'+esc(t.name)+'" data-m="'+esc(s.method)+'">trace</button>'+
+     '<div class=tscode>'+esc(s.code)+'</div></div>';
+   }).join("");
+  }
+  card.innerHTML='<div class=thead><b class=tname>▱ '+esc(t.name)+'</b>'+
+   (t.entity?'<span class=tentity>entity '+esc(t.entity)+'</span>':'')+mig+warn+
+   '<button class=ghost data-tracetable="'+esc(t.name)+'">trace table</button></div>'+
+   '<div class=tcols><div class=tcol><div class="tcolhd tcw">✎ writes here ('+writers.length+')</div>'+sites(writers,"writers")+'</div>'+
+   '<div class=tcol><div class="tcolhd tcr">↻ reads here ('+readers.length+')</div>'+sites(readers,"readers")+'</div></div>';
+  box.appendChild(card);
+ });
+ box.querySelectorAll("[data-tracetable]").forEach(function(b){b.onclick=function(){traceTable(b.dataset.tracetable)}});
+ box.querySelectorAll("[data-trace]").forEach(function(b){b.onclick=function(){traceTable(b.dataset.trace)}});
+}
+// jump to the Trace tab and run a trace for the table (reuses the trace panel).
+function traceTable(name){
+ tab("trace");if(window.loadWorkspace)loadWorkspace();
+ var inp=el("trsym");if(inp){inp.value=name;}
+ if(typeof runTrace==="function")runTrace();
+}

@@ -76,6 +76,7 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/projects", s.handleProjects)
 	mux.HandleFunc("/api/trace-symbols", s.handleTraceSymbols)
 	mux.HandleFunc("/api/lens-templates", s.handleLensTemplates)
+	mux.HandleFunc("/api/tables", s.handleTables)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
 	return http.ListenAndServe(addr, mux)
 }
@@ -1300,4 +1301,56 @@ func projName(p *ProjectConfig) string {
 		return ""
 	}
 	return p.Name
+}
+
+// handleTables serves the Tables view: every discovered table in the active project
+// with its entity/migration, and the writers/readers (call sites) so the UI can list
+// "who writes here / who reads here" and offer a one-click trace per table.
+func (s *uiServer) handleTables(w http.ResponseWriter, r *http.Request) {
+	projName := strings.TrimSpace(r.URL.Query().Get("project"))
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	proj := activeProjectFor(cfg, projName)
+	if proj == nil {
+		writeJSON(w, 200, map[string]any{"tables": []any{}})
+		return
+	}
+	ws := workspaceFromProject(cfg, proj, false)
+	idx := buildTypeIndex(cfg, ws)
+	g := buildTraceGraph(idx)
+	dbm := buildDBModel(cfg, ws, idx)
+
+	type site struct {
+		Method string `json:"method"`
+		Repo   string `json:"repo"`
+		File   string `json:"file"`
+		Line   int    `json:"line"`
+		Code   string `json:"code"`
+		Write  bool   `json:"write"`
+	}
+	type tableView struct {
+		Name       string   `json:"name"`
+		Entity     string   `json:"entity,omitempty"`
+		Mapping    string   `json:"mapping,omitempty"`
+		Migrations []string `json:"migrations,omitempty"`
+		MigRepo    string   `json:"mig_repo,omitempty"`
+		Writers    []site   `json:"writers"`
+		Readers    []site   `json:"readers"`
+	}
+	var out []tableView
+	for _, name := range dbm.sortedTableNames() {
+		ti := dbm.Tables[name]
+		tv := tableView{Name: name, Entity: ti.Entity, Mapping: ti.mapNote, Migrations: ti.Migrations, MigRepo: ti.MigRepo}
+		for _, h := range g.tableAccessSites(dbm, name) {
+			sv := site{Method: h.owner.label(), Repo: h.owner.typ.Repo, File: h.owner.typ.File, Line: h.line, Code: h.code, Write: h.write}
+			if h.write {
+				tv.Writers = append(tv.Writers, sv)
+			} else {
+				tv.Readers = append(tv.Readers, sv)
+			}
+		}
+		out = append(out, tv)
+	}
+	writeJSON(w, 200, map[string]any{"tables": out})
 }

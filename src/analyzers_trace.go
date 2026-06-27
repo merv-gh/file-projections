@@ -329,27 +329,25 @@ func TraceToLine(cfg Config, lens LensConfig, ws *Workspace) (Projection, error)
 	return p, nil
 }
 
-// traceToTable answers "how do we end up writing to / reading from <table>?". It
-// finds every method whose body calls a Spring Data repository for the table, traces
-// each to its entrypoints (reusing the path engine), and appends a table terminal
-// marker to each answer.
-func traceToTable(cfg Config, lens LensConfig, g *traceGraph, dbm *DBModel, table string, maxPaths int) (Projection, error) {
-	// Repository type names that manage this table.
+// tableAccessSite is one place a repository call reads/writes a table, with the
+// containing method. Shared by the table trace and the /api/tables view.
+type tableAccessSite struct {
+	owner *tMethod
+	line  int
+	code  string
+	write bool
+}
+
+// tableAccessSites finds every call site that reads/writes the given table through a
+// Spring Data repository field of one of the table's managing repository types.
+func (g *traceGraph) tableAccessSites(dbm *DBModel, table string) []tableAccessSite {
 	repoTypes := map[string]bool{}
 	for _, rt := range dbm.RepoTables {
 		if rt.Table == table {
 			repoTypes[rt.RepoType.Name] = true
 		}
 	}
-	// Find call sites: any method calling <repoField>.<writeOrRead>(…) where the
-	// receiver field's declared type is one of the managing repositories.
-	type hit struct {
-		owner *tMethod
-		line  int
-		code  string
-		write bool
-	}
-	var hits []hit
+	var hits []tableAccessSite
 	for _, m := range g.methods {
 		locals := map[string]string{}
 		for _, l := range m.method.Lines {
@@ -369,10 +367,19 @@ func traceToTable(cfg Config, lens LensConfig, g *traceGraph, dbm *DBModel, tabl
 				if !w && !r {
 					continue
 				}
-				hits = append(hits, hit{owner: m, line: m.method.Start + li, code: strings.TrimSpace(raw), write: w})
+				hits = append(hits, tableAccessSite{owner: m, line: m.method.Start + li, code: strings.TrimSpace(raw), write: w})
 			}
 		}
 	}
+	return hits
+}
+
+// traceToTable answers "how do we end up writing to / reading from <table>?". It
+// finds every method whose body calls a Spring Data repository for the table, traces
+// each to its entrypoints (reusing the path engine), and appends a table terminal
+// marker to each answer.
+func traceToTable(cfg Config, lens LensConfig, g *traceGraph, dbm *DBModel, table string, maxPaths int) (Projection, error) {
+	hits := g.tableAccessSites(dbm, table)
 
 	p := Projection{Sync: "view-only"}
 	var summary []string

@@ -35,3 +35,8 @@ fixtures/*/fp.config.json
 review.md
 # local demos (gitignored)
 /demos/
+
+# e2e (local)
+node_modules/
+package-lock.json
+demos/webm/

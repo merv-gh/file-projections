@@ -186,3 +186,28 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
 .nodelegend .nlk{display:inline-flex;align-items:center;gap:.3rem}
 .nodelegend .nlk i{width:1.1rem;height:.6rem;border-radius:2px;display:inline-block}
 .nodelegend .nlk .el{width:1.1rem;height:0;border-top:2px solid;display:inline-block}
+
+/* graph search + sub-view toggle + tables view */
+.gsearch{width:12rem;font-size:.78rem;padding:.2rem .5rem}
+.gsub{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.gsub button{border:none;border-radius:0;background:#fbf8f0;padding:.2rem .6rem;font-size:.78rem}
+.gsub button.on{background:var(--accent);color:#fff}
+.tablecard{border:1px solid var(--line);border-radius:8px;margin:.5rem 0;background:var(--panel)}
+.thead{display:flex;align-items:center;gap:.5rem;padding:.45rem .6rem;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tname{font-size:.95rem;color:#5a3f7a}
+.tentity{font-size:.72rem;color:var(--mut);font-family:ui-monospace,Menlo,monospace}
+.tmig{font-size:.7rem;color:var(--mut);font-family:ui-monospace,Menlo,monospace;background:#ece5d8;padding:.02rem .4rem;border-radius:4px}
+.tbug{font-size:.72rem;color:#fff;background:#b54848;padding:.05rem .45rem;border-radius:999px;font-weight:600}
+.thead [data-tracetable]{margin-left:auto}
+.tcols{display:flex;gap:0}
+.tcol{flex:1;padding:.5rem .6rem}
+.tcol+.tcol{border-left:1px solid var(--line)}
+.tcolhd{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.35rem}
+.tcw{color:#b54848}.tcr{color:#7a8a3a}
+.tsite{border:1px solid var(--line);border-radius:6px;padding:.3rem .45rem;margin:.25rem 0;background:#fbf8f0}
+.tsmethod{font-weight:600;font-size:.82rem}
+.tsrepo{font-size:.7rem;color:var(--mut);margin-left:.3rem}
+.tsloc{font-size:.7rem;color:var(--accent);font-family:ui-monospace,Menlo,monospace;margin-left:.3rem}
+.tsite [data-trace]{float:right;padding:.05rem .5rem;font-size:.72rem}
+.tscode{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:var(--mut);margin-top:.2rem;white-space:pre-wrap}
+.tnone{font-size:.78rem;color:var(--mut);font-style:italic}

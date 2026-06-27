@@ -44,7 +44,9 @@
 
    <div id=graphpane style=display:none>
     <div class=graphctl>
+     <div class=gsub><button id=gvgraph class=on>Graph</button><button id=gvtables>Tables</button></div>
      <select id=graphlens></select>
+     <input id=gsearch class=gsearch placeholder="filter nodes…" autocomplete=off>
      <label class=gchk><input type=checkbox id=gcross> cross-service only</label>
      <label class=gchk><input type=checkbox id=geffonly> side-effects only</label>
      <button class=ghost id=gmermaid>Copy mermaid</button>
@@ -64,6 +66,7 @@
      <span class=nlk><span class=el style="background:#7a8a3a"></span>reads-from</span>
     </div>
     <div id=graphwrap><div id=graphhint class=note>Pick a <code>service-graph</code> lens. Click a node to drill into its assumptions &amp; object timeline. Colored dots on a node show its side effects (IO/network/db/process).</div></div>
+    <div id=tableswrap style=display:none></div>
     <div id=mermaidbox style=display:none><div class=row style="justify-content:space-between"><h2 style=margin:0>mermaid</h2><button class=ghost id=gmclose>close</button></div><textarea id=mermaidtext rows=14 readonly></textarea></div>
    </div>
 

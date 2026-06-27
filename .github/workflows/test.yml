@@ -23,4 +23,4 @@ jobs:
         # so the suite is fully green on a stock CI runner.
         run: go test ./...
       - name: build
-        run: go build -o bin/file-projections .
+        run: go build -o bin/file-projections ./src

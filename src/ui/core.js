@@ -140,7 +140,8 @@ function openPicker(){
 function parentOf(p){var i=p.lastIndexOf("/");return i<0?"":p.slice(0,i)}
 el("srchange").onclick=openPicker;
 
-// ---- clone a github repo (server-side shallow clone, then use as source root) -
+// ---- clone a github repo (legacy single-root path; project picker is preferred) -
+if(el("clonebtn")){
 el("clonebtn").onclick=function(){
  var url=el("cloneurl").value.trim();if(!url){flash("paste a git URL or owner/repo",1);return}
  el("clonebtn").disabled=true;flash("cloning "+url+"…");
@@ -153,3 +154,4 @@ el("clonebtn").onclick=function(){
   }).catch(function(e){el("clonebtn").disabled=false;flash(String(e),1)});
 };
 el("cloneurl").addEventListener("keydown",function(e){if(e.key==="Enter")el("clonebtn").click()});
+}

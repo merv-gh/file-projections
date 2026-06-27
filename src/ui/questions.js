@@ -62,9 +62,6 @@ function renderQuestionCard(q){
  var ask = document.createElement("button"); ask.textContent = "Ask"; ask.className = "qask";
  ask.onclick = function(){ runQuestion(q); };
  foot.appendChild(ask);
- var tag = document.createElement("span"); tag.className = "conf conf-"+q.conf; tag.textContent = q.conf;
- tag.title = CONF_NOTE[q.conf] || q.conf;
- foot.appendChild(tag);
  card.appendChild(foot);
  return card;
 }
@@ -108,9 +105,9 @@ function runQuestion(q){
     return;
    }
    var badge = el("answerbadge"); badge.style.display = "";
-   badge.className = "answerbadge conf-"+(d.confidence||"lexical");
-   badge.innerHTML = "<b>"+esc(q.template.replace(/\{[a-z_]+\}/gi, "…"))+"</b> · <span class=conf conf-"+
-    esc(d.confidence||"lexical")+">"+esc(d.confidence||"")+"</span> "+esc(d.conf_note||CONF_NOTE[d.confidence]||"")+
+   badge.className = "answerbadge";
+   badge.innerHTML = "<b>"+esc(q.template.replace(/\{[a-z_]+\}/gi, "…"))+"</b> · <span class=confword>"+
+    esc(d.confidence||"")+"</span> "+esc(d.conf_note||CONF_NOTE[d.confidence]||"")+
     " · via <code>"+esc(d.analyzer||"")+"</code>";
    el("out").className = "";
    el("out").textContent = d.body || "(no results)";

@@ -199,6 +199,30 @@ func (g *traceGraph) methodsFor(types []*JavaType, method string) []*tMethod {
 	return out
 }
 
+// interestingLine picks the most useful line to aim a symbol trace at: the first
+// side-effect (io/network/db/process) line in the body, else the first call line,
+// else the method signature.
+func interestingLine(m *tMethod) int {
+	for li, raw := range m.method.Lines {
+		code := stripCallNoise(raw)
+		if strings.TrimSpace(code) == "" {
+			continue
+		}
+		for _, cm := range javaSEMarkers {
+			if cm.re.MatchString(code) {
+				return m.method.Start + li
+			}
+		}
+	}
+	for li, raw := range m.method.Lines {
+		code := stripCallNoise(raw)
+		if tQualCallRE.MatchString(code) && li > 0 {
+			return m.method.Start + li
+		}
+	}
+	return m.method.Start
+}
+
 // tracePath is one answer: an ordered chain of edges from an entrypoint to the target
 // method, plus whether it actually starts at an entrypoint.
 type tracePath struct {
@@ -208,28 +232,43 @@ type tracePath struct {
 }
 
 // TraceToLine is the analyzer: build the workspace graph, locate the target method,
-// reverse-search to entrypoints, and emit one projection per distinct path.
+// reverse-search to entrypoints, and emit one projection per distinct path. The
+// target is located either by a symbol name (preferred — params.symbol) or by an
+// explicit file:line (deep-link / back-compat).
 func TraceToLine(cfg Config, lens LensConfig, ws *Workspace) (Projection, error) {
 	repo := strings.TrimSpace(lens.Params["repo"])
 	file := strings.TrimSpace(lens.Params["file"])
+	symbol := strings.TrimSpace(lens.Params["symbol"])
 	line := atoi(lens.Params["line"])
-	if file == "" || line <= 0 {
-		return Projection{}, fmt.Errorf("trace-to-line: params.file and params.line are required")
+	if symbol == "" && (file == "" || line <= 0) {
+		return Projection{}, fmt.Errorf("trace-to-line: params.symbol (or file+line) is required")
 	}
 	maxPaths := atoi(lens.Params["max_paths"])
 	if maxPaths <= 0 {
 		maxPaths = 8
 	}
 	if len(ws.Repos) == 0 {
-		return Projection{}, fmt.Errorf("trace-to-line: workspace has no repos — add one (clone or link) first")
+		return Projection{}, fmt.Errorf("trace-to-line: no repos in scope — add a project (folder or clone) first")
 	}
 
 	idx := buildTypeIndex(cfg, ws)
 	g := buildTraceGraph(idx)
 
-	target := g.methodAt(repo, file, line)
+	var target *tMethod
+	if symbol != "" {
+		cands := g.methodsBySymbol(symbol)
+		if len(cands) == 0 {
+			return Projection{}, fmt.Errorf("trace-to-line: no method/type named %q in the selected project", symbol)
+		}
+		target = cands[0]
+		// Symbol mode: aim at the most interesting line in the target body — the
+		// first side-effect/call line — else the signature.
+		line = interestingLine(target)
+	} else {
+		target = g.methodAt(repo, file, line)
+	}
 	if target == nil {
-		return Projection{}, fmt.Errorf("trace-to-line: no method found containing %s:%d (repo=%q)", file, line, repo)
+		return Projection{}, fmt.Errorf("trace-to-line: could not locate %q", coalesce(symbol, fmt.Sprintf("%s:%d", file, line)))
 	}
 
 	paths := g.tracePaths(target, maxPaths)
@@ -299,6 +338,44 @@ func (g *traceGraph) methodAt(repo, file string, line int) *tMethod {
 		}
 	}
 	return best
+}
+
+// methodsBySymbol resolves a user-typed symbol (a method name "pay", a qualified
+// "RealPaymentService.pay", or a type name "RealPaymentService") to candidate target
+// methods, ordered with non-entrypoint methods first (you usually trace TO a worker,
+// not an entrypoint). For a bare type name, its declared methods are candidates.
+func (g *traceGraph) methodsBySymbol(symbol string) []*tMethod {
+	symbol = strings.TrimSpace(symbol)
+	typeName, methName := "", symbol
+	if i := strings.LastIndex(symbol, "."); i >= 0 {
+		typeName, methName = symbol[:i], symbol[i+1:]
+	}
+	typeName = simpleTypeName(typeName)
+	var out []*tMethod
+	for _, m := range g.methods {
+		if typeName != "" && m.typ.Name != typeName {
+			continue
+		}
+		if m.method.Name == methName {
+			out = append(out, m)
+		}
+	}
+	// Bare type name: offer the type's own methods (e.g. trace "Ledger" -> write()).
+	if len(out) == 0 {
+		if t := g.idx.findType(simpleTypeName(symbol)); t != nil {
+			for _, m := range g.byType[t.Name] {
+				out = append(out, m)
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ei, ej := out[i].entry != "", out[j].entry != ""
+		if ei != ej {
+			return ej // non-entry first
+		}
+		return out[i].typ.Name < out[j].typ.Name
+	})
+	return out
 }
 
 // tracePaths reverse-BFS from target to entrypoints, returning distinct paths
@@ -498,20 +575,23 @@ func pathHeadline(p tracePath) string {
 	return strings.Join(parts, " → ")
 }
 
-// AnalyzeTraceToLine is the registered analyzer entry: it loads the workspace (or a
-// param-injected one for tests/ad-hoc) and runs the trace.
+// AnalyzeTraceToLine is the registered analyzer entry: it builds the workspace from
+// config (the active project, the single source of truth) or a param-injected one
+// (tests / deep-links) and runs the trace.
 func AnalyzeTraceToLine(cfg Config, lens LensConfig) (Projection, error) {
-	ws, err := resolveTraceWorkspace(lens)
+	ws, err := resolveTraceWorkspace(cfg, lens)
 	if err != nil {
 		return Projection{}, err
 	}
 	return TraceToLine(cfg, lens, ws)
 }
 
-// resolveTraceWorkspace builds the workspace for a trace: from the lens `repos` param
-// (JSON [{name,path}]) when present (tests / explicit UI selection), else the
-// user-level workspace.
-func resolveTraceWorkspace(lens LensConfig) (*Workspace, error) {
+// resolveTraceWorkspace builds the workspace for a trace, in priority order:
+//  1. the lens `repos` param (JSON [{name,path}]) — tests / explicit selection;
+//  2. the active config project (the single source of truth), honoring
+//     params.include_libraries / params.project;
+//  3. the legacy user-level workspace (~/.file-projections) as a last resort.
+func resolveTraceWorkspace(cfg Config, lens LensConfig) (*Workspace, error) {
 	if raw := strings.TrimSpace(lens.Params["repos"]); raw != "" {
 		var repos []WorkspaceRepo
 		if err := json.Unmarshal([]byte(raw), &repos); err != nil {
@@ -524,6 +604,16 @@ func resolveTraceWorkspace(lens LensConfig) (*Workspace, error) {
 			}
 		}
 		return ws, nil
+	}
+	var proj *ProjectConfig
+	if name := strings.TrimSpace(lens.Params["project"]); name != "" {
+		proj = projectByName(cfg, name)
+	} else {
+		proj = activeProject(cfg)
+	}
+	if proj != nil {
+		appOnly := lens.Params["include_libraries"] == "false" || lens.Params["include_libraries"] == "0"
+		return workspaceFromProject(cfg, proj, appOnly), nil
 	}
 	return LoadWorkspace()
 }

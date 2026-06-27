@@ -60,8 +60,24 @@ func AnalyzeServiceGraph(cfg Config, lens LensConfig) (Projection, error) {
 	if err := json.Unmarshal([]byte(coalesce(lens.Params["services"], "[]")), &services); err != nil {
 		return Projection{}, fmt.Errorf("service-graph: bad services param: %w", err)
 	}
+	// Cross-repo (CROSS-REPO-UX.md §C): with no explicit services param but an active
+	// config project, derive the graph from the project's repos. A Java project builds
+	// a class-level cross-repo graph (types + call/DI edges) so controllers in a
+	// library and their concrete overrides in the app appear as one graph.
 	if len(services) == 0 {
-		return Projection{}, errors.New("service-graph: params.services is required (JSON [{name,root,lang}])")
+		var proj *ProjectConfig
+		if name := strings.TrimSpace(lens.Params["project"]); name != "" {
+			proj = projectByName(cfg, name)
+		} else {
+			proj = activeProject(cfg)
+		}
+		if proj != nil {
+			appOnly := lens.Params["include_libraries"] == "false" || lens.Params["include_libraries"] == "0"
+			return serviceGraphFromProject(cfg, proj, appOnly)
+		}
+	}
+	if len(services) == 0 {
+		return Projection{}, errors.New("service-graph: params.services is required (JSON [{name,root,lang}]) — or define a workspace project in config.json")
 	}
 	pkgMap := map[string]string{}
 	if p := lens.Params["packages"]; p != "" {
@@ -241,6 +257,111 @@ func sgIsTestTS(path string) bool {
 		strings.HasSuffix(b, ".spec.ts") || strings.HasSuffix(b, ".spec.tsx")
 }
 
+// serviceGraphFromProject builds a cross-repo, class-level graph from a config
+// project (CROSS-REPO-UX.md §C). Each repo is a "service"; each Java type is a node
+// (entrypoint when it declares a Spring-mapped method); resolved call edges (incl.
+// dependency-inversion override hops) become edges, cross=true when they span repos.
+// This reuses the trace engine's type index + dispatch so the service graph and the
+// trace agree on what calls what across the boundary.
+func serviceGraphFromProject(cfg Config, proj *ProjectConfig, appOnly bool) (Projection, error) {
+	ws := workspaceFromProject(cfg, proj, appOnly)
+	if len(ws.Repos) == 0 {
+		return Projection{}, fmt.Errorf("service-graph: project %q has no repos", proj.Name)
+	}
+	idx := buildTypeIndex(cfg, ws)
+	tg := buildTraceGraph(idx)
+
+	g := sgGraph{}
+	repoLang := map[string]string{}
+	for _, r := range ws.Repos {
+		g.Services = append(g.Services, sgService{Name: r.Name, Root: r.Path, Lang: "java"})
+		repoLang[r.Name] = "java"
+	}
+
+	// Node per type. A type is an entrypoint if any method carries a Spring mapping.
+	nodeID := func(t *JavaType) string { return t.Repo + "::" + t.Name }
+	added := map[string]bool{}
+	effOf := func(t *JavaType) []string {
+		seen := map[string]bool{}
+		var out []string
+		for _, m := range t.Methods {
+			for _, k := range methodEffectKinds(m) {
+				if !seen[k] {
+					seen[k] = true
+					out = append(out, k)
+				}
+			}
+		}
+		return out
+	}
+	for _, t := range idx.all {
+		id := nodeID(t)
+		if added[id] {
+			continue
+		}
+		added[id] = true
+		kind := "file"
+		op, method := "", ""
+		for _, m := range t.Methods {
+			if ann := entryAnnotation(m); ann != "" {
+				kind = "entrypoint"
+				op = appendCSV(op, t.Name+"."+m.Name)
+				if method == "" {
+					method = m.Name
+				}
+			}
+		}
+		g.Nodes = append(g.Nodes, sgNode{
+			ID: id, Label: t.Name, Service: t.Repo, Lang: "java", Kind: kind,
+			File: t.File, Line: t.Line, Op: op, Method: method, Effects: effOf(t),
+		})
+	}
+
+	// Edges from resolved call sites (deduped at the type level). DI/cross hops are
+	// exactly what the trace surfaces; here they become graph edges.
+	seen := map[string]bool{}
+	for _, caller := range tg.methods {
+		for _, e := range tg.callSitesOf(caller) {
+			from, to := nodeID(e.caller.typ), nodeID(e.callee.typ)
+			if from == to {
+				continue
+			}
+			key := from + ">" + to
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			label := ""
+			if e.di {
+				label = "DI→" + e.callee.typ.Name
+			}
+			g.Edges = append(g.Edges, sgEdge{From: from, To: to, Kind: "api-call", Label: label, Cross: e.caller.typ.Repo != e.callee.typ.Repo})
+		}
+	}
+
+	cross := 0
+	for _, e := range g.Edges {
+		if e.Cross {
+			cross++
+		}
+	}
+	body := []string{fmt.Sprintf("service-graph (cross-repo): %d repos, %d types, %d edges (%d cross-repo)", len(g.Services), len(g.Nodes), len(g.Edges), cross)}
+	for _, svc := range g.Services {
+		n := 0
+		for _, nd := range g.Nodes {
+			if nd.Service == svc.Name {
+				n++
+			}
+		}
+		body = append(body, fmt.Sprintf("  %-16s java  (%d types)", svc.Name, n))
+	}
+	gj, _ := json.Marshal(g)
+	p := Projection{Sync: "view-only"}
+	p.Blocks = append(p.Blocks, ProjectionBlock{ID: "service-graph", Tool: "service-graph", Mode: "graph", Lines: body})
+	p.Facts = append(p.Facts, ProjectionFact{ID: "graph", Tool: "service-graph", Text: string(gj)})
+	return p, nil
+}
+
 // appendCSV appends item to a comma-separated list, de-duplicating.
 func appendCSV(csv, item string) string {
 	if csv == "" {
@@ -375,6 +496,41 @@ func sgLangID(lang string) string {
 
 // fileEffectKinds returns the distinct side-effect kinds a file performs, using the
 // precompiled language markers — so service-graph nodes know what they touch.
+// javaSEMarkers lazily compiles the Java side-effect markers once for method-level
+// effect tagging in the cross-repo graph.
+var javaSEMarkers = func() []compiledMarker {
+	var out []compiledMarker
+	if l := languageByID("java"); l != nil {
+		for _, m := range l.SideEffects {
+			if re, err := regexp.Compile(m.Regex); err == nil {
+				out = append(out, compiledMarker{kind: m.Kind, label: m.Label, re: re})
+			}
+		}
+	}
+	return out
+}()
+
+// methodEffectKinds returns the distinct side-effect kinds a Java method's body
+// performs (io/network/db/process), for tagging type nodes in the cross-repo graph.
+func methodEffectKinds(m JavaMethod) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range m.Lines {
+		code := stripLineComment(raw)
+		if strings.TrimSpace(code) == "" {
+			continue
+		}
+		for _, cm := range javaSEMarkers {
+			if !seen[cm.kind] && cm.re.MatchString(code) {
+				seen[cm.kind] = true
+				out = append(out, cm.kind)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func fileEffectKinds(path string, markers []compiledMarker) []string {
 	if len(markers) == 0 {
 		return nil

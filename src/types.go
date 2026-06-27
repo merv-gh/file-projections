@@ -23,7 +23,33 @@ type Config struct {
 	ProjectionsDir string                `json:"projections_dir"`
 	ExcludeDirs    []string              `json:"exclude_dirs"`
 	Tools          map[string]ToolConfig `json:"tools,omitempty"`
-	Lenses         []LensConfig          `json:"lenses"`
+	// Workspace is the cross-repo projects model — the single source of truth for
+	// "what repos form a logical service" (CROSS-REPO-UX.md). Optional; absent for
+	// single-repo configs.
+	Workspace *WorkspaceConfig `json:"workspace,omitempty"`
+	Lenses    []LensConfig     `json:"lenses"`
+}
+
+// WorkspaceConfig is the cross-repo model embedded in config.json: a set of named
+// projects (each an app repo + its internal libraries) and which one is active.
+type WorkspaceConfig struct {
+	Projects []ProjectConfig `json:"projects"`
+	Active   string          `json:"active,omitempty"`
+}
+
+// ProjectConfig is one logical service: an app repo plus the internal libraries it
+// depends on. Repos are analyzed together for symbol search, trace and service graph.
+type ProjectConfig struct {
+	Name  string       `json:"name"`
+	Repos []RepoConfig `json:"repos"`
+}
+
+// RepoConfig is one repo in a project. Path is relative to cfg.Root (or absolute).
+// Role is "app" | "library" (drives the include-libraries scope and entrypoint bias).
+type RepoConfig struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Role string `json:"role,omitempty"`
 }
 
 // ToolConfig describes how to invoke an external tool that may not be installed

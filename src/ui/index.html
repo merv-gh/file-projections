@@ -4,8 +4,8 @@
 </head><body>
 <header>
  <b>file-projections</b>
- <span class=chip><span class=lbl>source</span><span class=val id=srval>.</span><button class=ghost id=srchange>Change…</button></span>
- <span class=clonebar><input id=cloneurl placeholder="github.com/owner/repo to clone" autocomplete=off><button class=ghost id=clonebtn>Clone</button></span>
+ <span class=chip><span class=lbl>project</span><select id=projsel class=projsel></select><button class=ghost id=projadd title="Add or manage projects">＋</button></span>
+ <span class=chip id=srcchip style=display:none><span class=lbl>source</span><span class=val id=srval>.</span><button class=ghost id=srchange>Change…</button></span>
  <span class=langtag id=langtag>—</span>
  <span class=note id=cfgpath style=color:var(--mut)></span>
  <span style=margin-left:auto id=msg></span>
@@ -87,27 +87,39 @@
 
   <div id=tracepane style=display:none>
    <div class=traceintro>
-    <h2 style=margin:.2rem 0>How do we end up at a line?</h2>
-    <p class=hint>Cross-repo, dependency-inversion-aware. Register your app repo + its internal libraries below, then ask for every control path from a (possibly library) entrypoint to a line — guards, loops and abstract→concrete override hops resolved across repos.</p>
+    <h2 style=margin:.2rem 0>How do we end up here?</h2>
+    <p class=hint>Type a symbol — the active project (and optionally its libraries) is searched automatically. Every control path from an entrypoint is shown, with guards, loops and abstract→concrete override hops resolved across repos. Manage repos from the <b>project</b> picker up top.</p>
    </div>
-   <div class=wsbox>
-    <div class=row style="gap:.4rem;align-items:flex-end;flex-wrap:wrap">
-     <div style=flex:2><label>Add a local folder (link)</label><input id=wslink placeholder="/path/to/your/repo" autocomplete=off></div>
-     <button class=ghost id=wsaddlink>Link folder</button>
-     <div style=flex:2><label>or clone a git repo</label><input id=wsclone placeholder="github.com/org/lib or URL" autocomplete=off></div>
-     <button class=ghost id=wsaddclone>Clone</button>
-    </div>
-    <div id=wsrepos class=wsrepos></div>
-   </div>
-   <div class=row style="gap:.4rem;align-items:flex-end;margin-top:.6rem;flex-wrap:wrap">
-    <div style=flex:1><label>repo</label><select id=trrepo></select></div>
-    <div style=flex:2><label>file</label><input id=trfile placeholder="RealPaymentService.java" autocomplete=off></div>
-    <div style=width:5rem><label>line</label><input id=trline type=number placeholder="29"></div>
+   <div class=traceask>
+    <div class=field style=flex:1><input id=trsym placeholder="symbol — e.g. pay, RealPaymentService.pay, Ledger" autocomplete=off><div id=trsymac class=ac></div></div>
+    <label class=gchk title="Search the project's internal libraries too, so paths can cross repo boundaries"><input type=checkbox id=trlibs checked> include libraries</label>
     <button id=trrun>Trace</button>
    </div>
    <div id=tracestatus class=note></div>
    <div id=traceout></div>
   </div>
+ </div>
+</div>
+<div id=projmodal class=modal style=display:none>
+ <div class=modalbox>
+  <div class=row style="justify-content:space-between;align-items:center"><h2 style=margin:0>Projects</h2><button class=ghost id=projclose>close</button></div>
+  <p class=hint>A project is your app repo plus its internal libraries. Saved to <code>config.json</code> — the single source of truth.</p>
+  <div id=projlist class=projlist></div>
+  <div class=projnew>
+   <label>New project</label>
+   <div class=row style="gap:.4rem"><input id=projname placeholder="project name e.g. shop" autocomplete=off><button class=ghost id=projnewbtn>Create</button></div>
+  </div>
+  <div class=projaddrepo>
+   <label>Add a repo to <b id=projaddtarget>—</b></label>
+   <div class=row style="gap:.4rem;flex-wrap:wrap;align-items:flex-end">
+    <div style=flex:2><input id=reppath placeholder="/path/to/repo (folder)" autocomplete=off></div>
+    <span class=note>or</span>
+    <div style=flex:2><input id=repurl placeholder="github.com/org/lib (clone)" autocomplete=off></div>
+    <select id=reprole><option value=app>app</option><option value=library>library</option></select>
+    <button class=ghost id=repadd>Add</button>
+   </div>
+  </div>
+  <span class=note id=projmsg></span>
  </div>
 </div>
 <script src="/ui/core.js"></script>

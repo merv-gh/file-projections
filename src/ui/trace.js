@@ -1,59 +1,90 @@
-// trace.js — the cross-repo, dependency-inversion-aware trace-to-line panel.
-// Registers the workspace repos (link a folder or clone), then asks for every
-// control path from a (possibly library) entrypoint to a line. Talks to
-// /api/workspace and /api/trace. Plain DOM, no framework (matches the other panels).
+// trace.js — cross-repo trace tab + the project picker (top bar + modal).
+// Trace by SYMBOL: the active config project is searched automatically; optionally
+// its libraries too. No file/line/repo entry. Project management writes config.json
+// via /api/projects (the single source of truth). Plain DOM, no framework.
 
-var WS=null;
+var PROJECTS = { projects: [], active: "" };
+var PROJ_ADD_TARGET = "";
 
-function loadWorkspace(){
- fetch("/api/workspace").then(function(r){return r.json()}).then(function(d){
-  WS=d; renderWorkspace(d);
- }).catch(function(e){el("tracestatus").textContent="workspace error: "+e});
+// ---- project picker (top bar) ------------------------------------------------
+function loadProjects(view){
+ var done = function(d){ PROJECTS = d || {projects:[],active:""}; renderProjSelect(); renderProjList(); if(window.refreshGraphScope)refreshGraphScope(); };
+ if(view){ done(view); return; }
+ fetch("/api/projects").then(function(r){return r.json()}).then(done).catch(function(){});
 }
 
-function renderWorkspace(d){
- var box=el("wsrepos"); box.innerHTML="";
- var repos=(d&&d.repos)||[];
- var sel=el("trrepo"); sel.innerHTML="<option value=''>(any repo)</option>";
- if(!repos.length){ box.innerHTML="<p class=hint>No repos yet. Link your app repo and its internal libraries (or clone them) to trace across the boundary.</p>"; return; }
- repos.forEach(function(r){
-  var card=document.createElement("div"); card.className="wsrepo";
-  var grp=r.group?("<span class=wsgroup>"+esc(r.group)+"</span>"):"<span class=wsgroup style=color:var(--mut)>no gradle group</span>";
-  var deps=(r.internal_deps&&r.internal_deps.length)?("<span class=wsdep>↳ internal: "+r.internal_deps.map(esc).join(", ")+"</span>"):"";
-  card.innerHTML="<div class=wsrow><b>"+esc(r.name)+"</b> <span class=wskind>"+esc(r.kind)+"</span> "+grp+deps+
-    "<button class=ghost data-rm='"+esc(r.name)+"' title='remove'>×</button></div>"+
-    "<div class=wspath>"+esc(r.path)+"</div>";
+function renderProjSelect(){
+ var sel = el("projsel"); if(!sel) return;
+ var ps = PROJECTS.projects || [];
+ if(!ps.length){ sel.innerHTML = "<option value=''>(no project)</option>"; el("srcchip").style.display=""; return; }
+ el("srcchip").style.display = "none";
+ sel.innerHTML = ps.map(function(p){
+  var on = p.name === PROJECTS.active ? " selected" : "";
+  return "<option value='"+esc(p.name)+"'"+on+">"+esc(p.name)+" ("+ (p.repos||[]).length +" repos)</option>";
+ }).join("");
+ sel.onchange = function(){ setActiveProject(sel.value); };
+}
+
+function setActiveProject(name){
+ postProjects({action:"set-active",project:name}, function(){ if(typeof reDetect==="function")reDetect(); });
+}
+
+function activeProjectObj(){ return (PROJECTS.projects||[]).filter(function(p){return p.name===PROJECTS.active})[0] || (PROJECTS.projects||[])[0]; }
+
+// ---- project modal -----------------------------------------------------------
+function openProjModal(){ el("projmodal").style.display=""; PROJ_ADD_TARGET = PROJECTS.active || ""; el("projaddtarget").textContent = PROJ_ADD_TARGET || "(create a project first)"; renderProjList(); }
+function closeProjModal(){ el("projmodal").style.display="none"; }
+
+function renderProjList(){
+ var box = el("projlist"); if(!box) return;
+ var ps = PROJECTS.projects || [];
+ if(!ps.length){ box.innerHTML = "<p class=hint>No projects yet. Create one below, then add your app repo and its libraries.</p>"; return; }
+ box.innerHTML = "";
+ ps.forEach(function(p){
+  var card = document.createElement("div"); card.className = "projcard"+(p.name===PROJECTS.active?" on":"");
+  var repos = (p.repos||[]).map(function(r){
+   var dep = (r.internal_deps&&r.internal_deps.length)?(" <span class=wsdep>↳ "+r.internal_deps.map(esc).join(", ")+"</span>"):"";
+   return "<div class=wsrepo><div class=wsrow><b>"+esc(r.name)+"</b> <span class=wskind>"+esc(r.role||"app")+"</span> <span class=wsgroup>"+esc(r.group||"no group")+"</span>"+dep+
+     "<button class=ghost data-rmrepo='"+esc(r.name)+"' data-proj='"+esc(p.name)+"'>×</button></div><div class=wspath>"+esc(r.path)+"</div></div>";
+  }).join("");
+  card.innerHTML = "<div class=projhd><b>"+esc(p.name)+"</b>"+(p.name===PROJECTS.active?" <span class=activetag>active</span>":" <button class=ghost data-activate='"+esc(p.name)+"'>activate</button>")+
+    "<button class=ghost data-addto='"+esc(p.name)+"'>+ repo</button><button class=ghost data-rmproj='"+esc(p.name)+"'>delete</button></div>"+repos;
   box.appendChild(card);
-  var opt=document.createElement("option"); opt.value=r.name; opt.textContent=r.name; sel.appendChild(opt);
  });
- box.querySelectorAll("[data-rm]").forEach(function(b){
-  b.onclick=function(){ if(!confirm("Remove "+b.dataset.rm+" from the workspace?"))return;
-   fetch("/api/workspace?name="+encodeURIComponent(b.dataset.rm),{method:"DELETE"})
-    .then(function(r){return r.json()}).then(function(d){ if(d.error){alert(d.error);return} renderWorkspace(d.workspace); }); };
- });
+ box.querySelectorAll("[data-activate]").forEach(function(b){b.onclick=function(){setActiveProject(b.dataset.activate)}});
+ box.querySelectorAll("[data-addto]").forEach(function(b){b.onclick=function(){PROJ_ADD_TARGET=b.dataset.addto;el("projaddtarget").textContent=PROJ_ADD_TARGET}});
+ box.querySelectorAll("[data-rmproj]").forEach(function(b){b.onclick=function(){if(confirm("Delete project "+b.dataset.rmproj+"?"))delProjects("project="+encodeURIComponent(b.dataset.rmproj))}});
+ box.querySelectorAll("[data-rmrepo]").forEach(function(b){b.onclick=function(){delProjects("project="+encodeURIComponent(b.dataset.proj)+"&repo="+encodeURIComponent(b.dataset.rmrepo))}});
 }
 
-function addRepo(kind){
- var path=kind==="clone"?el("wsclone").value.trim():el("wslink").value.trim();
- if(!path)return;
- el("tracestatus").textContent=(kind==="clone"?"cloning ":"linking ")+path+" …";
- fetch("/api/workspace",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify(kind==="clone"?{kind:"clone",url:path}:{kind:"link",path:path})})
+function postProjects(body, after){
+ el("projmsg")&&(el("projmsg").textContent="saving…");
+ fetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
   .then(function(r){return r.json()}).then(function(d){
-   if(d.error){el("tracestatus").textContent="error: "+d.error;return}
-   el("tracestatus").textContent="added "+(d.repo&&d.repo.name);
-   el("wslink").value="";el("wsclone").value="";
-   renderWorkspace(d.workspace);
-  }).catch(function(e){el("tracestatus").textContent="error: "+e});
+   if(d.error){ (el("projmsg")||{}).textContent="error: "+d.error; flash(d.error,1); return; }
+   el("projmsg")&&(el("projmsg").textContent="saved");
+   loadProjects(d.projects); if(after)after();
+  }).catch(function(e){ flash(String(e),1); });
+}
+function delProjects(qs){
+ fetch("/api/projects?"+qs,{method:"DELETE"}).then(function(r){return r.json()}).then(function(d){ if(d.error){flash(d.error,1);return} loadProjects(d.projects); });
+}
+
+// ---- trace by symbol ---------------------------------------------------------
+function traceSymFetch(q,cb){
+ fetch("/api/trace-symbols?project="+encodeURIComponent(PROJECTS.active||"")+"&q="+encodeURIComponent(q||""))
+  .then(function(r){return r.json()}).then(function(d){
+   cb((d.symbols||[]).map(function(s){return {label:s.name, sub:s.kind+" · "+s.repo, value:s.name}}));
+  }).catch(function(){cb([])});
 }
 
 function runTrace(){
- var file=el("trfile").value.trim(), line=parseInt(el("trline").value,10);
- if(!file||!line){el("tracestatus").textContent="enter a file and line";return}
- el("tracestatus").textContent="tracing …"; el("traceout").innerHTML="";
+ var sym = el("trsym").value.trim();
+ if(!sym){ el("tracestatus").textContent="type a symbol to trace"; return; }
+ el("tracestatus").textContent="tracing "+sym+" …"; el("traceout").innerHTML="";
  fetch("/api/trace",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({repo:el("trrepo").value,file:file,line:line})})
-  .then(function(r){return r.json()}).then(function(d){ renderTrace(d) })
+  body:JSON.stringify({symbol:sym, include_libraries:el("trlibs").checked})})
+  .then(function(r){return r.json()}).then(renderTrace)
   .catch(function(e){el("tracestatus").textContent="error: "+e});
 }
 
@@ -61,23 +92,28 @@ function renderTrace(d){
  if(d.error){el("tracestatus").textContent="error: "+d.error;return}
  el("tracestatus").textContent="";
  var out=el("traceout"); out.innerHTML="";
- if(d.summary&&d.summary.length){
-  var s=document.createElement("pre"); s.className="tracesum"; s.textContent=d.summary.join("\n"); out.appendChild(s);
- }
+ if(d.summary&&d.summary.length){ var s=document.createElement("pre"); s.className="tracesum"; s.textContent=d.summary.join("\n"); out.appendChild(s); }
  var answers=d.answers||[];
- if(!answers.length){ out.appendChild(note("No entrypoint path found. The method may be an entrypoint itself, dead, or only reached via reflection/proxy.")); return; }
+ if(!answers.length){
+  out.appendChild(note("No entrypoint path found. The method may be an entrypoint itself, dead, or only reached via reflection/proxy."));
+  if(!el("trlibs").checked && d.libraries && d.libraries.length){
+   var hint=document.createElement("button"); hint.className="expandlib"; hint.textContent="↳ expand with "+d.libraries.join(", ");
+   hint.onclick=function(){ el("trlibs").checked=true; runTrace(); }; out.appendChild(hint);
+  }
+  return;
+ }
  answers.forEach(function(a,i){
   var card=document.createElement("div"); card.className="answer";
-  var badge="<span class=cbadge data-c='"+esc((a.confidence||"").replace(/[^a-z]/g,""))+"'>"+esc(a.confidence||"structural")+"</span>";
-  card.innerHTML="<div class=answerhd>answer "+(i+1)+" "+badge+"<span class=anote>"+esc(a.note||"")+"</span></div>";
-  var pre=document.createElement("pre"); pre.className="answerbody";
-  pre.innerHTML=(a.lines||[]).map(decorate).join("\n");
+  card.innerHTML="<div class=answerhd>answer "+(i+1)+"<span class=anote>"+esc(a.note||"")+"</span></div>";
+  var pre=document.createElement("pre"); pre.className="answerbody"; pre.innerHTML=(a.lines||[]).map(decorate).join("\n");
   card.appendChild(pre); out.appendChild(card);
  });
+ if(!el("trlibs").checked && d.libraries && d.libraries.length){
+  var b=document.createElement("button"); b.className="expandlib"; b.textContent="↳ more paths may exist via "+d.libraries.join(", ")+" — expand";
+  b.onclick=function(){ el("trlibs").checked=true; runTrace(); }; out.appendChild(b);
+ }
 }
 
-// decorate adds light highlighting to the path lines: DI hops, repo crossings,
-// assumptions, the target marker.
 function decorate(l){
  var s=esc(l);
  if(l.indexOf("[entry]")>=0) return "<span class=tl-entry>"+s+"</span>";
@@ -85,15 +121,24 @@ function decorate(l){
  if(l.indexOf("crosses repo boundary")>=0) return "<span class=tl-cross>"+s+"</span>";
  if(l.indexOf("assume:")>=0) return "<span class=tl-assume>"+s+"</span>";
  if(l.indexOf("loop:")>=0) return "<span class=tl-loop>"+s+"</span>";
- if(l.indexOf("★")>=0) return "<span class=tl-target>"+s+"</span>";
+ if(l.indexOf("\u2605")>=0) return "<span class=tl-target>"+s+"</span>";
  return s;
 }
-
 function note(t){var p=document.createElement("p");p.className="hint";p.textContent=t;return p}
-function esc(s){return String(s==null?"":s).replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
 
-el("wsaddlink").onclick=function(){addRepo("link")};
-el("wsaddclone").onclick=function(){addRepo("clone")};
-el("trrun").onclick=runTrace;
-el("trline").addEventListener("keydown",function(e){if(e.key==="Enter")runTrace()});
-window.loadWorkspace=loadWorkspace;
+// loadWorkspace kept as the trace tab's entry hook (graph.js calls it on tab open).
+function loadWorkspace(){ loadProjects(); }
+window.loadWorkspace = loadWorkspace;
+
+// ---- wiring ------------------------------------------------------------------
+el("projadd")&&(el("projadd").onclick=openProjModal);
+el("projclose")&&(el("projclose").onclick=closeProjModal);
+el("projnewbtn")&&(el("projnewbtn").onclick=function(){ var n=el("projname").value.trim(); if(!n)return; postProjects({action:"new-project",project:n},function(){el("projname").value=""}); });
+el("repadd")&&(el("repadd").onclick=function(){
+ if(!PROJ_ADD_TARGET){ flash("create or pick a project first",1); return; }
+ postProjects({action:"add-repo",project:PROJ_ADD_TARGET,path:el("reppath").value.trim(),url:el("repurl").value.trim(),role:el("reprole").value},
+  function(){ el("reppath").value="";el("repurl").value=""; });
+});
+el("trrun")&&(el("trrun").onclick=runTrace);
+el("trsym")&&el("trsym").addEventListener("keydown",function(e){if(e.key==="Enter")runTrace()});
+if(el("trsym")){ var ac=el("trsymac"); combobox(el("trsym"),ac,traceSymFetch,function(it){el("trsym").value=it.value}); }

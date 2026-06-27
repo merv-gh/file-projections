@@ -205,6 +205,95 @@ func gitRemoteOrigin(repoPath string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// --- Config-driven workspace (the single source of truth, CROSS-REPO-UX.md) ------
+
+// activeProject returns the active project from a config's workspace, or the first
+// project if none is marked active, or nil when there's no workspace.
+func activeProject(cfg Config) *ProjectConfig {
+	if cfg.Workspace == nil || len(cfg.Workspace.Projects) == 0 {
+		return nil
+	}
+	if cfg.Workspace.Active != "" {
+		for i := range cfg.Workspace.Projects {
+			if cfg.Workspace.Projects[i].Name == cfg.Workspace.Active {
+				return &cfg.Workspace.Projects[i]
+			}
+		}
+	}
+	return &cfg.Workspace.Projects[0]
+}
+
+// projectByName returns a named project from config, or nil.
+func projectByName(cfg Config, name string) *ProjectConfig {
+	if cfg.Workspace == nil {
+		return nil
+	}
+	for i := range cfg.Workspace.Projects {
+		if cfg.Workspace.Projects[i].Name == name {
+			return &cfg.Workspace.Projects[i]
+		}
+	}
+	return nil
+}
+
+// resolveRepoPath turns a project repo path (relative to cfg.Root, or absolute) into
+// an absolute path.
+func resolveRepoPath(cfg Config, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	abs, err := filepath.Abs(filepath.Join(cfg.Root, p))
+	if err != nil {
+		return filepath.Join(cfg.Root, p)
+	}
+	return abs
+}
+
+// workspaceFromProject builds a *Workspace (the engine's multi-root type) from a
+// config project. When appOnly is true, only repos with role "app" (or, if none are
+// tagged, all repos) are included — the include-libraries=off scope.
+func workspaceFromProject(cfg Config, proj *ProjectConfig, appOnly bool) *Workspace {
+	ws := &Workspace{Home: "(config)"}
+	if proj == nil {
+		return ws
+	}
+	hasApp := false
+	for _, r := range proj.Repos {
+		if r.Role == "app" {
+			hasApp = true
+		}
+	}
+	for _, r := range proj.Repos {
+		if appOnly && hasApp && r.Role != "app" {
+			continue
+		}
+		ws.Repos = append(ws.Repos, WorkspaceRepo{
+			Name: r.Name, Path: resolveRepoPath(cfg, r.Path), Kind: "link", Group: detectGradle(resolveRepoPath(cfg, r.Path)).Group,
+		})
+	}
+	return ws
+}
+
+// libraryReposOf returns the names of the project's library repos (role != app).
+func libraryReposOf(proj *ProjectConfig) []string {
+	if proj == nil {
+		return nil
+	}
+	var out []string
+	hasApp := false
+	for _, r := range proj.Repos {
+		if r.Role == "app" {
+			hasApp = true
+		}
+	}
+	for _, r := range proj.Repos {
+		if hasApp && r.Role != "app" {
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
 // RunWorkspace is the `workspace` CLI command: list, add (link/clone), or remove
 // repos in the user-level workspace — parity with the UI's /api/workspace.
 //

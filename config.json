@@ -5,7 +5,25 @@
     "rg": { "image": "" },
     "joern": { "image": "ghcr.io/joernio/joern:nightly", "jvm_args": "-Xmx6g" }
   },
+  "workspace": {
+    "active": "shop",
+    "projects": [
+      {
+        "name": "shop",
+        "repos": [
+          { "name": "shop-app", "path": "fixtures/shop-app", "role": "app" },
+          { "name": "billing-lib", "path": "fixtures/billing-lib", "role": "library" }
+        ]
+      }
+    ]
+  },
   "lenses": [
+    {
+      "name": "shop-service-graph",
+      "out": ".projections/shop-service-graph.projection",
+      "analyzer": "service-graph",
+      "params": { "project": "shop" }
+    },
     {
       "name": "self-model",
       "out": ".projections/self-model.projection",

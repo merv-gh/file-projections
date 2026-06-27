@@ -84,6 +84,7 @@ fetch("/api/config").then(function(r){return r.json()}).then(function(d){
  el("cfgpath").textContent=d.path||"";el("cfg").value=JSON.stringify(d.config,null,2);
  STATE.analyzers=d.analyzers||[];STATE.applic=d.applicability||{};STATE.defaults=d.defaults||{};STATE.specs=d.specs||{};
  QUESTIONS=d.questions||[];
+ if(typeof loadProjects==="function")loadProjects(d.projects);
  STATE.lang=STATE.defaults.language||"";
  loadSavedLenses();
  var deep=parseDeepLink();

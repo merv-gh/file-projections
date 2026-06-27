@@ -73,6 +73,8 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/ask", s.handleAsk)
 	mux.HandleFunc("/api/workspace", s.handleWorkspace)
 	mux.HandleFunc("/api/trace", s.handleTrace)
+	mux.HandleFunc("/api/projects", s.handleProjects)
+	mux.HandleFunc("/api/trace-symbols", s.handleTraceSymbols)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
 	return http.ListenAndServe(addr, mux)
 }
@@ -125,6 +127,7 @@ func (s *uiServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"questions":     questionRegistry(),
 		"path":          s.configPath,
 		"defaults":      def,
+		"projects":      projectsView(s.cfg),
 	})
 }
 
@@ -857,32 +860,41 @@ func workspaceView(ws *Workspace) map[string]any {
 	return map[string]any{"home": ws.Home, "repos": views}
 }
 
-// handleTrace runs the cross-repo, DI-aware trace-to-line lens over the user
-// workspace and returns the multi-answer result (summary + one block per path).
+// handleTrace runs the cross-repo, DI-aware trace lens over the active config
+// project and returns the multi-answer result. Input is a symbol (preferred) or a
+// file:line; include_libraries scopes whether library repos are searched.
 func (s *uiServer) handleTrace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Repo string `json:"repo"`
-		File string `json:"file"`
-		Line int    `json:"line"`
-		Max  int    `json:"max_paths"`
+		Project          string `json:"project"`
+		Symbol           string `json:"symbol"`
+		Repo             string `json:"repo"`
+		File             string `json:"file"`
+		Line             int    `json:"line"`
+		IncludeLibraries *bool  `json:"include_libraries"`
+		Max              int    `json:"max_paths"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	ws, err := LoadWorkspace()
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
 	s.mu.Lock()
 	cfg := s.cfg
 	s.mu.Unlock()
-	lens := LensConfig{Name: "trace", Analyzer: "trace-to-line", Params: map[string]string{
+	params := map[string]string{
+		"project": req.Project, "symbol": req.Symbol,
 		"repo": req.Repo, "file": req.File, "line": strconv.Itoa(req.Line),
-	}}
+	}
+	if req.IncludeLibraries != nil && !*req.IncludeLibraries {
+		params["include_libraries"] = "false"
+	}
 	if req.Max > 0 {
-		lens.Params["max_paths"] = strconv.Itoa(req.Max)
+		params["max_paths"] = strconv.Itoa(req.Max)
+	}
+	lens := LensConfig{Name: "trace", Analyzer: "trace-to-line", Params: params}
+	ws, err := resolveTraceWorkspace(cfg, lens)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
 	}
 	p, err := TraceToLine(cfg, lens, ws)
 	if err != nil {
@@ -914,5 +926,284 @@ func (s *uiServer) handleTrace(w http.ResponseWriter, r *http.Request) {
 		}
 		answers = append(answers, a)
 	}
-	writeJSON(w, 200, map[string]any{"summary": summary, "answers": answers})
+	// Tell the UI whether enabling libraries would widen the search (the
+	// "expand with library" affordance), and which libraries exist.
+	libs := libraryReposOf(activeProjectFor(cfg, req.Project))
+	writeJSON(w, 200, map[string]any{"summary": summary, "answers": answers, "libraries": libs})
+}
+
+// activeProjectFor returns the named project, else the active one.
+func activeProjectFor(cfg Config, name string) *ProjectConfig {
+	if name != "" {
+		if p := projectByName(cfg, name); p != nil {
+			return p
+		}
+	}
+	return activeProject(cfg)
+}
+
+// persistConfig writes the in-memory config back to configPath (single source of
+// truth) and resets the detect cache. Caller holds no lock.
+func (s *uiServer) persistConfig(cfg Config) error {
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(s.configPath, raw, 0644); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.cfg = cfg
+	s.detectCache = nil
+	s.mu.Unlock()
+	return nil
+}
+
+// handleProjects is the cross-repo project API, backed by config.json (the single
+// source of truth). GET lists projects (with detected groups + internal-dep edges);
+// POST adds/updates a project or a repo (writing config); DELETE removes one.
+func (s *uiServer) handleProjects(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	if cfg.Workspace == nil {
+		cfg.Workspace = &WorkspaceConfig{}
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			Action  string `json:"action"` // "set-active" | "add-repo" | "new-project"
+			Project string `json:"project"`
+			// add-repo:
+			RepoName string `json:"repo_name"`
+			Path     string `json:"path"` // local folder
+			URL      string `json:"url"`  // git clone ref
+			Role     string `json:"role"` // app | library
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		switch req.Action {
+		case "set-active":
+			cfg.Workspace.Active = req.Project
+		case "new-project":
+			if req.Project == "" {
+				writeJSON(w, 200, map[string]any{"error": "project name required"})
+				return
+			}
+			if projectByName(cfg, req.Project) == nil {
+				cfg.Workspace.Projects = append(cfg.Workspace.Projects, ProjectConfig{Name: req.Project})
+			}
+			cfg.Workspace.Active = req.Project
+		case "add-repo":
+			proj := findProjectPtr(&cfg, req.Project)
+			if proj == nil {
+				writeJSON(w, 200, map[string]any{"error": "unknown project " + req.Project})
+				return
+			}
+			path, name, err := s.materializeRepo(cfg, req.Path, req.URL, req.RepoName)
+			if err != nil {
+				writeJSON(w, 200, map[string]any{"error": err.Error()})
+				return
+			}
+			role := req.Role
+			if role == "" {
+				role = "app"
+			}
+			// replace existing repo of same name, else append
+			replaced := false
+			for i := range proj.Repos {
+				if proj.Repos[i].Name == name {
+					proj.Repos[i] = RepoConfig{Name: name, Path: path, Role: role}
+					replaced = true
+				}
+			}
+			if !replaced {
+				proj.Repos = append(proj.Repos, RepoConfig{Name: name, Path: path, Role: role})
+			}
+		default:
+			writeJSON(w, 200, map[string]any{"error": "unknown action " + req.Action})
+			return
+		}
+		if err := s.persistConfig(cfg); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "projects": projectsView(cfg)})
+	case http.MethodDelete:
+		name := strings.TrimSpace(r.URL.Query().Get("project"))
+		repo := strings.TrimSpace(r.URL.Query().Get("repo"))
+		proj := findProjectPtr(&cfg, name)
+		if proj != nil && repo != "" {
+			var kept []RepoConfig
+			for _, rc := range proj.Repos {
+				if rc.Name != repo {
+					kept = append(kept, rc)
+				}
+			}
+			proj.Repos = kept
+		} else if name != "" {
+			var kept []ProjectConfig
+			for _, pc := range cfg.Workspace.Projects {
+				if pc.Name != name {
+					kept = append(kept, pc)
+				}
+			}
+			cfg.Workspace.Projects = kept
+			if cfg.Workspace.Active == name {
+				cfg.Workspace.Active = ""
+			}
+		}
+		if err := s.persistConfig(cfg); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "projects": projectsView(cfg)})
+	default:
+		writeJSON(w, 200, projectsView(cfg))
+	}
+}
+
+// findProjectPtr returns a pointer into cfg's project slice (so edits persist).
+func findProjectPtr(cfg *Config, name string) *ProjectConfig {
+	if cfg.Workspace == nil {
+		return nil
+	}
+	for i := range cfg.Workspace.Projects {
+		if name == "" || cfg.Workspace.Projects[i].Name == name {
+			return &cfg.Workspace.Projects[i]
+		}
+	}
+	return nil
+}
+
+// materializeRepo turns a folder path or a clone URL into a stored repo path
+// (relative to cfg.Root when possible) and a stable name.
+func (s *uiServer) materializeRepo(cfg Config, path, url, name string) (storedPath, repoName string, err error) {
+	if strings.TrimSpace(url) != "" {
+		u, n, e := normalizeGitURL(url)
+		if e != nil {
+			return "", "", e
+		}
+		dest := filepath.Join(cfg.Root, "workspace", "clones")
+		target, e := cloneRepo(u, n, dest, nil)
+		if e != nil {
+			return "", "", e
+		}
+		if rel, e := filepath.Rel(cfg.Root, target); e == nil && !strings.HasPrefix(rel, "..") {
+			return filepath.ToSlash(rel), coalesce(name, n), nil
+		}
+		return target, coalesce(name, n), nil
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", "", fmt.Errorf("provide a folder path or a clone URL")
+	}
+	abs, e := filepath.Abs(path)
+	if e != nil {
+		return "", "", e
+	}
+	if st, e := os.Stat(abs); e != nil || !st.IsDir() {
+		return "", "", fmt.Errorf("not a directory: %s", abs)
+	}
+	if name == "" {
+		name = filepath.Base(abs)
+	}
+	if rel, e := filepath.Rel(cfg.Root, abs); e == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel), name, nil
+	}
+	return abs, name, nil
+}
+
+// projectsView decorates each project's repos with detected gradle group + internal
+// dependency edges so the UI can show which repos form one logical service.
+func projectsView(cfg Config) map[string]any {
+	type repoView struct {
+		RepoConfig
+		Group    string   `json:"group"`
+		Internal []string `json:"internal_deps"`
+	}
+	type projView struct {
+		Name  string     `json:"name"`
+		Repos []repoView `json:"repos"`
+	}
+	var out []projView
+	if cfg.Workspace != nil {
+		for _, p := range cfg.Workspace.Projects {
+			ws := workspaceFromProject(cfg, &p, false)
+			infos := make([]GradleInfo, len(ws.Repos))
+			for i, r := range ws.Repos {
+				infos[i] = detectGradle(r.Path)
+			}
+			pv := projView{Name: p.Name}
+			for i, rc := range p.Repos {
+				var info GradleInfo
+				if i < len(infos) {
+					info = infos[i]
+				}
+				pv.Repos = append(pv.Repos, repoView{
+					RepoConfig: rc, Group: info.Group,
+					Internal: internalDepsAmong(info, ws.Repos, rc.Name),
+				})
+			}
+			out = append(out, pv)
+		}
+	}
+	active := ""
+	if cfg.Workspace != nil {
+		active = cfg.Workspace.Active
+	}
+	if active == "" && len(out) > 0 {
+		active = out[0].Name
+	}
+	return map[string]any{"projects": out, "active": active}
+}
+
+// handleTraceSymbols autocompletes method/type names across the active project's
+// repos (so the trace symbol input suggests across the whole workspace, not one root).
+func (s *uiServer) handleTraceSymbols(w http.ResponseWriter, r *http.Request) {
+	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	projName := strings.TrimSpace(r.URL.Query().Get("project"))
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	proj := activeProjectFor(cfg, projName)
+	if proj == nil {
+		writeJSON(w, 200, map[string]any{"symbols": []any{}})
+		return
+	}
+	ws := workspaceFromProject(cfg, proj, false)
+	idx := buildTypeIndex(cfg, ws)
+	type sym struct {
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		Repo string `json:"repo"`
+		File string `json:"file"`
+		Line int    `json:"line"`
+	}
+	var out []sym
+	seen := map[string]bool{}
+	for _, t := range idx.all {
+		if q == "" || strings.Contains(strings.ToLower(t.Name), q) {
+			k := "type:" + t.Repo + ":" + t.Name
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, sym{Name: t.Name, Kind: t.Kind, Repo: t.Repo, File: t.File, Line: t.Line})
+			}
+		}
+		for _, m := range t.Methods {
+			full := t.Name + "." + m.Name
+			if q == "" || strings.Contains(strings.ToLower(m.Name), q) || strings.Contains(strings.ToLower(full), q) {
+				k := "m:" + t.Repo + ":" + full
+				if !seen[k] {
+					seen[k] = true
+					out = append(out, sym{Name: full, Kind: "method", Repo: t.Repo, File: t.File, Line: m.Start})
+				}
+			}
+		}
+		if len(out) >= 50 {
+			break
+		}
+	}
+	writeJSON(w, 200, map[string]any{"symbols": out})
 }

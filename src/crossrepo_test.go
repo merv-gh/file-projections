@@ -178,3 +178,98 @@ func typeNames(ts []*JavaType) []string {
 	}
 	return out
 }
+
+// TestTraceBySymbolFromConfigProject covers the Phase 4 UX path: a config workspace
+// project drives the trace, and the target is given as a SYMBOL (no file/line/repo).
+func TestTraceBySymbolFromConfigProject(t *testing.T) {
+	billing, _ := filepath.Abs(filepath.Join("fixtures", "billing-lib"))
+	shop, _ := filepath.Abs(filepath.Join("fixtures", "shop-app"))
+	cfg := Config{
+		ExcludeDirs: defaultExcludeDirs(),
+		Workspace: &WorkspaceConfig{
+			Active: "shop",
+			Projects: []ProjectConfig{{
+				Name: "shop",
+				Repos: []RepoConfig{
+					{Name: "shop-app", Path: shop, Role: "app"},
+					{Name: "billing-lib", Path: billing, Role: "library"},
+				},
+			}},
+		},
+	}
+	// Symbol-only input; workspace resolved from the active config project.
+	lens := LensConfig{Name: "trace", Analyzer: "trace-to-line", Params: map[string]string{"symbol": "RealPaymentService.pay"}}
+	p, err := AnalyzeTraceToLine(cfg, lens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all strings.Builder
+	for _, ex := range p.Extra {
+		for _, bl := range ex.Proj.Blocks {
+			for _, l := range bl.Lines {
+				all.WriteString(l + "\n")
+			}
+		}
+	}
+	got := all.String()
+	for _, want := range []string{"PaymentController", "DI:", "crosses repo boundary", "ledger.write"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("symbol trace missing %q\n%s", want, got)
+		}
+	}
+
+	// include_libraries=false restricts to the app repo: no library entrypoint, so
+	// the cross-repo path should disappear (no controller, no boundary crossing).
+	lens.Params["include_libraries"] = "false"
+	p2, err := AnalyzeTraceToLine(cfg, lens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all2 strings.Builder
+	for _, ex := range p2.Extra {
+		for _, bl := range ex.Proj.Blocks {
+			for _, l := range bl.Lines {
+				all2.WriteString(l + "\n")
+			}
+		}
+	}
+	if strings.Contains(all2.String(), "crosses repo boundary") {
+		t.Errorf("app-only trace should not cross repo boundary:\n%s", all2.String())
+	}
+}
+
+// TestServiceGraphCrossRepoFromProject covers the cross-repo service graph derived
+// from a config project: the library controller and the app override appear as one
+// graph with a cross-repo edge.
+func TestServiceGraphCrossRepoFromProject(t *testing.T) {
+	billing, _ := filepath.Abs(filepath.Join("fixtures", "billing-lib"))
+	shop, _ := filepath.Abs(filepath.Join("fixtures", "shop-app"))
+	cfg := Config{
+		ExcludeDirs: defaultExcludeDirs(),
+		Workspace: &WorkspaceConfig{
+			Active: "shop",
+			Projects: []ProjectConfig{{
+				Name: "shop",
+				Repos: []RepoConfig{
+					{Name: "shop-app", Path: shop, Role: "app"},
+					{Name: "billing-lib", Path: billing, Role: "library"},
+				},
+			}},
+		},
+	}
+	p, err := AnalyzeServiceGraph(cfg, LensConfig{Name: "g", Analyzer: "service-graph"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graph string
+	for _, f := range p.Facts {
+		if f.ID == "graph" {
+			graph = f.Text
+		}
+	}
+	for _, want := range []string{"PaymentController", "RealPaymentService", "\"cross\":true", "billing-lib", "shop-app"} {
+		if !strings.Contains(graph, want) {
+			t.Errorf("cross-repo service graph missing %q\n%s", want, graph)
+		}
+	}
+}

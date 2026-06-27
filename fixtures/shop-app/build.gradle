@@ -1,0 +1,12 @@
+group = 'com.acme.shop'
+version = '2.1.0'
+plugins { id 'java'; id 'org.springframework.boot' version '3.2.0' }
+repositories { mavenCentral() }
+dependencies {
+    // Internal library — same 'com.acme' group. This is the edge we must follow
+    // across the repo boundary to build a seamless path.
+    implementation 'com.acme.billing:billing-lib:1.0.0'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    // External — not one of ours.
+    implementation 'com.google.guava:guava:33.0.0-jre'
+}

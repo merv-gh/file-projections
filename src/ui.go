@@ -71,6 +71,8 @@ func RunUI(cfg Config, configPath, addr string, out io.Writer) error {
 	mux.HandleFunc("/api/unroll/edit", s.handleUnrollEdit)
 	mux.HandleFunc("/api/clone", s.handleClone)
 	mux.HandleFunc("/api/ask", s.handleAsk)
+	mux.HandleFunc("/api/workspace", s.handleWorkspace)
+	mux.HandleFunc("/api/trace", s.handleTrace)
 	fmt.Fprintf(out, "file-projections ui on http://localhost%s  (config: %s)\n", addr, configPath)
 	return http.ListenAndServe(addr, mux)
 }
@@ -779,4 +781,138 @@ func (s *uiServer) handleClone(w http.ResponseWriter, r *http.Request) {
 	s.detectCache = nil
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"root": filepath.ToSlash(rel), "url": url})
+}
+
+// handleWorkspace is the cross-repo workspace API (CROSS-REPO.md §E). GET lists the
+// registered repos with their detected gradle group and internal-dependency edges;
+// POST adds a repo by local folder ("link") or git ref ("clone"); DELETE removes one.
+func (s *uiServer) handleWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, err := LoadWorkspace()
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			Kind string `json:"kind"` // "link" | "clone"
+			Path string `json:"path"` // for link
+			URL  string `json:"url"`  // for clone (url or owner/repo)
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		var repo *WorkspaceRepo
+		switch req.Kind {
+		case "clone":
+			repo, err = ws.AddClone(coalesce(req.URL, req.Path), nil)
+		default:
+			repo, err = ws.AddLink(req.Path, req.Name)
+		}
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "repo": repo, "workspace": workspaceView(ws)})
+	case http.MethodDelete:
+		name := strings.TrimSpace(r.URL.Query().Get("name"))
+		if err := ws.Remove(name); err != nil {
+			writeJSON(w, 200, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "workspace": workspaceView(ws)})
+	default:
+		writeJSON(w, 200, workspaceView(ws))
+	}
+}
+
+// workspaceView decorates the workspace with per-repo internal-dependency edges so
+// the UI/CI can highlight which repos form one logical service (same gradle group).
+func workspaceView(ws *Workspace) map[string]any {
+	type repoView struct {
+		WorkspaceRepo
+		Internal  []string `json:"internal_deps"`
+		HasGradle bool     `json:"has_gradle"`
+	}
+	// Resolve every repo's gradle info once so the internal-dep comparison (which
+	// needs the OTHER repos' groups) works even when repos were loaded from
+	// workspace.json without a cached group.
+	infos := make([]GradleInfo, len(ws.Repos))
+	for i, r := range ws.Repos {
+		infos[i] = detectGradle(r.Path)
+		if ws.Repos[i].Group == "" {
+			ws.Repos[i].Group = infos[i].Group
+		}
+	}
+	var views []repoView
+	for i, r := range ws.Repos {
+		views = append(views, repoView{
+			WorkspaceRepo: r,
+			Internal:      internalDepsAmong(infos[i], ws.Repos, r.Name),
+			HasGradle:     infos[i].HasGradle,
+		})
+	}
+	return map[string]any{"home": ws.Home, "repos": views}
+}
+
+// handleTrace runs the cross-repo, DI-aware trace-to-line lens over the user
+// workspace and returns the multi-answer result (summary + one block per path).
+func (s *uiServer) handleTrace(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Repo string `json:"repo"`
+		File string `json:"file"`
+		Line int    `json:"line"`
+		Max  int    `json:"max_paths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	ws, err := LoadWorkspace()
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	lens := LensConfig{Name: "trace", Analyzer: "trace-to-line", Params: map[string]string{
+		"repo": req.Repo, "file": req.File, "line": strconv.Itoa(req.Line),
+	}}
+	if req.Max > 0 {
+		lens.Params["max_paths"] = strconv.Itoa(req.Max)
+	}
+	p, err := TraceToLine(cfg, lens, ws)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"error": err.Error()})
+		return
+	}
+	// Flatten: summary block + one "answer" per Extra projection.
+	var summary []string
+	for _, bl := range p.Blocks {
+		summary = append(summary, bl.Lines...)
+	}
+	type answer struct {
+		Lines      []string `json:"lines"`
+		Confidence string   `json:"confidence"`
+		Note       string   `json:"note"`
+	}
+	var answers []answer
+	for _, ex := range p.Extra {
+		a := answer{}
+		for _, bl := range ex.Proj.Blocks {
+			a.Lines = append(a.Lines, bl.Lines...)
+		}
+		for _, f := range ex.Proj.Facts {
+			if f.ID == "confidence" {
+				if c, note, ok := strings.Cut(f.Text, ": "); ok {
+					a.Confidence, a.Note = c, note
+				}
+			}
+		}
+		answers = append(answers, a)
+	}
+	writeJSON(w, 200, map[string]any{"summary": summary, "answers": answers})
 }

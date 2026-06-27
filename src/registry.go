@@ -79,6 +79,8 @@ func DefaultRegistry() Registry {
 		// lexical callers/references, plus the transitive impact set (Phase 2).
 		"call-graph-callers": AnalyzerFunc{"call-graph-callers", AnalyzeCallGraphCallers},
 		"impact-set":         AnalyzerFunc{"impact-set", AnalyzeImpactSet},
+		// Cross-repo, DI-aware trace-to-line (multi-answer paths entrypoint→line).
+		"trace-to-line": AnalyzerFunc{"trace-to-line", AnalyzeTraceToLine},
 	}
 }
 

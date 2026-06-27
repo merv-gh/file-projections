@@ -1,0 +1,80 @@
+<!doctype html><html lang=en><meta charset=utf-8>
+<title>file-projections — Phase 3: cross-repo trace-to-line</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ :root{--bg:#1a1c20;--panel:#23262c;--ink:#e6e8ea;--mut:#9aa0a8;--line:#31353c;--accent:#6f9fd8}
+ *{box-sizing:border-box}
+ body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+ header{padding:28px 32px;border-bottom:1px solid var(--line)}
+ header h1{margin:0 0 6px;font-size:20px} header p{margin:0 0 6px;color:var(--mut);max-width:80ch}
+ .pill{display:inline-block;font-size:11px;padding:2px 9px;border-radius:10px;margin-right:6px;color:#fff}
+ .p-pure{background:#4a8a4a} .p-di{background:#7a4fa0} .p-cross{background:#b54848}
+ main{padding:24px 32px;max-width:1000px}
+ h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:22px 0 8px}
+ table{border-collapse:collapse;width:100%;font-size:13px}
+ td,th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)} th{color:var(--mut);font-weight:600}
+ .mono{font-family:ui-monospace,Menlo,monospace;color:var(--accent)}
+ .tracesum{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;white-space:pre-wrap;color:var(--mut)}
+ .answer{margin-top:14px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+ .answerhd{display:flex;align-items:center;gap:10px;background:#2a2e35;padding:8px 14px;font-size:13px;font-weight:600}
+ .answerhd .anote{margin-left:auto;font-weight:400;color:var(--mut);font-size:12px}
+ .answerbody{margin:0;padding:12px 16px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;white-space:pre-wrap;line-height:1.5;background:#1e2228}
+ .cbadge{font-size:11px;color:#fff;border-radius:8px;padding:2px 8px;background:#5a7a9a}
+ .cbadge[data-c=structuraldi]{background:#9a6fd0}
+ .tl-entry{color:#7fc99a;font-weight:600}
+ .tl-di{color:#c9a0ec;font-weight:600}
+ .tl-cross{color:#e88;font-weight:600}
+ .tl-assume{color:#9aa0a8;font-style:italic}
+ .tl-loop{color:#d9a35a}
+ .tl-target{color:#1a1c20;font-weight:700;background:#f3e6b0;padding:0 3px}
+ footer{padding:20px 32px;color:var(--mut);font-size:12px;border-top:1px solid var(--line)}
+ code{background:#2a2e35;padding:1px 5px;border-radius:4px}
+</style>
+<header>
+ <h1>file-projections — Phase 3: cross-repo trace-to-line</h1>
+ <p><span class="pill p-pure">pure-Go</span><span class="pill p-di">dependency-inversion</span><span class="pill p-cross">cross-repo</span></p>
+ <p>The original purpose: "how do we end up at this line?" across an app repo and its
+ internal libraries. A Spring <code>@RestController</code> lives in the library and calls
+ an <b>abstract</b> service; the <b>concrete</b> override lives in the app repo. Resolving
+ that dependency-inversion hop across the repo boundary produces a seamless path no
+ single-repo view can show. Captured live from <code>/api/trace</code> against the
+ <code>billing-lib</code> + <code>shop-app</code> fixtures.</p>
+</header>
+<main>
+ <h2>Workspace (registered repos)</h2>
+ <table>
+  <tr><th>repo</th><th>kind</th><th>gradle group</th><th>internal deps</th></tr>
+  <tr><td><b>billing-lib</b></td><td>link</td><td class=mono>com.acme.billing</td><td>—</td></tr><tr><td><b>shop-app</b></td><td>link</td><td class=mono>com.acme.shop</td><td>billing-lib</td></tr>
+ </table>
+ <p style="color:var(--mut);font-size:12px;margin-top:6px">Internal-library detection: <code>shop-app</code> (com.acme.shop) shares the <code>com.acme</code> group with <code>billing-lib</code>, so the dependency is classified internal and followed across the boundary.</p>
+
+ <h2>Question: how do we end up at RealPaymentService.java:29 (<code>ledger.write</code>)?</h2>
+ <div class=tracesum>// target: ledger.write(order.getId(), order.getAmount());  (shop-app/src/main/java/com/acme/shop/RealPaymentService.java)
+// 2 path(s) from an entrypoint reach this line
+//   answer 1: PaymentController.charge → RealPaymentService.pay*
+//   answer 2: PaymentController.charge → AbstractPaymentService.process → RealPaymentService.pay*</div>
+ <section class=answer>
+ <div class=answerhd>answer 1 <span class="cbadge" data-c="structuraldi">structural (di)</span><span class=anote>PaymentController.charge → RealPaymentService.pay*</span></div>
+ <pre class=answerbody><span class="tl-entry">[entry] PaymentController.charge   billing-lib/src/main/java/com/acme/billing/PaymentController.java   @PostMapping</span>
+  → return paymentService.pay(order)                                                                                                      PaymentController.java:32
+<span class="tl-di">      ↳ DI: AbstractPaymentService.pay is abstract → dispatched to RealPaymentService.pay (shop-app/src/main/java/com/acme/shop/RealPaymentService.java)</span>
+<span class="tl-cross">    ═══ crosses repo boundary: billing-lib → shop-app ═══</span>
+  RealPaymentService.pay   shop-app/src/main/java/com/acme/shop/RealPaymentService.java
+<span class="tl-assume">    assume: order.getAmount().signum() &gt; 0</span>
+<span class="tl-target">★ ledger.write(order.getId(), order.getAmount());                                                                                         RealPaymentService.java:29</span></pre>
+</section><section class=answer>
+ <div class=answerhd>answer 2 <span class="cbadge" data-c="structuraldi">structural (di)</span><span class=anote>PaymentController.charge → AbstractPaymentService.process → RealPaymentService.pay*</span></div>
+ <pre class=answerbody><span class="tl-entry">[entry] PaymentController.charge   billing-lib/src/main/java/com/acme/billing/PaymentController.java   @PostMapping</span>
+<span class="tl-assume">    assume: order.isExpress()</span>
+  → return paymentService.process(order)                                                                                                  PaymentController.java:29
+  AbstractPaymentService.process   billing-lib/src/main/java/com/acme/billing/AbstractPaymentService.java
+  → return pay(order)                                                                                                                     AbstractPaymentService.java:16
+<span class="tl-di">      ↳ DI: AbstractPaymentService.pay is abstract → dispatched to RealPaymentService.pay (shop-app/src/main/java/com/acme/shop/RealPaymentService.java)</span>
+<span class="tl-cross">    ═══ crosses repo boundary: billing-lib → shop-app ═══</span>
+  RealPaymentService.pay   shop-app/src/main/java/com/acme/shop/RealPaymentService.java
+<span class="tl-assume">    assume: order.getAmount().signum() &gt; 0</span>
+<span class="tl-target">★ ledger.write(order.getId(), order.getAmount());                                                                                         RealPaymentService.java:29</span></pre>
+</section>
+</main>
+<footer>Self-contained · no network, no server · Phase 3 · multi-answer (one control-flow per path), DI hops + repo crossings + per-path guards. Live UI on :7777. Authoring/transactions still deferred.</footer>
+</html>

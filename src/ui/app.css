@@ -119,3 +119,29 @@ pre{background:#fbf8f0;border:1px solid var(--line);border-radius:8px;padding:.7
 .conf-lexical{background:#9a8c6a}.conf-structural{background:#5a7a9a}.conf-cpg{background:#24784f}.conf-exact{background:#3f6f9f}
 .answerbadge{font-size:.8rem;color:#5a5346;background:#f4f0e8;border:1px solid var(--line);border-radius:8px;padding:.4rem .6rem;margin-bottom:.5rem}
 .answerbadge code{background:#e2ddd2;padding:.03rem .3rem;border-radius:4px}
+
+/* Trace (cross-repo) panel */
+.traceintro{margin-bottom:.6rem}
+.wsbox{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.6rem .7rem}
+.wsrepos{margin-top:.5rem;display:flex;flex-direction:column;gap:.35rem}
+.wsrepo{background:#fbf8f0;border:1px solid var(--line);border-radius:6px;padding:.35rem .5rem}
+.wsrow{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.wsrow b{font-size:.85rem}
+.wskind{font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:.02rem .4rem}
+.wsgroup{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:var(--accent)}
+.wsdep{font-size:.72rem;color:var(--ok)}
+.wsrow [data-rm]{margin-left:auto;padding:.05rem .45rem}
+.wspath{font-family:ui-monospace,Menlo,monospace;font-size:.68rem;color:var(--mut);margin-top:.15rem;word-break:break-all}
+.tracesum{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:.5rem .6rem;font-family:ui-monospace,Menlo,monospace;font-size:.74rem;white-space:pre-wrap;color:var(--mut)}
+.answer{margin-top:.7rem;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.answerhd{display:flex;align-items:center;gap:.5rem;background:var(--soft);padding:.35rem .6rem;font-size:.78rem;font-weight:600}
+.answerhd .anote{margin-left:auto;font-weight:400;color:var(--mut);font-size:.72rem}
+.answerbody{margin:0;padding:.55rem .7rem;font-family:ui-monospace,Menlo,monospace;font-size:.74rem;white-space:pre-wrap;line-height:1.45;background:#fbf8f0}
+.cbadge{font-size:.66rem;color:#fff;border-radius:8px;padding:.05rem .45rem;background:#5a7a9a}
+.cbadge[data-c=structuraldi]{background:#7a4fa0}.cbadge[data-c=structural]{background:#5a7a9a}.cbadge[data-c=cpg]{background:#24784f}
+.tl-entry{color:#24784f;font-weight:600}
+.tl-di{color:#7a4fa0;font-weight:600}
+.tl-cross{color:#b54848;font-weight:600}
+.tl-assume{color:#746b5d;font-style:italic}
+.tl-loop{color:#9a6a2b}
+.tl-target{color:#25231f;font-weight:700;background:#f3e6b0}

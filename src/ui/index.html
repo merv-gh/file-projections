@@ -39,7 +39,7 @@
    </div>
   </div>
  <div class=col>
-  <div class=tabs><button class=on id=tresult>Result</button><button id=tgraph>Service graph</button><button id=tcfg>config.json</button></div>
+  <div class=tabs><button class=on id=tresult>Result</button><button id=tgraph>Service graph</button><button id=ttrace>Trace (cross-repo)</button><button id=tcfg>config.json</button></div>
 
    <div id=graphpane style=display:none>
     <div class=graphctl>
@@ -84,11 +84,36 @@
    <textarea id=cfg rows=28></textarea>
    <div style=margin-top:.5rem><button id=savecfg>Save config.json</button><span class=note id=cfgmsg></span></div>
   </div>
+
+  <div id=tracepane style=display:none>
+   <div class=traceintro>
+    <h2 style=margin:.2rem 0>How do we end up at a line?</h2>
+    <p class=hint>Cross-repo, dependency-inversion-aware. Register your app repo + its internal libraries below, then ask for every control path from a (possibly library) entrypoint to a line — guards, loops and abstract→concrete override hops resolved across repos.</p>
+   </div>
+   <div class=wsbox>
+    <div class=row style="gap:.4rem;align-items:flex-end;flex-wrap:wrap">
+     <div style=flex:2><label>Add a local folder (link)</label><input id=wslink placeholder="/path/to/your/repo" autocomplete=off></div>
+     <button class=ghost id=wsaddlink>Link folder</button>
+     <div style=flex:2><label>or clone a git repo</label><input id=wsclone placeholder="github.com/org/lib or URL" autocomplete=off></div>
+     <button class=ghost id=wsaddclone>Clone</button>
+    </div>
+    <div id=wsrepos class=wsrepos></div>
+   </div>
+   <div class=row style="gap:.4rem;align-items:flex-end;margin-top:.6rem;flex-wrap:wrap">
+    <div style=flex:1><label>repo</label><select id=trrepo></select></div>
+    <div style=flex:2><label>file</label><input id=trfile placeholder="RealPaymentService.java" autocomplete=off></div>
+    <div style=width:5rem><label>line</label><input id=trline type=number placeholder="29"></div>
+    <button id=trrun>Trace</button>
+   </div>
+   <div id=tracestatus class=note></div>
+   <div id=traceout></div>
+  </div>
  </div>
 </div>
 <script src="/ui/core.js"></script>
 <script src="/ui/unroll.js"></script>
 <script src="/ui/graph.js"></script>
 <script src="/ui/questions.js"></script>
+<script src="/ui/trace.js"></script>
 <script src="/ui/studio.js"></script>
 </body></html>

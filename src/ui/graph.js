@@ -1,8 +1,9 @@
 // graph.js — result/graph/config tabs + the service-graph SVG renderer and mermaid export.
-var GPANES={result:["tresult","resultpane"],graph:["tgraph","graphpane"],cfg:["tcfg","cfgpane"]};
+var GPANES={result:["tresult","resultpane"],graph:["tgraph","graphpane"],trace:["ttrace","tracepane"],cfg:["tcfg","cfgpane"]};
 function tab(name){for(var k in GPANES){var on=k===name;el(GPANES[k][0]).classList.toggle("on",on);el(GPANES[k][1]).style.display=on?"":"none"}}
 el("tresult").onclick=function(){tab("result")};el("tcfg").onclick=function(){tab("cfg")};
 el("tgraph").onclick=function(){tab("graph");if(!GRAPH)loadGraph()};
+el("ttrace").onclick=function(){tab("trace");if(window.loadWorkspace)loadWorkspace()};
 
 var GRAPH=null;
 var GRAPH_BASE="";

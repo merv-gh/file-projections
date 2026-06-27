@@ -98,3 +98,54 @@ binds to `impact-set`.
 - Real tree-sitter backend behind the seam (pure-Go covers the need today).
 - Lexical control/data-flow for Go/TS (still Java-only via joern).
 - Runtime/Observe: OTel traces, sql-table ↔ call-site linking, git diff-since.
+
+---
+
+# Done — Cross-repo interprocedural paths (Phase 3)
+
+The project's original purpose, now working: trace "how do we end up at this line?"
+across an app repo and its internal libraries, resolving Spring **dependency
+inversion** across the repo boundary. Pure-Go (no joern). Full design in CROSS-REPO.md.
+
+## The hard problem solved
+A `@RestController` in an internal library calls an **abstract** service; the
+**concrete** override lives in the app repo. Neither repo alone shows a path. Loading
+both + resolving the type hierarchy across them yields the seamless path. Verified
+against the fixtures (`fixtures/billing-lib` + `fixtures/shop-app`): tracing
+`RealPaymentService.java:29` (`ledger.write`) produces two answers, each starting at
+the library's `@PostMapping charge()`, crossing the repo boundary through the DI hop
+(`AbstractPaymentService.pay → RealPaymentService.pay`), with per-path guards.
+
+## Shipped
+- **`workspace.go`** — user-level workspace at `~/.file-projections` (override via
+  `FILE_PROJECTIONS_HOME`). Add a repo by **link** (point at a local folder, no copy)
+  or **clone**. `workspace.json` persists the set.
+- **`gradle.go`** — parse group + dependencies from build.gradle(.kts)/settings;
+  classify internal libraries (shared group prefix or `project(:...)` dep) vs external.
+- **`javatypes.go`** — cross-repo Java type hierarchy (package/extends/implements/
+  fields/methods) + `ConcreteOverrides` dispatch (the DI primitive). Strips block
+  comments so javadoc mentioning a method isn't mis-parsed.
+- **`analyzers_trace.go`** — `trace-to-line` lens: MULTIPLE answers, one control path
+  per entrypoint→line, each with guard assumptions, loop markers, DI hops and repo
+  crossings. Reverse-BFS over the workspace call graph with cycle guard + path cap.
+- **UI** — `/api/workspace` (list/link/clone/rm) and `/api/trace`; Workspace + Trace
+  panels (`ui/trace.js`, new tab in `index.html`); `workspace` CLI command. New
+  question "How do we end up at {file}:{line}? (cross-repo)".
+
+## Confidence
+`structural` (scope-resolved by type+method+arity). A path through a DI boundary is
+badged **`structural (di)`** with the resolved override named. Ambiguity (>1 override,
+generics, overloads, proxies) is reported, not hidden — joern stays the precise upgrade.
+
+## Verified
+- `go build`, `go vet`, full `go test ./src` green (3 new cross-repo tests:
+  gradle parse + internal-dep classification, cross-repo override resolution, full
+  DI trace with entrypoint/boundary/guard assertions).
+- Live UI on :7777: `/api/workspace` shows `shop-app` internally depends on
+  `billing-lib`; `/api/trace` returns the 2 DI-resolved answers. `demo-phase3.html`
+  baked from live output.
+
+## Deferred (Phase 4, per YAGNI)
+- Precision: generics/overload resolution, non-Spring DI (Guice/Dagger), Kotlin/Scala.
+- Runtime/Observe: OTel traces, sql-table ↔ call-site linking, git diff-since.
+- Write/authoring + transactional multi-file apply (unchanged deferral).

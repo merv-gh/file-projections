@@ -99,6 +99,9 @@ func analyzerSpecs() map[string]AnalyzerSpec {
 			[]ParamSpec{f("name", "method")}},
 		{"impact-set", []string{"java", "go", "js"}, "Transitive set of functions that (in)directly call a function — \"if I change X, what breaks\" (structural).",
 			[]ParamSpec{f("name", "method")}},
+		// Cross-repo, DI-aware trace-to-line — Phase 3.
+		{"trace-to-line", []string{"java"}, "How do we end up at file:line? Every control path from a (cross-repo) entrypoint to the line, with guards, loops and dependency-inversion hops resolved across internal libraries.",
+			[]ParamSpec{f("file", "file"), f("line", "line"), opt("repo", "text"), text("max_paths", "8", false)}},
 	}
 	out := map[string]AnalyzerSpec{}
 	for _, s := range specs {

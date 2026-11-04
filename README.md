@@ -1,4 +1,12 @@
 # file-projections
+
+### Bounded semantic adapter scripts
+
+`src/tools/joern/semantic-project.sc` builds base/data-flow overlays in a separate retained CPG and streams a language-neutral `dt.semantic.projection/v1` NDJSON surface: symbols, call sites, guard evidence and boundary candidates, followed by a mandatory coverage summary. It accepts `cpgPath`, `enrichedPath`, `out`, `root`, `maxRecords` and `maxBytes`. Raw and enriched paths must differ. The caller manages immutable generations, exact source/dependency identities and authorization.
+
+`src/tools/joern/semantic-query.sc` reopens the enriched CPG and accepts a JSON request file for named `slice`, `paths` or `assertions` operations with `dataflow` or `controlflow` mode, generation-local `fromNodeIds`/`toNodeIds`, `maxPaths`, `maxHops` and `budgetMs`. It accepts `cpgPath`, `out`, `request` and optional `root` to normalize source paths. The surrounding process must enforce a hard deadline because a graph traversal can exceed its budget between iterator checks. These scripts do not execute caller-supplied Scala.
+
+The adapters were verified with real Java and TypeScript frontends on Joern 4.0.564, including saved-graph reopening, transitive Java source roots, value-flow paths and an early-throw guard's false CFG branch. CPG paths retain unknown feasibility; boundary candidates and condition inventories do not prove distributed invariants. They are machine-readable companion scripts, independent of the existing projection-file renderer and UI.
 ![tests](https://github.com/merv-gh/file-projections/actions/workflows/test.yml/badge.svg)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

@@ -66,6 +66,7 @@ func (wp *WorkerPool) runWorker(id int) {
 }
 
 type ContainerTools struct {
+	Jssrc2cpg   string // path to JavaScript/TypeScript frontend
 	Javasrc2cpg string // path to javasrc2cpg binary (empty = not found)
 	JoernParse  string // path to joern-parse
 	JoernExport string // path to joern-export
@@ -139,6 +140,8 @@ func probeContainer(container string) ContainerTools {
 		log.Printf("container %s: javasrc2cpg NOT FOUND anywhere - will use joern-parse (slower, double RAM)", container)
 	}
 
+	tools.Jssrc2cpg = discoverJssrcFrontend(container)
+
 	// Find joern-parse and joern-export
 	for _, tool := range []struct {
 		name string
@@ -200,39 +203,34 @@ func (wp *WorkerPool) processJob(job *Job, container string, tools ContainerTool
 		dockerExec(container, "rm", "-f", logFile)
 	}()
 
-	resolvedSrc := resolveContainerSrcDir(container, containerSrc)
+	language, err := normalizeLanguage(job.Language)
+	if err != nil {
+		job.fail(err.Error())
+		return
+	}
+	resolvedSrc := containerSrc
+	if language == "java" {
+		resolvedSrc = resolveContainerSrcDir(container, containerSrc)
+	}
 	if resolvedSrc != containerSrc {
 		job.addLog(fmt.Sprintf("Resolved source dir: %s", resolvedSrc), "info")
 	}
 
 	// Count source files
 	countOut, _ := dockerExec(container, "sh", "-c",
-		fmt.Sprintf("find '%s' -name '*.java' | wc -l", resolvedSrc))
+		fmt.Sprintf("find '%s' -type f \\( -name '*.java' -o -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' \\) | wc -l", resolvedSrc))
 	fileCount := strings.TrimSpace(countOut)
-	job.addLog(fmt.Sprintf("Java source files: %s", fileCount), "info")
+	job.addLog(fmt.Sprintf("Source files (%s): %s", language, fileCount), "info")
 
 	// ── Step 1: Parse ──────────────────────────────────────────────
 	job.setStatus("parsing")
 	job.setProgress(10)
 	start := time.Now()
 
-	// Unset _JAVA_OPTIONS so subprocesses (Delombok, etc.) don't inherit huge heaps.
-	// We pass JVM memory directly to the specific tool via -J flags instead.
-	jvmFlags := "-J-Xmx4g"
-
-	var parseCmd string
-	if tools.Javasrc2cpg != "" {
-		job.addLog(fmt.Sprintf("Using javasrc2cpg at %s (single JVM, no overlay passes)", tools.Javasrc2cpg), "info")
-		// --delombok-mode no-delombok: skip Delombok subprocess (OOM-prone, not needed for boundary mapping)
-		parseCmd = fmt.Sprintf("unset _JAVA_OPTIONS JAVA_TOOL_OPTIONS; %s %s %s --delombok-mode no-delombok -o %s",
-			tools.Javasrc2cpg, jvmFlags, resolvedSrc, containerCpg)
-	} else if tools.JoernParse != "" {
-		job.addLog("WARNING: javasrc2cpg not found, using joern-parse (spawns subprocess, needs more RAM)", "info")
-		parseCmd = fmt.Sprintf("unset _JAVA_OPTIONS JAVA_TOOL_OPTIONS; %s %s %s --language javasrc --output %s --frontend-args --delombok-mode no-delombok",
-			tools.JoernParse, jvmFlags, resolvedSrc, containerCpg)
-	} else {
-		job.addLog("FATAL: neither javasrc2cpg nor joern-parse found in container!", "error")
-		job.fail("no parse tool found in container")
+	parseCmd, err := parseCommand(tools, language, resolvedSrc, containerCpg, queryConfig(cfg).JoernHeap)
+	if err != nil {
+		job.addLog(err.Error(), "error")
+		job.fail(err.Error())
 		return
 	}
 	job.addLog(fmt.Sprintf("CMD: %s", parseCmd), "info")
@@ -294,8 +292,8 @@ func (wp *WorkerPool) processJob(job *Job, container string, tools ContainerTool
 
 	// Strategy A: Use joern-export (works if CPG has all overlays, i.e. from joern-parse)
 	job.addLog("Trying joern-export --format neo4jcsv...", "info")
-	exportCmd := fmt.Sprintf("joern-export --format neo4jcsv --repr all -o %s %s",
-		containerExport, containerCpg)
+	exportCmd := fmt.Sprintf("unset _JAVA_OPTIONS JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS; joern-export -J-Xmx%s --format neo4jcsv --repr all -o %s %s",
+		queryConfig(cfg).JoernHeap, containerExport, containerCpg)
 	out, err = dockerExecWithProgress(container, job, logFile, exportCmd)
 	dumpLogFileToJob(container, job, logFile)
 
@@ -343,7 +341,7 @@ cpg.close()
 		dockerExec(container, "sh", "-c",
 			fmt.Sprintf("cat > %s << 'ENDSCRIPT'\n%s\nENDSCRIPT", scriptPath, exportScript))
 
-		scriptCmd := fmt.Sprintf("joern --script %s --nocolors", scriptPath)
+		scriptCmd := fmt.Sprintf("unset _JAVA_OPTIONS JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS; joern -J-Xmx%s --script %s --nocolors", queryConfig(cfg).JoernHeap, scriptPath)
 		out, err = dockerExecWithProgress(container, job, logFile, scriptCmd)
 		dumpLogFileToJob(container, job, logFile)
 		dockerExec(container, "rm", "-f", scriptPath)
@@ -367,9 +365,9 @@ cpg.close()
 		os.MkdirAll(exportDir, 0755)
 
 		replCmd := fmt.Sprintf(
-			`echo 'loadCpg("%s"); save' | joern --nocolors 2>&1; `+
-				`joern-export --format neo4jcsv --repr all -o %s %s`,
-			containerCpg, containerExport, containerCpg)
+			`unset _JAVA_OPTIONS JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS; echo 'loadCpg("%s"); save' | joern -J-Xmx%s --nocolors 2>&1 && `+
+				`joern-export -J-Xmx%s --format neo4jcsv --repr all -o %s %s`,
+			containerCpg, queryConfig(cfg).JoernHeap, queryConfig(cfg).JoernHeap, containerExport, containerCpg)
 		out, err = dockerExecWithProgress(container, job, logFile, replCmd)
 		dumpLogFileToJob(container, job, logFile)
 

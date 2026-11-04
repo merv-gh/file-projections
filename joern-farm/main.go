@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -21,6 +21,9 @@ var (
 
 func main() {
 	cfg = loadConfig()
+	if err := validateRuntimeConfig(cfg); err != nil {
+		log.Fatal(err)
+	}
 	store = NewJobStore()
 	pool = NewWorkerPool(cfg.WorkerCount, cfg.DataDir)
 
@@ -43,10 +46,12 @@ func main() {
 
 func loadConfig() FarmConfig {
 	c := FarmConfig{
-		Port:        envOr("PORT", "9090"),
-		DataDir:     envOr("DATA_DIR", "/data"),
-		WorkerCount: envInt("WORKER_COUNT", 2),
-		JoernHeap:   envOr("JOERN_HEAP", "4g"),
+		Port:                envOr("PORT", "9090"),
+		DataDir:             envOr("DATA_DIR", "/data"),
+		WorkerCount:         envInt("WORKER_COUNT", 2),
+		JoernHeap:           envOr("JOERN_HEAP", "4g"),
+		QueryTimeoutSeconds: envInt("QUERY_TIMEOUT_SECONDS", 300),
+		QueryMaxOutputBytes: int64(envInt("QUERY_MAX_OUTPUT_BYTES", 64<<20)),
 	}
 	return c
 }
@@ -69,20 +74,23 @@ func envInt(key string, fallback int) int {
 
 // POST /jobs  (multipart: metadata JSON + source zip)
 func handleSubmitJob(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(500 << 20); err != nil { // 500MB max
+	r.Body = http.MaxBytesReader(w, r.Body, 500<<20)
+	if err := r.ParseMultipartForm(8 << 20); err != nil { // spool large uploads to disk
 		errResp(w, 400, "parse multipart: "+err.Error())
 		return
 	}
 
+	defer r.MultipartForm.RemoveAll()
 	metaStr := r.FormValue("metadata")
 	if metaStr == "" {
 		errResp(w, 400, "missing metadata field")
 		return
 	}
 	var meta struct {
-		Name   string `json:"name"`
-		Branch string `json:"branch"`
-		Export *bool  `json:"export"` // pointer: absent → default true (export to neo4jcsv)
+		Name     string `json:"name"`
+		Branch   string `json:"branch"`
+		Language string `json:"language"`
+		Export   *bool  `json:"export"` // pointer: absent → default true (export to neo4jcsv)
 	}
 	if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
 		errResp(w, 400, "bad metadata json: "+err.Error())
@@ -90,6 +98,11 @@ func handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if meta.Name == "" {
 		errResp(w, 400, "name is required in metadata")
+		return
+	}
+	language, err := normalizeLanguage(meta.Language)
+	if err != nil {
+		errResp(w, 400, err.Error())
 		return
 	}
 	export := true
@@ -108,6 +121,7 @@ func handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		ID:        generateID(),
 		Name:      meta.Name,
 		Branch:    meta.Branch,
+		Language:  language,
 		Export:    export,
 		Status:    "queued",
 		StartedAt: time.Now(),
@@ -151,6 +165,7 @@ func handleListJobs(w http.ResponseWriter, r *http.Request) {
 		ID       string     `json:"id"`
 		Name     string     `json:"name"`
 		Branch   string     `json:"branch,omitempty"`
+		Language string     `json:"language"`
 		Status   string     `json:"status"`
 		Progress int        `json:"progress"`
 		Worker   string     `json:"worker,omitempty"`
@@ -161,7 +176,7 @@ func handleListJobs(w http.ResponseWriter, r *http.Request) {
 	for i, j := range jobs {
 		j.mu.Lock()
 		out[i] = jobSummary{
-			ID: j.ID, Name: j.Name, Branch: j.Branch,
+			ID: j.ID, Name: j.Name, Branch: j.Branch, Language: j.Language,
 			Status: j.Status, Progress: j.Progress, Worker: j.Worker,
 			Started: j.StartedAt, Done: j.DoneAt,
 		}
@@ -314,51 +329,93 @@ func handleRunScript(w http.ResponseWriter, r *http.Request) {
 		errResp(w, 404, "cpg not found (submit with export:false to keep it for queries)")
 		return
 	}
-	if err := r.ParseMultipartForm(50 << 20); err != nil {
+	if !acquireQuerySlot() {
+		errResp(w, http.StatusTooManyRequests, "query slot busy; retry after the active query completes")
+		return
+	}
+	defer releaseQuerySlot()
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	if err := r.ParseMultipartForm(128 << 10); err != nil {
 		errResp(w, 400, "parse multipart: "+err.Error())
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	file, _, err := r.FormFile("script")
 	if err != nil {
 		errResp(w, 400, "missing script file: "+err.Error())
 		return
 	}
 	defer file.Close()
-	scriptBytes, _ := io.ReadAll(file)
-
-	// Materialize script + output path on the shared /data volume.
+	scriptBytes, err := io.ReadAll(io.LimitReader(file, maxScriptBytes+1))
+	if err != nil || len(scriptBytes) == 0 || len(scriptBytes) > maxScriptBytes {
+		errResp(w, 400, "script must contain 1..1048576 bytes")
+		return
+	}
+	params, err := validateQueryParams(r.Form["param"])
+	if err != nil {
+		errResp(w, 400, err.Error())
+		return
+	}
+	runtimeCfg := queryConfig(cfg)
+	if err := validateRuntimeConfig(runtimeCfg); err != nil {
+		errResp(w, 500, err.Error())
+		return
+	}
 	qid := generateID()
 	scriptHost := filepath.Join(cfg.DataDir, "q-"+qid+".sc")
 	outHost := filepath.Join(cfg.DataDir, "q-"+qid+".jsonl")
+	pidHost := filepath.Join(cfg.DataDir, "q-"+qid+".pid")
 	if err := os.WriteFile(scriptHost, scriptBytes, 0644); err != nil {
 		errResp(w, 500, "write script: "+err.Error())
 		return
 	}
 	defer os.Remove(scriptHost)
 	defer os.Remove(outHost)
+	defer os.Remove(pidHost)
 	scriptCt := "/data/q-" + qid + ".sc"
 	outCt := "/data/q-" + qid + ".jsonl"
-
-	// Build the joern command: the farm sets cpgPath + out; the client supplies the rest.
-	args := []string{"--script", scriptCt, "--param", "cpgPath=" + containerCpg, "--param", "out=" + outCt}
-	for _, p := range r.Form["param"] {
-		args = append(args, "--param", p)
+	pidCt := "/data/q-" + qid + ".pid"
+	command, err := queryCommand(runtimeCfg.JoernHeap, scriptCt, containerCpg, outCt, params)
+	if err != nil {
+		errResp(w, 400, err.Error())
+		return
 	}
-	container := resolveContainerID("joern-worker-1")
-	joinArgs := "joern"
-	for _, a := range args {
-		joinArgs += " '" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	container := job.Worker
+	if container == "" {
+		container = resolveContainerID("joern-worker-1")
 	}
-	log.Printf("job %s: running script query: %s", job.ID, joinArgs)
-	cmdOut, runErr := dockerExec(container, "sh", "-c", "unset _JAVA_OPTIONS JAVA_TOOL_OPTIONS; "+joinArgs)
-	data, readErr := os.ReadFile(outHost)
-	if readErr != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(runtimeCfg.QueryTimeoutSeconds)*time.Second)
+	defer cancel()
+	log.Printf("job %s: starting bounded script query %s", job.ID, qid)
+	cmdOut, runErr := runQuery(ctx, container, command, pidCt, runtimeCfg.QueryMaxOutputBytes)
+	// A failed script can leave partial output. Never publish it as a successful query.
+	if runErr != nil {
+		code := 500
+		if ctx.Err() != nil {
+			code = http.StatusGatewayTimeout
+		}
+		errResp(w, code, "script execution failed: "+runErr.Error()+"\njoern said:\n"+tailStr(cmdOut, 4000))
+		return
+	}
+	output, err := os.Open(outHost)
+	if err != nil {
 		errResp(w, 500, "script produced no output.\njoern said:\n"+tailStr(cmdOut, 4000))
 		return
 	}
+	defer output.Close()
+	stat, err := output.Stat()
+	if err != nil || !stat.Mode().IsRegular() {
+		errResp(w, 500, "script output must be a regular file")
+		return
+	}
+	if stat.Size() > runtimeCfg.QueryMaxOutputBytes {
+		errResp(w, http.StatusRequestEntityTooLarge, "script output exceeds QUERY_MAX_OUTPUT_BYTES; narrow the query")
+		return
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Write(data)
-	_ = runErr
+	w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+	// Stream the result instead of allocating the whole NDJSON file in the API heap.
+	io.CopyN(w, output, stat.Size())
 }
 
 func tailStr(s string, n int) string {

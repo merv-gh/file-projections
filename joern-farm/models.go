@@ -6,16 +6,19 @@ import (
 )
 
 type FarmConfig struct {
-	Port        string `json:"port"`
-	DataDir     string `json:"data_dir"`
-	WorkerCount int    `json:"worker_count"`
-	JoernHeap   string `json:"joern_heap"`
+	Port                string `json:"port"`
+	DataDir             string `json:"data_dir"`
+	WorkerCount         int    `json:"worker_count"`
+	JoernHeap           string `json:"joern_heap"`
+	QueryTimeoutSeconds int    `json:"query_timeout_seconds"`
+	QueryMaxOutputBytes int64  `json:"query_max_output_bytes"`
 }
 
 type Job struct {
 	ID        string     `json:"id"`
 	Name      string     `json:"name"`
 	Branch    string     `json:"branch,omitempty"`
+	Language  string     `json:"language"`
 	Status    string     `json:"status"` // queued, parsing, exporting, packaging, done, failed
 	Progress  int        `json:"progress"`
 	Error     string     `json:"error,omitempty"`

@@ -12,6 +12,9 @@ services:
       PORT: "9090"
       DATA_DIR: /data
       WORKER_COUNT: "1"
+      JOERN_HEAP: "4g"
+      QUERY_TIMEOUT_SECONDS: "300"
+      QUERY_MAX_OUTPUT_BYTES: "67108864"
     depends_on:
       - joern-worker-1
     networks:
